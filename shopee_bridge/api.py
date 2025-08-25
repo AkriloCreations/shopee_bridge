@@ -1,5 +1,7 @@
 import time, hmac, hashlib, requests, frappe
 from frappe.utils import get_url, nowdate
+from datetime import datetime, timedelta
+import json
 
 def _settings():
     return frappe.get_single("Shopee Settings")
@@ -143,11 +145,15 @@ def refresh_if_needed():
 
 @frappe.whitelist()
 def sync_recent_orders(hours: int = 24):
-    """Tarik order by update_time → Sales Invoice + Payment Entry."""
+    """Enhanced version with better error handling and retry logic."""
     s = _settings()
     
     if not s.access_token:
         frappe.throw("Access token required. Please authenticate with Shopee first.")
+    
+    # Try to refresh token if it's about to expire
+    refresh_result = refresh_if_needed()
+    frappe.logger().info(f"Token refresh status: {refresh_result.get('status')}")
         
     now = int(time.time())
     last = int(s.last_success_update_time or 0)
@@ -157,45 +163,137 @@ def sync_recent_orders(hours: int = 24):
 
     offset, page_size = 0, 50
     highest = last
+    processed_count = 0
+    error_count = 0
+    retry_attempts = 0
+    max_retries = 3
 
-    while True:
-        ol = _call("/api/v2/order/get_order_list", str(s.partner_id).strip(), s.partner_key,
-                   s.shop_id, s.access_token, {
-                       "time_range_field": "update_time",
-                       "time_from": time_from, "time_to": time_to,
-                       "page_size": page_size,
-                       "order_status": "READY_TO_SHIP,PROCESSED,COMPLETED",
-                       "offset": offset
-                   })
+    frappe.logger().info(f"Starting order sync: from {time_from} to {time_to}")
+
+    try:
+        while True:
+            try:
+                # Rate limiting - add small delay between requests
+                if processed_count > 0 or retry_attempts > 0:
+                    time.sleep(0.5 + retry_attempts * 0.5)
+                
+                ol = _call("/api/v2/order/get_order_list", str(s.partner_id).strip(), s.partner_key,
+                           s.shop_id, s.access_token, {
+                               "time_range_field": "update_time",
+                               "time_from": time_from, "time_to": time_to,
+                               "page_size": page_size,
+                               "order_status": "READY_TO_SHIP,PROCESSED,COMPLETED",
+                               "offset": offset
+                           })
+                
+                if ol.get("error"):
+                    # Handle specific error cases
+                    error_msg = ol.get("message", "").lower()
+                    
+                    # Token expired - try refresh once
+                    if "access token expired" in error_msg or "invalid access token" in error_msg:
+                        if retry_attempts < max_retries:
+                            frappe.logger().info(f"Token expired, attempting refresh (attempt {retry_attempts + 1})")
+                            refresh_result = refresh_if_needed()
+                            if refresh_result.get("status") == "refreshed":
+                                retry_attempts += 1
+                                continue  # Retry with new token
+                    
+                    # Rate limit - wait longer
+                    if "rate limit" in error_msg or "too many requests" in error_msg:
+                        wait_time = 5 + retry_attempts * 2
+                        frappe.logger().info(f"Rate limited, waiting {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        retry_attempts += 1
+                        if retry_attempts < max_retries:
+                            continue
+                    
+                    error_full = f"Failed to get orders: {ol.get('error')} - {ol.get('message')}"
+                    frappe.log_error(error_full, "Shopee API Error")
+                    
+                    error_count += 1
+                    if error_count > 3:
+                        frappe.throw(error_full)
+                    continue
+                    
+                resp = ol.get("response") or {}
+                orders = resp.get("order_list", [])
+                
+                if not orders:
+                    frappe.logger().info("No more orders found, breaking loop")
+                    break
+                
+                # Process orders with better error handling
+                batch_processed = 0
+                for o in orders:
+                    try:
+                        order_sn = o.get("order_sn")
+                        if order_sn:
+                            # Check if order already processed
+                            if not frappe.db.exists("Sales Invoice", {"shopee_order_sn": order_sn}):
+                                _process_order(order_sn)
+                                batch_processed += 1
+                            ut = int(o.get("update_time") or 0)
+                            if ut > highest:
+                                highest = ut
+                    except Exception as order_error:
+                        error_count += 1
+                        frappe.log_error(f"Failed to process order {order_sn}: {str(order_error)}", 
+                                       "Shopee Order Processing")
+                        # Continue processing other orders
+                        continue
+                
+                processed_count += batch_processed
+                frappe.logger().info(f"Processed {batch_processed} orders in this batch, total: {processed_count}")
+
+                if not resp.get("has_next_page"):
+                    break
+                offset = resp.get("next_offset", offset + page_size)
+                retry_attempts = 0  # Reset retry counter on successful page
+                
+            except Exception as e:
+                error_count += 1
+                frappe.log_error(f"Error processing batch: {str(e)}", "Shopee Sync Error")
+                if error_count > 5:
+                    frappe.logger().error("Too many errors, stopping sync")
+                    break
+                continue
+
+        # Update success timestamp only if we processed something
+        if highest > (s.last_success_update_time or 0):
+            s.last_success_update_time = highest
+            s.save(ignore_permissions=True)
+            frappe.db.commit()
+            frappe.logger().info(f"Updated last success time to: {highest}")
+
+        result = {
+            "from": time_from, 
+            "to": time_to, 
+            "max_update_time": highest,
+            "processed_orders": processed_count,
+            "errors": error_count,
+            "success": error_count < processed_count or processed_count == 0
+        }
         
-        if ol.get("error"):
-            frappe.throw(f"Failed to get orders: {ol.get('error')} - {ol.get('message')}")
-            
-        resp = ol.get("response") or {}
-        for o in resp.get("order_list", []):
-            order_sn = o.get("order_sn")
-            if order_sn:
-                _process_order(order_sn)
-                ut = int(o.get("update_time") or 0)
-                if ut > highest:
-                    highest = ut
-
-        if not resp.get("has_next_page"):
-            break
-        offset = resp.get("next_offset", offset + page_size)
-
-    if highest > (s.last_success_update_time or 0):
-        s.last_success_update_time = highest
-        s.save(ignore_permissions=True)
-        frappe.db.commit()
-
-    return {"from": time_from, "to": time_to, "max_update_time": highest}
+        frappe.logger().info(f"Sync completed: {result}")
+        return result
+        
+    except Exception as e:
+        frappe.log_error(f"Sync failed: {str(e)}", "Shopee Sync Critical Error")
+        raise
 
 def _ensure_item_exists(sku: str, item_data: dict, rate: float) -> str:
     """
+    Enhanced item creation with better error handling.
     Ensure item exists in ERPNext, create if not found.
     Returns the item_code to use.
     """
+    # Sanitize SKU to ensure it's valid
+    if not sku or not sku.strip():
+        sku = f"SHP-UNKNOWN-{item_data.get('item_id', 'NOITEM')}-{int(time.time())}"
+    
+    sku = sku.strip()[:140]  # ERPNext item_code limit
+    
     # Check if item already exists
     if frappe.db.exists("Item", sku):
         return sku
@@ -211,7 +309,7 @@ def _ensure_item_exists(sku: str, item_data: dict, rate: float) -> str:
         item = frappe.new_doc("Item")
         item.item_code = sku
         item.item_name = item_name[:140]  # ERPNext limit
-        item.item_group = "All Item Groups"  # Default group
+        item.item_group = _get_item_group()
         item.stock_uom = "Nos"  # Default UOM
         item.is_stock_item = 1
         item.include_item_in_manufacturing = 0
@@ -248,11 +346,39 @@ def _ensure_item_exists(sku: str, item_data: dict, rate: float) -> str:
         return sku
         
     except Exception as e:
-        # If item creation fails, log error and return original SKU
+        # If item creation fails, log error and return fallback
         frappe.log_error(f"Failed to create item {sku}: {str(e)}", "Shopee Item Creation")
-        
-        # Try to use existing similar item or create minimal fallback
         return _create_fallback_item(sku, item_name, rate)
+
+def _get_item_group():
+    """Get or create Shopee item group."""
+    item_group_name = "Shopee Products"
+    if not frappe.db.exists("Item Group", item_group_name):
+        try:
+            item_group = frappe.new_doc("Item Group")
+            item_group.item_group_name = item_group_name
+            item_group.parent_item_group = "All Item Groups"
+            item_group.is_group = 0
+            item_group.insert(ignore_permissions=True)
+        except Exception as e:
+            frappe.log_error(f"Failed to create item group: {str(e)}", "Shopee Item Group Creation")
+            return "All Item Groups"
+    return item_group_name
+
+def _get_customer_group():
+    """Get or create Shopee customer group."""
+    customer_group_name = "Shopee Customers"
+    if not frappe.db.exists("Customer Group", customer_group_name):
+        try:
+            customer_group = frappe.new_doc("Customer Group")
+            customer_group.customer_group_name = customer_group_name
+            customer_group.parent_customer_group = "All Customer Groups"
+            customer_group.is_group = 0
+            customer_group.insert(ignore_permissions=True)
+        except Exception as e:
+            frappe.log_error(f"Failed to create customer group: {str(e)}", "Shopee Customer Group Creation")
+            return "All Customer Groups"
+    return customer_group_name
 
 def _create_fallback_item(sku: str, item_name: str, rate: float) -> str:
     """Create minimal fallback item if normal creation fails"""
@@ -261,7 +387,7 @@ def _create_fallback_item(sku: str, item_name: str, rate: float) -> str:
         item = frappe.new_doc("Item")
         item.item_code = sku
         item.item_name = item_name[:140]
-        item.item_group = "All Item Groups"
+        item.item_group = "All Item Groups"  # Use default group as fallback
         item.stock_uom = "Nos"
         item.is_stock_item = 1
         item.is_sales_item = 1
@@ -271,124 +397,293 @@ def _create_fallback_item(sku: str, item_name: str, rate: float) -> str:
     except Exception as e:
         frappe.log_error(f"Fallback item creation also failed for {sku}: {str(e)}", "Shopee Fallback Item")
         # Return a generic item code - you may want to create a catch-all item
-        return "SHOPEE-UNKNOWN-ITEM"
+        return _ensure_catch_all_item()
+
+def _ensure_catch_all_item():
+    """Ensure catch-all item exists for failed item creation."""
+    catch_all_sku = "SHOPEE-UNKNOWN-ITEM"
+    if not frappe.db.exists("Item", catch_all_sku):
+        try:
+            item = frappe.new_doc("Item")
+            item.item_code = catch_all_sku
+            item.item_name = "Shopee Unknown Item"
+            item.item_group = "All Item Groups"
+            item.stock_uom = "Nos"
+            item.is_stock_item = 1
+            item.is_sales_item = 1
+            item.standard_rate = 0
+            item.description = "Fallback item for Shopee products that couldn't be created"
+            item.insert(ignore_permissions=True)
+        except Exception as e:
+            frappe.log_error(f"Failed to create catch-all item: {str(e)}", "Shopee Catch All Item")
+    return catch_all_sku
 
 def _process_order(order_sn: str):
+    """Enhanced order processing with better error handling."""
     s = _settings()
+    
+    # Check if order already processed
     if frappe.db.exists("Sales Invoice", {"shopee_order_sn": order_sn}):
+        frappe.logger().info(f"Order {order_sn} already processed, skipping")
         return
 
-    det = _call("/api/v2/order/get_order_detail", str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token, {"order_sn_list": order_sn})
-    
-    if det.get("error"):
-        frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
-        return
+    try:
+        # Get order details
+        det = _call("/api/v2/order/get_order_detail", str(s.partner_id).strip(), s.partner_key,
+                    s.shop_id, s.access_token, {"order_sn_list": [order_sn]})
         
-    order_list = det.get("response", {}).get("order_list", [])
-    if not order_list:
-        return
-    det = order_list[0]
+        if det.get("error"):
+            frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
+            return
+            
+        order_list = det.get("response", {}).get("order_list", [])
+        if not order_list:
+            frappe.log_error(f"No order data found for {order_sn}", "Shopee Order Processing")
+            return
+        det = order_list[0]
 
-    esc = _call("/api/v2/payment/get_escrow_detail", str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token, {"order_sn": order_sn})
-    
-    if esc.get("error"):
-        frappe.log_error(f"Failed to get escrow detail for {order_sn}: {esc.get('message')}")
-        esc = {"response": {}}
+        # Get escrow details
+        esc = _call("/api/v2/payment/get_escrow_detail", str(s.partner_id).strip(), s.partner_key,
+                    s.shop_id, s.access_token, {"order_sn": order_sn})
         
-    esc = esc.get("response", {}) or {}
+        if esc.get("error"):
+            frappe.log_error(f"Failed to get escrow detail for {order_sn}: {esc.get('message')}")
+            esc = {"response": {}}
+            
+        esc = esc.get("response", {}) or {}
 
-    customer = f"SHP-{det.get('buyer_username') or 'UNKNOWN'}"
-    if not frappe.db.exists("Customer", {"customer_name": customer}):
+        # Create or get customer
+        customer = _create_or_get_customer(det)
+
+        # Create Sales Invoice
+        si = frappe.new_doc("Sales Invoice")
+        si.customer = customer
+        si.posting_date = nowdate()
+        si.set_posting_time = 1
+        si.update_stock = 1
+        si.currency = "IDR"
+        si.shopee_order_sn = order_sn
+        si.remarks = f"Shopee order SN {order_sn}"
+
+        # Set company from settings
+        company = frappe.db.get_single_value("Global Defaults", "default_company")
+        if company:
+            si.company = company
+
+        # Add items to invoice
+        for it in det.get("item_list", []):
+            try:
+                # SKU fallback priority: model_sku -> item_sku -> item_id-model_id
+                sku = (it.get("model_sku") or "").strip() or \
+                      (it.get("item_sku") or "").strip() or \
+                      f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+                
+                # Ensure SKU is not empty
+                if not sku:
+                    sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
+                
+                qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+                rate = float(it.get("model_original_price") or it.get("model_discounted_price") or it.get("order_price") or 0)
+                
+                # Convert from Shopee micro units (if rate is very high, it's likely in micro units)
+                if rate > 1000000:  # Likely in micro units
+                    rate = rate / 100000
+                
+                # Auto-create item if not exists
+                item_code = _ensure_item_exists(sku, it, rate)
+                
+                row = si.append("items", {})
+                row.item_code = item_code
+                row.qty = qty
+                row.rate = rate
+                row.amount = qty * rate
+                
+                # Set warehouse if configured
+                warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+                if warehouse:
+                    row.warehouse = warehouse
+
+            except Exception as item_error:
+                frappe.log_error(f"Failed to process item in order {order_sn}: {str(item_error)}", 
+                               "Shopee Item Processing")
+                continue
+
+        # Only proceed if we have items
+        if not si.items:
+            frappe.log_error(f"No valid items found for order {order_sn}", "Shopee Order Processing")
+            return
+
+        si.insert(ignore_permissions=True)
+        si.submit()
+        
+        frappe.logger().info(f"Created Sales Invoice {si.name} for order {order_sn}")
+
+        # Create Payment Entry if there's payment
+        net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
+        if net > 0:
+            _create_payment_entry(si, esc, net, order_sn)
+
+    except Exception as e:
+        frappe.log_error(f"Failed to process order {order_sn}: {str(e)}", "Shopee Order Processing")
+        raise
+
+def _create_or_get_customer(order_detail):
+    """Create or get customer from order details."""
+    buyer_username = order_detail.get("buyer_username") or f"buyer_{order_detail.get('buyer_user_id', 'unknown')}"
+    customer_name = f"SHP-{buyer_username}"
+    
+    # Check if customer exists
+    if frappe.db.exists("Customer", {"customer_name": customer_name}):
+        return customer_name
+
+    # Create new customer
+    try:
         c = frappe.new_doc("Customer")
-        c.customer_name = customer
-        c.customer_group = "All Customer Groups"
+        c.customer_name = customer_name
+        c.customer_group = _get_customer_group()
         c.customer_type = "Individual"
+        c.territory = "All Territories"  # Default territory
+        
+        # Set customer primary contact if available
+        recipient_address = order_detail.get("recipient_address", {})
+        if recipient_address:
+            c.customer_primary_contact = _create_customer_contact(customer_name, recipient_address)
+        
         c.insert(ignore_permissions=True)
-
-    si = frappe.new_doc("Sales Invoice")
-    si.customer = customer
-    si.posting_date = nowdate()
-    si.set_posting_time = 1
-    si.update_stock = 1
-    si.currency = "IDR"
-    si.shopee_order_sn = order_sn
-    si.remarks = f"Shopee order SN {order_sn}"
-
-    for it in det.get("item_list", []):
-        # SKU fallback priority: model_sku -> item_sku -> item_id-model_id
-        sku = (it.get("model_sku") or "").strip() or \
-              (it.get("item_sku") or "").strip() or \
-              f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+        return customer_name
         
-        # Ensure SKU is not empty
-        if not sku:
-            sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
+    except Exception as e:
+        frappe.log_error(f"Failed to create customer {customer_name}: {str(e)}", "Shopee Customer Creation")
+        # Return the name anyway, customer might have been created by another process
+        return customer_name
+
+def _create_customer_contact(customer_name, address_data):
+    """Create contact for customer."""
+    try:
+        contact = frappe.new_doc("Contact")
+        contact.first_name = address_data.get("name", customer_name)
+        contact.phone = address_data.get("phone", "")
         
-        qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-        rate = float(it.get("model_original_price") or it.get("model_discounted_price") or it.get("order_price") or 0)
+        # Link to customer
+        contact.append("links", {
+            "link_doctype": "Customer",
+            "link_name": customer_name
+        })
         
-        # Auto-create item if not exists
-        item_code = _ensure_item_exists(sku, it, rate)
+        contact.insert(ignore_permissions=True)
+        return contact.name
+    except Exception as e:
+        frappe.log_error(f"Failed to create contact for {customer_name}: {str(e)}", "Shopee Contact Creation")
+        return None
+
+def _create_payment_entry(si, esc, net, order_sn):
+    """Create payment entry with Shopee fees."""
+    try:
+        # Account mappings for Shopee fees
+        ACC = {
+            "commission": _get_or_create_account("Komisi Shopee", "Expense Account"),
+            "service": _get_or_create_account("Biaya Layanan Shopee", "Expense Account"),
+            "protection": _get_or_create_account("Proteksi Pengiriman Shopee", "Expense Account"),
+            "shipdiff": _get_or_create_account("Selisih Ongkir Shopee", "Expense Account"),
+            "voucher": _get_or_create_account("Voucher Shopee", "Expense Account")
+        }
+
+        fees = {
+            "commission": float(esc.get("commission_fee") or esc.get("seller_commission_fee") or 0),
+            "service": float(esc.get("service_fee") or esc.get("seller_service_fee") or 0),
+            "protection": float(esc.get("shipping_seller_protection_fee_amount") or 0),
+            "shipdiff": float(esc.get("shipping_fee_difference") or 0),
+            "voucher": float(esc.get("voucher_seller") or 0)
+                          + float(esc.get("coin_cash_back") or 0)
+                          + float(esc.get("voucher_code_seller") or 0),
+        }
+
+        # Get default accounts
+        paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account")
+        if not paid_from:
+            company = frappe.db.get_single_value("Global Defaults", "default_company")
+            paid_from = frappe.db.get_value("Company", company, "default_receivable_account")
         
-        row = si.append("items", {})
-        row.item_code = item_code
-        row.qty = qty
-        row.rate = rate
+        paid_to = _get_or_create_account("Bank - Shopee (Escrow)", "Bank")
 
-    si.insert(ignore_permissions=True)
-    si.submit()
+        pe = frappe.new_doc("Payment Entry")
+        pe.payment_type = "Receive"
+        pe.party_type = "Customer"
+        pe.party = si.customer
+        pe.posting_date = nowdate()
+        pe.mode_of_payment = _get_or_create_mode_of_payment("Shopee")
+        pe.paid_from = paid_from
+        pe.paid_to = paid_to
+        pe.paid_amount = net
+        pe.received_amount = net
+        pe.reference_no = order_sn
 
-    net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
-    if net <= 0:
-        return
+        # Set company
+        company = frappe.db.get_single_value("Global Defaults", "default_company")
+        if company:
+            pe.company = company
 
-    ACC = {
-        "commission": "Komisi Shopee",
-        "service":    "Biaya Layanan Shopee",
-        "protection": "Proteksi Pengiriman Shopee",
-        "shipdiff":   "Selisih Ongkir Shopee",
-        "voucher":    "Voucher Shopee"
-    }
+        # Link to Sales Invoice
+        r = pe.append("references", {})
+        r.reference_doctype = "Sales Invoice"
+        r.reference_name = si.name
+        r.allocated_amount = net + sum(fees.values())
 
-    fees = {
-        "commission": float(esc.get("commission_fee") or esc.get("seller_commission_fee") or 0),
-        "service":    float(esc.get("service_fee") or esc.get("seller_service_fee") or 0),
-        "protection": float(esc.get("shipping_seller_protection_fee_amount") or 0),
-        "shipdiff":   float(esc.get("shipping_fee_difference") or 0),
-        "voucher":    float(esc.get("voucher_seller") or 0)
-                      + float(esc.get("coin_cash_back") or 0)
-                      + float(esc.get("voucher_code_seller") or 0),
-    }
+        # Add fee deductions
+        for k, v in fees.items():
+            if v > 0:
+                d = pe.append("deductions", {})
+                d.account = ACC[k]
+                d.amount = v
 
-    paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account") or "Debtors - AC"
-    paid_to   = "Bank - Shopee (Escrow)"
+        pe.insert(ignore_permissions=True)
+        pe.submit()
+        
+        frappe.logger().info(f"Created Payment Entry {pe.name} for order {order_sn}")
 
-    pe = frappe.new_doc("Payment Entry")
-    pe.payment_type = "Receive"
-    pe.party_type = "Customer"
-    pe.party = customer
-    pe.posting_date = nowdate()
-    pe.mode_of_payment = "Shopee"
-    pe.paid_from = paid_from
-    pe.paid_to = paid_to
-    pe.paid_amount = net
-    pe.received_amount = net
+    except Exception as e:
+        frappe.log_error(f"Failed to create payment entry for {order_sn}: {str(e)}", "Shopee Payment Entry Creation")
 
-    r = pe.append("references", {})
-    r.reference_doctype = "Sales Invoice"
-    r.reference_name = si.name
-    r.allocated_amount = net + sum(fees.values())
+def _get_or_create_account(account_name, account_type):
+    """Get or create account."""
+    if frappe.db.exists("Account", {"account_name": account_name}):
+        return account_name
+    
+    try:
+        company = frappe.db.get_single_value("Global Defaults", "default_company")
+        
+        account = frappe.new_doc("Account")
+        account.account_name = account_name
+        account.account_type = account_type
+        account.company = company
+        
+        # Set parent account based on type
+        if account_type == "Bank":
+            account.parent_account = "Bank Accounts - " + frappe.db.get_value("Company", company, "abbr")
+        elif account_type == "Expense Account":
+            account.parent_account = "Expenses - " + frappe.db.get_value("Company", company, "abbr")
+        
+        account.insert(ignore_permissions=True)
+        return account_name
+    except Exception as e:
+        frappe.log_error(f"Failed to create account {account_name}: {str(e)}", "Shopee Account Creation")
+        # Return a default account
+        return frappe.db.get_single_value("Accounts Settings", "default_cash_account")
 
-    for k, v in fees.items():
-        if v:
-            d = pe.append("deductions", {})
-            d.account = ACC[k]
-            d.amount  = v
-
-    pe.insert(ignore_permissions=True)
-    pe.submit()
+def _get_or_create_mode_of_payment(mode_name):
+    """Get or create mode of payment."""
+    if frappe.db.exists("Mode of Payment", mode_name):
+        return mode_name
+    
+    try:
+        mode = frappe.new_doc("Mode of Payment")
+        mode.mode_of_payment = mode_name
+        mode.type = "Electronic"
+        mode.insert(ignore_permissions=True)
+        return mode_name
+    except Exception as e:
+        frappe.log_error(f"Failed to create mode of payment {mode_name}: {str(e)}", "Shopee Mode of Payment Creation")
+        return "Cash"  # Fallback to default
 
 @frappe.whitelist()
 def debug_sign():
@@ -484,37 +779,47 @@ def exchange_code(code: str, shop_id: str | None = None):
     }
 
 def _cfg_defaults():
+    """Get configuration defaults from settings."""
     s = _settings()
     return {
         "price_list": getattr(s, "price_list", None) or "Standard Selling",
         "item_group": getattr(s, "item_group", None) or "Products",
-        "stock_uom":  getattr(s, "stock_uom",  None) or "pcs",
+        "stock_uom": getattr(s, "stock_uom", None) or "Nos",
     }
 
 def _get_or_create_price_list(pl_name: str):
+    """Get or create price list."""
     if not frappe.db.exists("Price List", {"price_list_name": pl_name}):
-        pl = frappe.new_doc("Price List")
-        pl.price_list_name = pl_name
-        pl.selling = 1
-        pl.insert(ignore_permissions=True)
+        try:
+            pl = frappe.new_doc("Price List")
+            pl.price_list_name = pl_name
+            pl.selling = 1
+            pl.currency = "IDR"
+            pl.insert(ignore_permissions=True)
+        except Exception as e:
+            frappe.log_error(f"Failed to create price list {pl_name}: {str(e)}", "Shopee Price List Creation")
 
 def _upsert_price(item_code: str, price_list: str, currency: str, rate: float):
-    _get_or_create_price_list(price_list)
-    cond = {"item_code": item_code, "price_list": price_list, "currency": currency}
-    name = frappe.db.get_value("Item Price", cond, "name")
-    if name:
-        ip = frappe.get_doc("Item Price", name)
-        ip.price_list_rate = rate
-        ip.save(ignore_permissions=True)
-    else:
-        ip = frappe.new_doc("Item Price")
-        ip.update({
-            "item_code": item_code,
-            "price_list": price_list,
-            "currency": currency,
-            "price_list_rate": rate,
-        })
-        ip.insert(ignore_permissions=True)
+    """Update or insert item price."""
+    try:
+        _get_or_create_price_list(price_list)
+        cond = {"item_code": item_code, "price_list": price_list, "currency": currency}
+        name = frappe.db.get_value("Item Price", cond, "name")
+        if name:
+            ip = frappe.get_doc("Item Price", name)
+            ip.price_list_rate = rate
+            ip.save(ignore_permissions=True)
+        else:
+            ip = frappe.new_doc("Item Price")
+            ip.update({
+                "item_code": item_code,
+                "price_list": price_list,
+                "currency": currency,
+                "price_list_rate": rate,
+            })
+            ip.insert(ignore_permissions=True)
+    except Exception as e:
+        frappe.log_error(f"Failed to upsert price for {item_code}: {str(e)}", "Shopee Price Update")
 
 def _upsert_item(item_code: str, item_name: str, item_group: str, stock_uom: str, rate: float) -> str:
     """Idempotent upsert Item. Return item_code actually used."""
@@ -546,11 +851,13 @@ def _upsert_item(item_code: str, item_name: str, item_group: str, stock_uom: str
                 doc.standard_rate = rate
             doc.insert(ignore_permissions=True)
             return doc.name
-    except Exception:
+    except Exception as e:
+        frappe.log_error(f"Failed to upsert item {item_code}: {str(e)}", "Shopee Item Upsert")
         # fallback terakhir
         return _create_fallback_item(item_code, item_name, rate)
 
 def _get_models_for_item(item_id: int):
+    """Get models/variations for a Shopee item."""
     s = _settings()
     res = _call(
         "/api/v2/product/get_model_list",
@@ -564,9 +871,8 @@ def _get_models_for_item(item_id: int):
     models = resp.get("model") or resp.get("models") or []
     return models if isinstance(models, list) else []
 
-
-# --- nama item dasar (tanpa model) ---
 def _get_item_base_info(item_id: int):
+    """Get base item information from Shopee."""
     s = _settings()
     res = _call(
         "/api/v2/product/get_item_base_info",
@@ -574,7 +880,7 @@ def _get_item_base_info(item_id: int):
         s.partner_key,
         s.shop_id,
         s.access_token,
-        {"item_id_list": str(item_id)},
+        {"item_id_list": [int(item_id)]},
     )
     lst = (res.get("response") or {}).get("item_list", []) or []
     return lst[0] if lst and isinstance(lst, list) else {}
@@ -582,6 +888,7 @@ def _get_item_base_info(item_id: int):
 @frappe.whitelist()
 def sync_items(hours: int = 720, status: str = "NORMAL"):
     """
+    Enhanced item sync with better error handling.
     Sinkron Item dari Shopee ke ERPNext dengan model_sku sebagai Item Code bila ada.
     - hours: jendela update_time ke belakang (default 30 hari).
     - status: filter Shopee item_status (default 'NORMAL').
@@ -597,91 +904,388 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
     page_size, offset = 100, 0
     created, updated = 0, 0
     processed_items = 0
+    error_count = 0
 
-    while True:
-        gl = _call(
-            "/api/v2/product/get_item_list",
-            str(s.partner_id).strip(),
-            s.partner_key,
-            s.shop_id,
-            s.access_token,
-            {
-                "offset": offset,
-                "page_size": page_size,
-                "update_time_from": time_from,
-                "update_time_to": time_to,
-                "item_status": status,
-            },
-        )
+    frappe.logger().info(f"Starting item sync: from {time_from} to {time_to}")
 
-        # Guard: pastikan dict & bukan error
-        if not isinstance(gl, dict):
-            frappe.log_error(
-                f"Unexpected get_item_list payload type: {type(gl).__name__}",
-                "Shopee sync_items",
-            )
-            return {"ok": False, "error": "bad_payload_type"}
+    # Ensure token is valid
+    refresh_if_needed()
 
-        if gl.get("error"):
-            frappe.log_error(f"get_item_list error: {gl.get('error')} - {gl.get('message')}", "Shopee sync_items")
-            return {"ok": False, "error": gl.get("error"), "message": gl.get("message")}
+    try:
+        while True:
+            try:
+                # Add small delay between API calls
+                if processed_items > 0:
+                    time.sleep(0.3)
 
-        resp = gl.get("response") or {}
-        # Beberapa region: 'item' vs 'items', 'has_next_page' vs 'has_next'
-        item_list = (resp.get("item") or resp.get("items") or [])
-        if not isinstance(item_list, list):
-            item_list = []
-
-        has_next = bool(resp.get("has_next_page") or resp.get("has_next") or False)
-
-        for it in item_list:
-            processed_items += 1
-            item_id = int(it.get("item_id"))
-            base = _get_item_base_info(item_id)
-            base_name = base.get("item_name") or f"Item {item_id}"
-
-            models = _get_models_for_item(item_id)
-
-            # Tanpa model → satu Item
-            if not models:
-                sku = str(base.get("item_sku") or item_id)
-                rate = float(base.get("normal_price") or 0)
-                used_code = _upsert_item(
-                    sku, base_name, defaults["item_group"], defaults["stock_uom"], rate
+                gl = _call(
+                    "/api/v2/product/get_item_list",
+                    str(s.partner_id).strip(),
+                    s.partner_key,
+                    s.shop_id,
+                    s.access_token,
+                    {
+                        "offset": offset,
+                        "page_size": page_size,
+                        "update_time_from": time_from,
+                        "update_time_to": time_to,
+                        "item_status": status,
+                    },
                 )
-                _upsert_price(used_code, defaults["price_list"], currency, rate)
-                if not frappe.db.exists("Item", {"item_code": sku}):
-                    created += 1
-                else:
-                    updated += 1
+
+                # Guard: pastikan dict & bukan error
+                if not isinstance(gl, dict):
+                    frappe.log_error(
+                        f"Unexpected get_item_list payload type: {type(gl).__name__}",
+                        "Shopee sync_items",
+                    )
+                    return {"ok": False, "error": "bad_payload_type"}
+
+                if gl.get("error"):
+                    error_msg = f"get_item_list error: {gl.get('error')} - {gl.get('message')}"
+                    frappe.log_error(error_msg, "Shopee sync_items")
+                    
+                    # Handle token expiration
+                    if "access token expired" in str(gl.get("message", "")).lower():
+                        refresh_result = refresh_if_needed()
+                        if refresh_result.get("status") == "refreshed":
+                            continue  # Retry with new token
+                    
+                    return {"ok": False, "error": gl.get("error"), "message": gl.get("message")}
+
+                resp = gl.get("response") or {}
+                # Beberapa region: 'item' vs 'items', 'has_next_page' vs 'has_next'
+                item_list = (resp.get("item") or resp.get("items") or [])
+                if not isinstance(item_list, list):
+                    item_list = []
+
+                has_next = bool(resp.get("has_next_page") or resp.get("has_next") or False)
+
+                for it in item_list:
+                    try:
+                        processed_items += 1
+                        item_id = int(it.get("item_id"))
+                        base = _get_item_base_info(item_id)
+                        base_name = base.get("item_name") or f"Item {item_id}"
+
+                        models = _get_models_for_item(item_id)
+
+                        # Tanpa model → satu Item
+                        if not models:
+                            sku = str(base.get("item_sku") or item_id)
+                            rate = float(base.get("normal_price") or 0)
+                            
+                            # Convert from micro units if needed
+                            if rate > 1000000:
+                                rate = rate / 100000
+                            
+                            before_exists = frappe.db.exists("Item", {"item_code": sku})
+                            used_code = _upsert_item(
+                                sku, base_name, defaults["item_group"], defaults["stock_uom"], rate
+                            )
+                            _upsert_price(used_code, defaults["price_list"], currency, rate)
+                            
+                            if not before_exists:
+                                created += 1
+                            else:
+                                updated += 1
+                            continue
+
+                        # Ada model → satu Item per model
+                        for m in models:
+                            try:
+                                model_sku = (m.get("model_sku") or "").strip()
+                                sku = model_sku if model_sku else f"{item_id}-{m.get('model_id')}"
+                                model_name = m.get("model_name") or ""
+                                name = f"{base_name} - {model_name}" if model_name else base_name
+                                rate = float(m.get("price") or m.get("original_price") or 0)
+
+                                # Convert from micro units if needed
+                                if rate > 1000000:
+                                    rate = rate / 100000
+
+                                before_exists = frappe.db.exists("Item", {"item_code": sku})
+                                used_code = _upsert_item(
+                                    sku, name, defaults["item_group"], defaults["stock_uom"], rate
+                                )
+                                _upsert_price(used_code, defaults["price_list"], currency, rate)
+                                
+                                if not before_exists:
+                                    created += 1
+                                else:
+                                    updated += 1
+                            except Exception as model_error:
+                                error_count += 1
+                                frappe.log_error(f"Failed to process model {m.get('model_id')} for item {item_id}: {str(model_error)}", "Shopee Model Processing")
+                                continue
+
+                    except Exception as item_error:
+                        error_count += 1
+                        frappe.log_error(f"Failed to process item {it.get('item_id')}: {str(item_error)}", "Shopee Item Processing")
+                        continue
+
+                if not has_next:
+                    break
+                offset = resp.get("next_offset", offset + page_size)
+
+            except Exception as batch_error:
+                error_count += 1
+                frappe.log_error(f"Error processing item batch: {str(batch_error)}", "Shopee Item Sync")
+                if error_count > 5:
+                    break
                 continue
 
-            # Ada model → satu Item per model
-            for m in models:
-                model_sku = (m.get("model_sku") or "").strip()
-                sku = model_sku if model_sku else f"{item_id}-{m.get('model_id')}"
-                model_name = m.get("model_name") or ""
-                name = f"{base_name} - {model_name}" if model_name else base_name
-                rate = float(m.get("price") or m.get("original_price") or 0)
+        result = {
+            "ok": True,
+            "window": {"from": time_from, "to": time_to},
+            "processed_items": processed_items,
+            "created": created,
+            "updated": updated,
+            "errors": error_count
+        }
+        
+        frappe.logger().info(f"Item sync completed: {result}")
+        return result
 
-                before_exists = frappe.db.exists("Item", {"item_code": sku})
-                used_code = _upsert_item(
-                    sku, name, defaults["item_group"], defaults["stock_uom"], rate
-                )
-                _upsert_price(used_code, defaults["price_list"], currency, rate)
-                if not before_exists and frappe.db.exists("Item", {"item_code": used_code}):
-                    created += 1
+    except Exception as e:
+        frappe.log_error(f"Item sync failed: {str(e)}", "Shopee Item Sync Critical Error")
+        return {
+            "ok": False,
+            "error": "critical_error",
+            "message": str(e),
+            "processed_items": processed_items,
+            "created": created,
+            "updated": updated,
+            "errors": error_count
+        }
+
+@frappe.whitelist()
+def test_connection():
+    """Test Shopee API connection and token validity."""
+    try:
+        s = _settings()
+        
+        if not s.access_token:
+            return {"success": False, "error": "No access token configured"}
+        
+        # Test with shop info API
+        result = _call("/api/v2/shop/get_shop_info", 
+                      str(s.partner_id).strip(), s.partner_key,
+                      s.shop_id, s.access_token, {})
+        
+        if result.get("error"):
+            # Try to refresh token if expired
+            if "access token expired" in str(result.get("message", "")).lower():
+                refresh_result = refresh_if_needed()
+                if refresh_result.get("status") == "refreshed":
+                    # Retry with new token
+                    result = _call("/api/v2/shop/get_shop_info", 
+                                  str(s.partner_id).strip(), s.partner_key,
+                                  s.shop_id, s.access_token, {})
+            
+            if result.get("error"):
+                return {"success": False, "error": result.get("error"), "message": result.get("message")}
+        
+        shop_info = result.get("response", {})
+        return {
+            "success": True,
+            "shop_name": shop_info.get("shop_name"),
+            "shop_id": shop_info.get("shop_id"),
+            "region": shop_info.get("region"),
+            "status": shop_info.get("status")
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": "exception", "message": str(e)}
+
+@frappe.whitelist()
+def manual_sync_order(order_sn: str):
+    """Manually sync a specific order by order SN."""
+    try:
+        if not order_sn:
+            frappe.throw("Order SN is required")
+        
+        _process_order(order_sn)
+        return {"success": True, "message": f"Order {order_sn} synced successfully"}
+    except Exception as e:
+        frappe.log_error(f"Manual order sync failed for {order_sn}: {str(e)}", "Manual Order Sync")
+        return {"success": False, "error": str(e)}
+
+@frappe.whitelist()
+def get_sync_status():
+    """Get current sync status and statistics."""
+    try:
+        s = _settings()
+        
+        # Get count of synced orders
+        total_orders = frappe.db.count("Sales Invoice", {"shopee_order_sn": ["!=", ""]})
+        
+        # Get recent sync info
+        last_sync_time = None
+        if s.last_success_update_time:
+            last_sync_time = datetime.fromtimestamp(int(s.last_success_update_time))
+        
+        # Get recent errors
+        recent_errors = frappe.db.count("Error Log", {
+            "error": ["like", "%Shopee%"],
+            "creation": [">=", datetime.now() - timedelta(hours=24)]
+        })
+        
+        return {
+            "success": True,
+            "token_status": "valid" if s.access_token else "missing",
+            "token_expires": datetime.fromtimestamp(int(s.token_expire_at)) if s.token_expire_at else None,
+            "last_sync": last_sync_time,
+            "total_synced_orders": total_orders,
+            "recent_errors": recent_errors,
+            "environment": s.environment
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Scheduled job functions (called by ERPNext scheduler)
+def scheduled_order_sync():
+    """Scheduled function to sync recent orders (called by scheduler)."""
+    try:
+        frappe.logger().info("Starting scheduled order sync")
+        result = sync_recent_orders(hours=24)  # Sync last 24 hours
+        
+        if result.get("errors", 0) > 0:
+            frappe.logger().warning(f"Order sync completed with {result.get('errors')} errors")
+        else:
+            frappe.logger().info(f"Order sync completed successfully: {result.get('processed_orders')} orders processed")
+            
+    except Exception as e:
+        frappe.log_error(f"Scheduled order sync failed: {str(e)}", "Scheduled Order Sync")
+
+def scheduled_token_refresh():
+    """Scheduled function to refresh token if needed (called by scheduler)."""
+    try:
+        result = refresh_if_needed()
+        if result.get("status") == "refreshed":
+            frappe.logger().info("Token refreshed successfully")
+    except Exception as e:
+        frappe.log_error(f"Scheduled token refresh failed: {str(e)}", "Scheduled Token Refresh")
+
+def scheduled_item_sync():
+    """Scheduled function to sync items (called weekly)."""
+    try:
+        frappe.logger().info("Starting scheduled item sync")
+        result = sync_items(hours=168)  # Sync last week
+        
+        if result.get("ok"):
+            frappe.logger().info(f"Item sync completed: {result.get('created')} created, {result.get('updated')} updated")
+        else:
+            frappe.logger().error(f"Item sync failed: {result.get('message')}")
+            
+    except Exception as e:
+        frappe.log_error(f"Scheduled item sync failed: {str(e)}", "Scheduled Item Sync")
+
+# Helper function for webhook handling (if you implement webhooks)
+@frappe.whitelist(allow_guest=True)
+def webhook_handler():
+    """Handle Shopee webhooks for real-time order updates."""
+    try:
+        # Get webhook data from request
+        data = frappe.local.form_dict
+        
+        # Validate webhook signature (implement based on Shopee webhook docs)
+        # ... signature validation logic ...
+        
+        # Process webhook data
+        event_type = data.get("event")
+        
+        if event_type == "order_status_update":
+            order_sn = data.get("order_sn")
+            if order_sn:
+                _process_order(order_sn)
+                
+        return {"success": True}
+        
+    except Exception as e:
+        frappe.log_error(f"Webhook handler failed: {str(e)}", "Shopee Webhook")
+        return {"success": False, "error": str(e)}
+    
+# Add this to your api.py file for direct OAuth handling
+
+@frappe.whitelist(allow_guest=True)
+def oauth_callback_handler():
+    """
+    Handle OAuth callback directly via API method.
+    This can be used as an alternative to the page-based callback.
+    """
+    try:
+        # Get parameters from request
+        code = frappe.form_dict.get('code')
+        shop_id = frappe.form_dict.get('shop_id')
+        error = frappe.form_dict.get('error')
+        error_description = frappe.form_dict.get('error_description')
+        
+        # Handle error case
+        if error:
+            frappe.local.response['type'] = 'redirect'
+            frappe.local.response['location'] = f"/app/shopee-settings?error={error}&error_description={error_description or ''}"
+            return
+        
+        # Handle success case
+        if code and shop_id:
+            try:
+                # Exchange code for tokens
+                result = exchange_code(code, shop_id)
+                
+                if result and result.get("ok"):
+                    # Success - redirect to settings with success message
+                    frappe.local.response['type'] = 'redirect'
+                    frappe.local.response['location'] = "/app/shopee-settings?success=1"
                 else:
-                    updated += 1
+                    # Failed - redirect with error
+                    frappe.local.response['type'] = 'redirect'
+                    frappe.local.response['location'] = "/app/shopee-settings?error=exchange_failed"
+                    
+            except Exception as e:
+                frappe.log_error(f"OAuth exchange failed: {str(e)}", "Shopee OAuth")
+                frappe.local.response['type'] = 'redirect'
+                frappe.local.response['location'] = f"/app/shopee-settings?error=server_error&message={str(e)}"
+        else:
+            # Invalid request
+            frappe.local.response['type'] = 'redirect'
+            frappe.local.response['location'] = "/app/shopee-settings?error=invalid_request"
+            
+    except Exception as e:
+        frappe.log_error(f"OAuth callback handler failed: {str(e)}", "Shopee OAuth")
+        frappe.local.response['type'] = 'redirect'
+        frappe.local.response['location'] = "/app/shopee-settings?error=callback_failed"
 
-        if not has_next:
-            break
-        offset = resp.get("next_offset", offset + page_size)
-
-    return {
-        "ok": True,
-        "window": {"from": time_from, "to": time_to},
-        "processed_items": processed_items,
-        "created": created,
-        "updated": updated,
-    }
+@frappe.whitelist()
+def get_oauth_status():
+    """Get current OAuth status for UI updates."""
+    try:
+        s = _settings()
+        
+        # Check if we have tokens
+        has_tokens = bool(s.access_token and s.refresh_token)
+        
+        # Check token expiry
+        token_expired = False
+        token_expires_soon = False
+        
+        if s.token_expire_at:
+            now = int(time.time())
+            expires_at = int(s.token_expire_at)
+            
+            token_expired = expires_at <= now
+            token_expires_soon = (expires_at - now) < 3600  # Less than 1 hour
+        
+        return {
+            "success": True,
+            "has_tokens": has_tokens,
+            "token_expired": token_expired,
+            "token_expires_soon": token_expires_soon,
+            "expires_at": s.token_expire_at,
+            "shop_id": s.shop_id,
+            "environment": s.environment
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
