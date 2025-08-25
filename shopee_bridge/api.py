@@ -453,8 +453,12 @@ def _process_order(order_sn: str):
 
     try:
         # Get order details
-        det = _call("/api/v2/order/get_order_detail", str(s.partner_id).strip(), s.partner_key,
-                    s.shop_id, s.access_token, {"order_sn_list": [order_sn]})
+        det = _call(
+            "/api/v2/order/get_order_detail",
+    str(s.partner_id).strip(), s.partner_key,
+    s.shop_id, s.access_token,
+    {"order_sn_list": order_sn}  # <-- WAJIB order_sn_list (string)
+)
         
         if det.get("error"):
             frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
@@ -1230,3 +1234,181 @@ def webhook_handler():
     except Exception as e:
         frappe.log_error(f"Webhook handler failed: {str(e)}", "Shopee Webhook")
         return {"success": False, "error": str(e)}
+
+@frappe.whitelist()
+def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
+    """Sync orders by absolute date range (time_from/time_to in UNIX seconds)."""
+    s = _settings()
+    if not s.access_token:
+        frappe.throw("Access token required. Please authenticate with Shopee first.")
+
+    if not time_from or not time_to or time_from > time_to:
+        frappe.throw("Invalid time range")
+
+    # Pastikan token masih valid
+    refresh_if_needed()
+
+    statuses = ["READY_TO_SHIP", "PROCESSED", "COMPLETED"]
+    seen = set()
+    processed_count, error_count = 0, 0
+    highest = int(s.last_success_update_time or 0)
+    page_size = int(page_size)
+
+    for st in statuses:
+        offset = 0
+        while True:
+            try:
+                resp = _call(
+                    "/api/v2/order/get_order_list",
+                    str(s.partner_id).strip(), s.partner_key,
+                    s.shop_id, s.access_token,
+                    {
+                        "time_range_field": "update_time",
+                        "time_from": int(time_from),
+                        "time_to": int(time_to),
+                        "page_size": page_size,
+                        "order_status": st,
+                        "offset": offset,
+                    },
+                )
+
+                if resp.get("error"):
+                    frappe.log_error(f"sync_orders_range error: {resp}", "Shopee API")
+                    break
+
+                data = resp.get("response") or {}
+                orders = data.get("order_list") or []
+                if not orders:
+                    break
+
+                for o in orders:
+                    order_sn = o.get("order_sn")
+                    if not order_sn or order_sn in seen:
+                        continue
+                    seen.add(order_sn)
+
+                    if not frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
+                        _process_order(order_sn)
+                        processed_count += 1
+
+                    ut = int(o.get("update_time") or 0)
+                    if ut > highest:
+                        highest = ut
+
+                if not data.get("has_next_page"):
+                    break
+                offset = data.get("next_offset", offset + page_size)
+
+            except Exception as e:
+                error_count += 1
+                frappe.log_error(f"sync_orders_range batch error: {e}", "Shopee Sync Range")
+                if error_count > 5:
+                    break
+                continue
+
+    if highest > int(s.last_success_update_time or 0):
+        s.last_success_update_time = highest
+        s.save(ignore_permissions=True)
+        frappe.db.commit()
+
+    return {
+        "from": time_from,
+        "to": time_to,
+        "max_update_time": highest,
+        "processed_orders": processed_count,
+        "errors": error_count,
+        "success": error_count < processed_count or processed_count == 0,
+    }
+
+@frappe.whitelist()
+def diagnose_order(order_sn: str):
+    """Diagnose why an order_sn cannot be fetched.
+    Returns a dict with visibility, detail/escrow results, and suggested fixes.
+    """
+    s = _settings()
+    order_sn = (order_sn or "").strip()
+    if not order_sn:
+        return {"ok": False, "reason": "empty_order_sn"}
+
+    ctx = {
+        "env": getattr(s, "environment", "Test") or "Test",
+        "shop_id": s.shop_id,
+        "merchant_id": getattr(s, "merchant_id", None),
+        "partner_id": str(s.partner_id).strip(),
+    }
+
+    out = {"ok": False, "context": ctx, "order_sn": order_sn}
+
+    # 1) Visibility check via get_order_list (3 hari terakhir, 3 status umum)
+    try:
+        now = int(time.time())
+        visible = False
+        hits = []
+        for st in ["READY_TO_SHIP", "PROCESSED", "COMPLETED"]:
+            r = _call("/api/v2/order/get_order_list",
+                      str(s.partner_id).strip(), s.partner_key,
+                      s.shop_id, s.access_token,
+                      {"time_range_field": "update_time",
+                       "time_from": now - 3*24*3600,
+                       "time_to": now,
+                       "page_size": 50,
+                       "order_status": st,
+                       "offset": 0})
+            rows = (r.get("response") or {}).get("order_list") or []
+            if any((o.get("order_sn") or "").strip() == order_sn for o in rows):
+                visible = True
+                hits.append(st)
+        out["visible_in_list"] = visible
+        out["visible_status_hits"] = hits
+    except Exception as e:
+        out["visible_error"] = f"{e}"
+
+    # 2) get_order_detail via shop_id
+    det_shop = _call("/api/v2/order/get_order_detail",
+                     str(s.partner_id).strip(), s.partner_key,
+                     s.shop_id, s.access_token,
+                     {"order_sn_list": order_sn})
+    out["detail_via_shop"] = {"error": det_shop.get("error"), "message": det_shop.get("message")}
+    shop_ok = not det_shop.get("error") and (det_shop.get("response") or {}).get("order_list")
+
+    # 3) get_order_detail via merchant_id (fallback), jika ada
+    merch_ok = False
+    det_merch = {}
+    mid = getattr(s, "merchant_id", None)
+    if not shop_ok and mid:
+        det_merch = _call("/api/v2/order/get_order_detail",
+                          str(s.partner_id).strip(), s.partner_key,
+                          None, s.access_token,
+                          {"order_sn_list": order_sn, "merchant_id": int(mid)})
+        out["detail_via_merchant"] = {"error": det_merch.get("error"), "message": det_merch.get("message")}
+        merch_ok = not det_merch.get("error") and (det_merch.get("response") or {}).get("order_list")
+
+    # 4) Escrow (opsional)
+    esc_shop = _call("/api/v2/payment/get_escrow_detail",
+                     str(s.partner_id).strip(), s.partner_key,
+                     s.shop_id, s.access_token,
+                     {"order_sn": order_sn})
+    out["escrow_via_shop"] = {"error": esc_shop.get("error"), "message": esc_shop.get("message")}
+
+    esc_merch = {}
+    if esc_shop.get("error") and mid:
+        esc_merch = _call("/api/v2/payment/get_escrow_detail",
+                          str(s.partner_id).strip(), s.partner_key,
+                          None, s.access_token,
+                          {"order_sn": order_sn, "merchant_id": int(mid)})
+        out["escrow_via_merchant"] = {"error": esc_merch.get("error"), "message": esc_merch.get("message")}
+
+    # 5) Kesimpulan & saran
+    advice = []
+    if not out.get("visible_in_list"):
+        advice.append("Order tidak terlihat oleh token/shop saat ini. Cek ENV (Test/Prod) & Shop ID.")
+    if not shop_ok and mid and merch_ok:
+        advice.append("Gunakan merchant_id untuk get_order_detail (token merchant-level).")
+    if not shop_ok and not merch_ok:
+        advice.append("Detail tetap tidak ditemukan. Kemungkinan: ENV/Shop mismatch, atau order di luar retensi Shopee.")
+    if ctx["env"] == "Test":
+        advice.append("Jika order berasal dari Production, ubah Environment ke Production dan Connect ulang.")
+
+    out["advice"] = advice
+    out["ok"] = bool(out.get("visible_in_list") and (shop_ok or merch_ok))
+    return out
