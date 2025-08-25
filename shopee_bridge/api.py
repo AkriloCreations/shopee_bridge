@@ -1321,9 +1321,10 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
     }
 
 @frappe.whitelist()
-def diagnose_order(order_sn: str):
+def diagnose_order(order_sn: str, lookback_days: int = 60, max_pages: int = 40):
     """Diagnose why an order_sn cannot be fetched.
-    Returns a dict with visibility, detail/escrow results, and suggested fixes.
+    - Search get_order_list over a wider window (create_time & update_time) and all statuses.
+    - Try detail via shop_id, then fallback via merchant_id (if present).
     """
     s = _settings()
     order_sn = (order_sn or "").strip()
@@ -1337,78 +1338,89 @@ def diagnose_order(order_sn: str):
         "partner_id": str(s.partner_id).strip(),
     }
 
-    out = {"ok": False, "context": ctx, "order_sn": order_sn}
+    statuses = ["UNPAID","READY_TO_SHIP","PROCESSED","SHIPPED","COMPLETED","CANCELLED","IN_CANCEL","INVOICE_PENDING"]
+    fields = ["update_time","create_time"]
 
-    # 1) Visibility check via get_order_list (3 hari terakhir, 3 status umum)
+    now = int(time.time())
+    tf = now - int(lookback_days) * 24 * 3600
+    found = False
+    hits = []
+
+    # 1) Visibility scan (paged, broad)
     try:
-        now = int(time.time())
-        visible = False
-        hits = []
-        for st in ["READY_TO_SHIP", "PROCESSED", "COMPLETED"]:
-            r = _call("/api/v2/order/get_order_list",
-                      str(s.partner_id).strip(), s.partner_key,
-                      s.shop_id, s.access_token,
-                      {"time_range_field": "update_time",
-                       "time_from": now - 3*24*3600,
-                       "time_to": now,
-                       "page_size": 50,
-                       "order_status": st,
-                       "offset": 0})
-            rows = (r.get("response") or {}).get("order_list") or []
-            if any((o.get("order_sn") or "").strip() == order_sn for o in rows):
-                visible = True
-                hits.append(st)
-        out["visible_in_list"] = visible
-        out["visible_status_hits"] = hits
+        for field in fields:
+            for st in statuses:
+                offset = 0
+                pages = 0
+                while pages < int(max_pages):
+                    r = _call(
+                        "/api/v2/order/get_order_list",
+                        str(s.partner_id).strip(), s.partner_key,
+                        s.shop_id, s.access_token,
+                        {
+                            "time_range_field": field,
+                            "time_from": tf,
+                            "time_to": now,
+                            "page_size": 50,
+                            "order_status": st,
+                            "offset": offset,
+                        },
+                    )
+                    rows = (r.get("response") or {}).get("order_list") or []
+                    if any((o.get("order_sn") or "").strip() == order_sn for o in rows):
+                        found = True
+                        hits.append({"status": st, "field": field})
+                        break
+                    if not rows or not (r.get("response") or {}).get("has_next_page"):
+                        break
+                    offset = (r.get("response") or {}).get("next_offset", offset + 50)
+                    pages += 1
+            if found:
+                break
     except Exception as e:
-        out["visible_error"] = f"{e}"
+        frappe.log_error(f"diagnose scan error: {e}", "Shopee Diagnose")
 
-    # 2) get_order_detail via shop_id
-    det_shop = _call("/api/v2/order/get_order_detail",
-                     str(s.partner_id).strip(), s.partner_key,
-                     s.shop_id, s.access_token,
-                     {"order_sn_list": order_sn})
+    out = {
+        "ok": False,
+        "context": ctx,
+        "order_sn": order_sn,
+        "visible_in_list": bool(found),
+        "visible_status_hits": hits,
+    }
+
+    # 2) Detail via shop_id
+    det_shop = _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(), s.partner_key,
+        s.shop_id, s.access_token,
+        {"order_sn_list": order_sn}
+    )
     out["detail_via_shop"] = {"error": det_shop.get("error"), "message": det_shop.get("message")}
     shop_ok = not det_shop.get("error") and (det_shop.get("response") or {}).get("order_list")
 
-    # 3) get_order_detail via merchant_id (fallback), jika ada
+    # 3) Detail via merchant_id (jika ada & shop gagal)
     merch_ok = False
     det_merch = {}
     mid = getattr(s, "merchant_id", None)
     if not shop_ok and mid:
-        det_merch = _call("/api/v2/order/get_order_detail",
-                          str(s.partner_id).strip(), s.partner_key,
-                          None, s.access_token,
-                          {"order_sn_list": order_sn, "merchant_id": int(mid)})
+        det_merch = _call(
+            "/api/v2/order/get_order_detail",
+            str(s.partner_id).strip(), s.partner_key,
+            None, s.access_token,
+            {"order_sn_list": order_sn, "merchant_id": int(mid)}
+        )
         out["detail_via_merchant"] = {"error": det_merch.get("error"), "message": det_merch.get("message")}
         merch_ok = not det_merch.get("error") and (det_merch.get("response") or {}).get("order_list")
 
-    # 4) Escrow (opsional)
-    esc_shop = _call("/api/v2/payment/get_escrow_detail",
-                     str(s.partner_id).strip(), s.partner_key,
-                     s.shop_id, s.access_token,
-                     {"order_sn": order_sn})
-    out["escrow_via_shop"] = {"error": esc_shop.get("error"), "message": esc_shop.get("message")}
-
-    esc_merch = {}
-    if esc_shop.get("error") and mid:
-        esc_merch = _call("/api/v2/payment/get_escrow_detail",
-                          str(s.partner_id).strip(), s.partner_key,
-                          None, s.access_token,
-                          {"order_sn": order_sn, "merchant_id": int(mid)})
-        out["escrow_via_merchant"] = {"error": esc_merch.get("error"), "message": esc_merch.get("message")}
-
-    # 5) Kesimpulan & saran
     advice = []
-    if not out.get("visible_in_list"):
-        advice.append("Order tidak terlihat oleh token/shop saat ini. Cek ENV (Test/Prod) & Shop ID.")
+    if not found:
+        advice.append(f"Order tidak terlihat di get_order_list {lookback_days} hari terakhir (create/update). "
+                      "Cek ENV/Shop ID/region. Coba perpanjang lookback_days.")
     if not shop_ok and mid and merch_ok:
         advice.append("Gunakan merchant_id untuk get_order_detail (token merchant-level).")
     if not shop_ok and not merch_ok:
-        advice.append("Detail tetap tidak ditemukan. Kemungkinan: ENV/Shop mismatch, atau order di luar retensi Shopee.")
-    if ctx["env"] == "Test":
-        advice.append("Jika order berasal dari Production, ubah Environment ke Production dan Connect ulang.")
+        advice.append("Detail tetap tidak ditemukan. Kemungkinan ENV/Shop mismatch, region beda, atau order di luar retensi.")
 
     out["advice"] = advice
-    out["ok"] = bool(out.get("visible_in_list") and (shop_ok or merch_ok))
+    out["ok"] = bool(found and (shop_ok or merch_ok))
     return out
