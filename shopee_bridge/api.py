@@ -86,8 +86,15 @@ def connect_url(app_type: str = "shop"):
     # sign base string: partner_id + path + timestamp (NO access_token/shop_id for auth)
     sign = _sign(partner_key, f"{partner_id}{path}{ts}")
 
-    # redirect HARUS sama persis dengan yang didaftarkan di Shopee OP
-    redirect = "https://erp.managerio.ddns.net/app/shopee-settings"
+    # Multiple redirect options - choose the one that works best for your setup
+    redirect_options = [
+        "https://erp.managerio.ddns.net/app/shopee-settings",  # Direct to settings
+        "https://erp.managerio.ddns.net/oauth-callback",       # Via callback page
+        "https://erp.managerio.ddns.net/api/method/shopee_bridge.shopee_bridge.doctype.shopee_settings.api.oauth_callback_handler"  # Direct API
+    ]
+    
+    # Use the first option by default, but make it configurable
+    redirect = getattr(s, 'oauth_redirect_url', None) or redirect_options[0]
 
     # urutan param disusun seperti contoh resmi Shopee: partner_id, redirect, timestamp, sign
     url = (
@@ -97,7 +104,14 @@ def connect_url(app_type: str = "shop"):
         f"&timestamp={ts}"
         f"&sign={sign}"
     )
-    return {"url": url}
+    
+    return {
+        "url": url,
+        "redirect_url": redirect,
+        "partner_id": partner_id,
+        "timestamp": ts,
+        "signature": sign
+    }
 
 @frappe.whitelist(allow_guest=True)
 def oauth_callback(code=None, shop_id=None, **kw):
@@ -1205,87 +1219,4 @@ def webhook_handler():
         
     except Exception as e:
         frappe.log_error(f"Webhook handler failed: {str(e)}", "Shopee Webhook")
-        return {"success": False, "error": str(e)}
-    
-# Add this to your api.py file for direct OAuth handling
-
-@frappe.whitelist(allow_guest=True)
-def oauth_callback_handler():
-    """
-    Handle OAuth callback directly via API method.
-    This can be used as an alternative to the page-based callback.
-    """
-    try:
-        # Get parameters from request
-        code = frappe.form_dict.get('code')
-        shop_id = frappe.form_dict.get('shop_id')
-        error = frappe.form_dict.get('error')
-        error_description = frappe.form_dict.get('error_description')
-        
-        # Handle error case
-        if error:
-            frappe.local.response['type'] = 'redirect'
-            frappe.local.response['location'] = f"/app/shopee-settings?error={error}&error_description={error_description or ''}"
-            return
-        
-        # Handle success case
-        if code and shop_id:
-            try:
-                # Exchange code for tokens
-                result = exchange_code(code, shop_id)
-                
-                if result and result.get("ok"):
-                    # Success - redirect to settings with success message
-                    frappe.local.response['type'] = 'redirect'
-                    frappe.local.response['location'] = "/app/shopee-settings?success=1"
-                else:
-                    # Failed - redirect with error
-                    frappe.local.response['type'] = 'redirect'
-                    frappe.local.response['location'] = "/app/shopee-settings?error=exchange_failed"
-                    
-            except Exception as e:
-                frappe.log_error(f"OAuth exchange failed: {str(e)}", "Shopee OAuth")
-                frappe.local.response['type'] = 'redirect'
-                frappe.local.response['location'] = f"/app/shopee-settings?error=server_error&message={str(e)}"
-        else:
-            # Invalid request
-            frappe.local.response['type'] = 'redirect'
-            frappe.local.response['location'] = "/app/shopee-settings?error=invalid_request"
-            
-    except Exception as e:
-        frappe.log_error(f"OAuth callback handler failed: {str(e)}", "Shopee OAuth")
-        frappe.local.response['type'] = 'redirect'
-        frappe.local.response['location'] = "/app/shopee-settings?error=callback_failed"
-
-@frappe.whitelist()
-def get_oauth_status():
-    """Get current OAuth status for UI updates."""
-    try:
-        s = _settings()
-        
-        # Check if we have tokens
-        has_tokens = bool(s.access_token and s.refresh_token)
-        
-        # Check token expiry
-        token_expired = False
-        token_expires_soon = False
-        
-        if s.token_expire_at:
-            now = int(time.time())
-            expires_at = int(s.token_expire_at)
-            
-            token_expired = expires_at <= now
-            token_expires_soon = (expires_at - now) < 3600  # Less than 1 hour
-        
-        return {
-            "success": True,
-            "has_tokens": has_tokens,
-            "token_expired": token_expired,
-            "token_expires_soon": token_expires_soon,
-            "expires_at": s.token_expire_at,
-            "shop_id": s.shop_id,
-            "environment": s.environment
-        }
-        
-    except Exception as e:
         return {"success": False, "error": str(e)}
