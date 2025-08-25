@@ -1,5 +1,5 @@
 import time, hmac, hashlib, requests, frappe
-from frappe.utils import get_url, nowdate
+from frappe.utils import get_url, nowdate, cint
 from datetime import datetime, timedelta
 import json
 
@@ -1663,3 +1663,186 @@ def fix_item_names_from_shopee(update: int = 0, limit_pages: int = 999):
         offset = resp.get("next_offset", offset + page_size); pages += 1
     if int(update): frappe.db.commit()
     return {"updated": updated, "sample": preview[:50], "total_candidates": len(preview)}
+
+# --- imports yang mungkin kamu belum punya di atas file
+from frappe.utils import nowdate, cint
+
+# --- helper: buat Sales Order
+def _make_sales_order(customer: str, company: str, items: list, order_sn: str):
+    so = frappe.new_doc("Sales Order")
+    so.customer = customer
+    so.transaction_date = nowdate()
+    if company:
+        so.company = company
+    so.custom_shopee_order_sn = order_sn
+    for it in items:
+        row = so.append("items", {})
+        row.item_code = it["item_code"]
+        row.item_name = it.get("item_name")
+        row.qty = it["qty"]
+        row.rate = it["rate"]
+    so.insert(ignore_permissions=True)
+    so.submit()
+    frappe.logger().info(f"Created Sales Order {so.name} for {order_sn}")
+    return so
+
+# --- helper: optional Work Orders kalau item punya BOM default
+def _maybe_create_work_orders(so_name: str):
+    try:
+        so = frappe.get_doc("Sales Order", so_name)
+        for i in so.items:
+            bom = frappe.db.get_value("BOM",
+                                      {"item": i.item_code, "is_active": 1, "is_default": 1},
+                                      "name")
+            if bom:
+                wo = frappe.new_doc("Work Order")
+                wo.production_item = i.item_code
+                wo.bom_no = bom
+                wo.qty = i.qty
+                wo.sales_order = so.name
+                wo.company = so.company
+                wo.insert(ignore_permissions=True)
+                wo.save()
+        frappe.logger().info(f"Work Order check done for {so_name}")
+    except Exception as e:
+        frappe.log_error(f"_maybe_create_work_orders error: {e}", "Shopee Phase2")
+
+# --- helper: Payment Entry sebagai advance ke SO (opsional)
+def _create_pe_advance(so_name: str, customer: str, net_amount: float, order_sn: str):
+    if net_amount <= 0:
+        return
+    pe = frappe.new_doc("Payment Entry")
+    pe.payment_type = "Receive"
+    pe.party_type = "Customer"
+    pe.party = customer
+    pe.paid_amount = net_amount
+    pe.received_amount = net_amount
+    pe.reference_no = f"Shopee {order_sn}"
+    pe.reference_date = nowdate()
+    pe.company = frappe.db.get_value("Sales Order", so_name, "company")
+    pe.append("references", {
+        "reference_doctype": "Sales Order",
+        "reference_name": so_name,
+        "allocated_amount": net_amount
+    })
+    pe.insert(ignore_permissions=True)
+    pe.submit()
+    frappe.logger().info(f"Advance PE {pe.name} created for {so_name}")
+
+# --- WHITELIST: saat stok siap, buat DN + SI dari SO
+@frappe.whitelist()
+def make_dn_si(order_sn: str = None, so_name: str = None, posting_date: str = None):
+    assert order_sn or so_name, "Provide order_sn or so_name"
+    if not so_name:
+        so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+    if not so_name:
+        frappe.throw("Sales Order not found")
+
+    so = frappe.get_doc("Sales Order", so_name)
+    company = so.company
+    posting_date = posting_date or nowdate()
+
+    # Delivery Note
+    dn = frappe.new_doc("Delivery Note")
+    dn.customer = so.customer
+    dn.company  = company
+    dn.posting_date = posting_date
+    dn.set_posting_time = 1
+    for i in so.items:
+        r = dn.append("items", {})
+        r.item_code = i.item_code
+        r.item_name = i.item_name
+        r.qty = i.qty
+        r.against_sales_order = so.name
+        r.so_detail = i.name
+        wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+        if wh: r.warehouse = wh
+    dn.insert(ignore_permissions=True)
+    dn.submit()
+
+    # Sales Invoice (tanpa update_stock; stok sudah keluar di DN)
+    si = frappe.new_doc("Sales Invoice")
+    si.customer = so.customer
+    si.company  = company
+    si.posting_date = posting_date
+    si.set_posting_time = 1
+    si.custom_shopee_order_sn = getattr(so, "custom_shopee_order_sn", "")
+    for i in so.items:
+        r = si.append("items", {})
+        r.item_code = i.item_code
+        r.item_name = i.item_name
+        r.qty = i.qty
+        r.rate = i.rate
+        r.sales_order = so.name
+        r.so_detail = i.name
+    si.insert(ignore_permissions=True)
+
+    # (Opsional) tarik advance dari Payment Entry via “Get Advances” manual,
+    # atau biarkan tim accounting lakukan alokasi. Supaya aman, kita submit SI
+    # meskipun advance belum dialokasikan.
+    si.submit()
+
+    return {"ok": True, "delivery_note": dn.name, "sales_invoice": si.name}
+
+# --- UBAH _process_order: sekarang buat SO (bukan SI) saat Phase 2
+def _process_order(order_sn: str):
+    s = _settings()
+
+    # skip kalau sudah pernah dibuat (cek SI atau SO)
+    if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}) \
+       or frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn}):
+        frappe.logger().info(f"Order {order_sn} already processed, skipping")
+        return
+
+    # ambil detail + escrow (fungsi _call kamu tetap)
+    det = _call("/api/v2/order/get_order_detail",
+                str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                {"order_sn_list": order_sn})
+    if det.get("error"):
+        frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
+        return
+    rows = (det.get("response") or {}).get("order_list") or []
+    if not rows:
+        frappe.log_error(f"No order data found for {order_sn}", "Shopee Order Processing")
+        return
+    det = rows[0]
+
+    esc = _call("/api/v2/payment/get_escrow_detail",
+                str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                {"order_sn": order_sn})
+    if esc.get("error"):
+        frappe.log_error(f"Failed to get escrow detail for {order_sn}: {esc.get('message')}")
+        esc = {"response": {}}
+    esc = esc.get("response", {}) or {}
+
+    customer = _create_or_get_customer(det)
+    company  = frappe.db.get_single_value("Global Defaults", "default_company")
+
+    # siapkan item list (re-use logic SKU/qty/rate kamu)
+    items = []
+    for it in det.get("item_list", []):
+        sku = (it.get("model_sku") or "").strip() or \
+              (it.get("item_sku") or "").strip() or \
+              f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+        if not sku:
+            sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
+        qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+        rate = float(it.get("model_original_price") or it.get("model_discounted_price") or it.get("order_price") or 0)
+        if rate > 1000000:
+            rate = rate / 100000
+        item_code = _ensure_item_exists(sku, it, rate)
+        items.append({"item_code": item_code, "item_name": it.get("item_name") or it.get("model_name"), "qty": qty, "rate": rate})
+
+    # flag mode Phase 2
+    use_so = cint(getattr(s, "use_sales_order_flow", 1))
+    if use_so:
+        so = _make_sales_order(customer, company, items, order_sn)
+        _maybe_create_work_orders(so.name)        # opsional, aman kalau tak ada BOM
+        net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
+        # bikin advance PE kalau mau langsung catat penerimaan Shopee
+        if net > 0:
+            _create_pe_advance(so.name, customer, net, order_sn)
+        return
+    else:
+        # fallback: mode lama (langsung SI) — biarkan kode lama kamu di sini bila diperlukan
+        pass
