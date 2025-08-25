@@ -159,121 +159,131 @@ def refresh_if_needed():
 
 @frappe.whitelist()
 def sync_recent_orders(hours: int = 24):
-    """Enhanced version with better error handling and retry logic."""
+    """Enhanced version with better error handling and retry logic (multi-status safe)."""
     s = _settings()
-    
     if not s.access_token:
         frappe.throw("Access token required. Please authenticate with Shopee first.")
-    
-    # Try to refresh token if it's about to expire
+
+    # Refresh token bila perlu
     refresh_result = refresh_if_needed()
     frappe.logger().info(f"Token refresh status: {refresh_result.get('status')}")
-        
+
     now = int(time.time())
     last = int(s.last_success_update_time or 0)
     overlap = int(getattr(s, "overlap_seconds", 600) or 600)
     time_from = (now - hours * 3600) if last == 0 else max(0, last - overlap)
     time_to = now
 
-    offset, page_size = 0, 50
+    page_size = 50
     highest = last
     processed_count = 0
     error_count = 0
     retry_attempts = 0
     max_retries = 3
 
+    # Shopee: order_status harus 1 nilai saja per request
+    statuses = ["READY_TO_SHIP", "PROCESSED", "COMPLETED"]
+    seen = set()  # dedupe order_sn antar status
+
     frappe.logger().info(f"Starting order sync: from {time_from} to {time_to}")
 
     try:
-        while True:
-            try:
-                # Rate limiting - add small delay between requests
-                if processed_count > 0 or retry_attempts > 0:
-                    time.sleep(0.5 + retry_attempts * 0.5)
-                
-                ol = _call("/api/v2/order/get_order_list", str(s.partner_id).strip(), s.partner_key,
-                           s.shop_id, s.access_token, {
-                               "time_range_field": "update_time",
-                               "time_from": time_from, "time_to": time_to,
-                               "page_size": page_size,
-                               "order_status": "READY_TO_SHIP,PROCESSED,COMPLETED",
-                               "offset": offset
-                           })
-                
-                if ol.get("error"):
-                    # Handle specific error cases
-                    error_msg = ol.get("message", "").lower()
-                    
-                    # Token expired - try refresh once
-                    if "access token expired" in error_msg or "invalid access token" in error_msg:
-                        if retry_attempts < max_retries:
-                            frappe.logger().info(f"Token expired, attempting refresh (attempt {retry_attempts + 1})")
-                            refresh_result = refresh_if_needed()
-                            if refresh_result.get("status") == "refreshed":
+        for st in statuses:
+            offset = 0
+            while True:
+                try:
+                    # small backoff
+                    if processed_count > 0 or retry_attempts > 0:
+                        time.sleep(0.5 + retry_attempts * 0.5)
+
+                    ol = _call(
+                        "/api/v2/order/get_order_list",
+                        str(s.partner_id).strip(), s.partner_key,
+                        s.shop_id, s.access_token,
+                        {
+                            "time_range_field": "update_time",
+                            "time_from": time_from,
+                            "time_to": time_to,
+                            "page_size": page_size,
+                            "order_status": st,   # << kirim satu status
+                            "offset": offset
+                        }
+                    )
+
+                    if ol.get("error"):
+                        msg_lc = (ol.get("message") or "").lower()
+
+                        # token expired → coba refresh
+                        if ("access token expired" in msg_lc or "invalid access token" in msg_lc) and retry_attempts < max_retries:
+                            frappe.logger().info(f"Token issue, refreshing (attempt {retry_attempts+1})")
+                            r = refresh_if_needed()
+                            if r.get("status") == "refreshed":
                                 retry_attempts += 1
-                                continue  # Retry with new token
-                    
-                    # Rate limit - wait longer
-                    if "rate limit" in error_msg or "too many requests" in error_msg:
-                        wait_time = 5 + retry_attempts * 2
-                        frappe.logger().info(f"Rate limited, waiting {wait_time} seconds...")
-                        time.sleep(wait_time)
-                        retry_attempts += 1
-                        if retry_attempts < max_retries:
+                                continue
+
+                        # rate limit → tunggu lalu retry
+                        if ("rate limit" in msg_lc or "too many requests" in msg_lc) and retry_attempts < max_retries:
+                            wait_time = 5 + retry_attempts * 2
+                            frappe.logger().info(f"Rate limited, waiting {wait_time}s…")
+                            time.sleep(wait_time)
+                            retry_attempts += 1
                             continue
-                    
-                    error_full = f"Failed to get orders: {ol.get('error')} - {ol.get('message')}"
-                    frappe.log_error(error_full, "Shopee API Error")
-                    
-                    error_count += 1
-                    if error_count > 3:
-                        frappe.throw(error_full)
-                    continue
-                    
-                resp = ol.get("response") or {}
-                orders = resp.get("order_list", [])
-                
-                if not orders:
-                    frappe.logger().info("No more orders found, breaking loop")
-                    break
-                
-                # Process orders with better error handling
-                batch_processed = 0
-                for o in orders:
-                    try:
-                        order_sn = o.get("order_sn")
-                        if order_sn:
-                            # Check if order already processed
+
+                        error_full = f"Failed to get orders: {ol.get('error')} - {ol.get('message')}"
+                        frappe.log_error(error_full, "Shopee API Error")
+                        error_count += 1
+                        if error_count > 3:
+                            frappe.throw(error_full)
+                        break  # keluar dari while current status
+
+                    resp = ol.get("response") or {}
+                    orders = resp.get("order_list", []) or []
+
+                    if not orders:
+                        frappe.logger().info(f"No orders for status {st}, moving on")
+                        break
+
+                    batch_processed = 0
+                    for o in orders:
+                        try:
+                            order_sn = o.get("order_sn")
+                            if not order_sn:
+                                continue
+                            if order_sn in seen:
+                                continue
+                            seen.add(order_sn)
+
+                            # skip jika sudah pernah dibuat
                             if not frappe.db.exists("Sales Invoice", {"shopee_order_sn": order_sn}):
                                 _process_order(order_sn)
                                 batch_processed += 1
+
                             ut = int(o.get("update_time") or 0)
                             if ut > highest:
                                 highest = ut
-                    except Exception as order_error:
-                        error_count += 1
-                        frappe.log_error(f"Failed to process order {order_sn}: {str(order_error)}", 
-                                       "Shopee Order Processing")
-                        # Continue processing other orders
-                        continue
-                
-                processed_count += batch_processed
-                frappe.logger().info(f"Processed {batch_processed} orders in this batch, total: {processed_count}")
+                        except Exception as order_error:
+                            error_count += 1
+                            frappe.log_error(f"Failed to process order {o.get('order_sn')}: {str(order_error)}",
+                                             "Shopee Order Processing")
+                            continue
 
-                if not resp.get("has_next_page"):
-                    break
-                offset = resp.get("next_offset", offset + page_size)
-                retry_attempts = 0  # Reset retry counter on successful page
-                
-            except Exception as e:
-                error_count += 1
-                frappe.log_error(f"Error processing batch: {str(e)}", "Shopee Sync Error")
-                if error_count > 5:
-                    frappe.logger().error("Too many errors, stopping sync")
-                    break
-                continue
+                    processed_count += batch_processed
+                    frappe.logger().info(f"[{st}] processed {batch_processed} this page, total {processed_count}")
 
-        # Update success timestamp only if we processed something
+                    if not resp.get("has_next_page"):
+                        break
+                    offset = resp.get("next_offset", offset + page_size)
+                    retry_attempts = 0  # reset retry kalau sukses halaman ini
+
+                except Exception as e:
+                    error_count += 1
+                    frappe.log_error(f"Error processing batch [{st}]: {str(e)}", "Shopee Sync Error")
+                    if error_count > 5:
+                        frappe.logger().error("Too many errors, stopping sync")
+                        break
+                    continue
+
+        # update last success time hanya bila meningkat
         if highest > (s.last_success_update_time or 0):
             s.last_success_update_time = highest
             s.save(ignore_permissions=True)
@@ -281,20 +291,20 @@ def sync_recent_orders(hours: int = 24):
             frappe.logger().info(f"Updated last success time to: {highest}")
 
         result = {
-            "from": time_from, 
-            "to": time_to, 
+            "from": time_from,
+            "to": time_to,
             "max_update_time": highest,
             "processed_orders": processed_count,
             "errors": error_count,
             "success": error_count < processed_count or processed_count == 0
         }
-        
         frappe.logger().info(f"Sync completed: {result}")
         return result
-        
+
     except Exception as e:
         frappe.log_error(f"Sync failed: {str(e)}", "Shopee Sync Critical Error")
         raise
+
 
 def _ensure_item_exists(sku: str, item_data: dict, rate: float) -> str:
     """
