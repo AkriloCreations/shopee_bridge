@@ -441,49 +441,114 @@ def _ensure_catch_all_item():
         except Exception as e:
             frappe.log_error(f"Failed to create catch-all item: {str(e)}", "Shopee Catch All Item")
     return catch_all_sku
+def _ensure_mapping_fields(item_name: str, model_sku: str, item_id: str, model_id: str):
+    updates = {}
+    if model_sku and not frappe.db.get_value("Item", item_name, "custom_model_sku"):
+        updates["custom_model_sku"] = model_sku
+    if item_id and not frappe.db.get_value("Item", item_name, "custom_shopee_item_id"):
+        updates["custom_shopee_item_id"] = str(item_id)
+    if model_id and not frappe.db.get_value("Item", item_name, "custom_shopee_model_id"):
+        updates["custom_shopee_model_id"] = str(model_id)
+    if updates:
+        frappe.db.set_value("Item", item_name, updates)
+
+def _match_or_create_item(it: dict, rate: float) -> str:
+    """Cari Item Existing berdasarkan mapping; kalau tidak ada, buat baru + set mapping."""
+    model_sku = (it.get("model_sku") or "").strip()
+    item_id   = str(it.get("item_id") or "")
+    model_id  = str(it.get("model_id") or "0")
+
+    # 1) by item_code / custom_model_sku (pakai model_sku)
+    if model_sku:
+        name = frappe.db.get_value("Item", {"item_code": model_sku}, "name") \
+            or frappe.db.get_value("Item", {"custom_model_sku": model_sku}, "name")
+        if name:
+            _ensure_mapping_fields(name, model_sku, item_id, model_id)
+            return name
+
+    # 2) by custom id (item_id + model_id)
+    name = frappe.db.get_value("Item",
+                               {"custom_shopee_item_id": item_id, "custom_shopee_model_id": model_id},
+                               "name")
+    if name:
+        _ensure_mapping_fields(name, model_sku, item_id, model_id)
+        return name
+
+    # 3) legacy patterns (item_code lama berbasis ID)
+    candidates = [f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"]
+    for c in candidates:
+        name = frappe.db.get_value("Item", {"item_code": c}, "name")
+        if name:
+            _ensure_mapping_fields(name, model_sku, item_id, model_id)
+            return name
+
+    # 4) tidak ketemu → buat baru (pakai model_sku kalau ada)
+    code = model_sku or f"{item_id}-{model_id}"
+    itname = (it.get("item_name") or it.get("model_name") or code)[:140]
+
+    item = frappe.new_doc("Item")
+    item.item_code = code
+    item.item_name = itname
+    item.item_group = frappe.db.get_single_value("Stock Settings", "default_item_group") or "All Item Groups"
+    item.stock_uom = "Nos"
+    item.is_stock_item = 1
+    item.maintain_stock = 1
+    # set mapping
+    item.custom_model_sku = model_sku or ""
+    item.custom_shopee_item_id = item_id
+    item.custom_shopee_model_id = model_id
+
+    wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+    if wh:
+        item.append("item_defaults", {"default_warehouse": wh})
+    item.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return item.name
 
 def _process_order(order_sn: str):
-    """Enhanced order processing with better error handling."""
+    """Enhanced order processing with mapping (model_sku ↔ ID) & better item handling."""
     s = _settings()
-    
-    # Check if order already processed
+
+    # Skip bila sudah ada
     if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
         frappe.logger().info(f"Order {order_sn} already processed, skipping")
         return
 
     try:
-        # Get order details
+        # --- Order detail: minta item_list eksplisit ---
         det = _call(
             "/api/v2/order/get_order_detail",
-    str(s.partner_id).strip(), s.partner_key,
-    s.shop_id, s.access_token,
-    {"order_sn_list": order_sn}  # <-- WAJIB order_sn_list (string)
-)
-        
+            str(s.partner_id).strip(), s.partner_key,
+            s.shop_id, s.access_token,
+            {
+                "order_sn_list": order_sn,
+                "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info"
+            }
+        )
         if det.get("error"):
             frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
             return
-            
-        order_list = det.get("response", {}).get("order_list", [])
-        if not order_list:
+
+        orders = (det.get("response") or {}).get("order_list", []) or []
+        if not orders:
             frappe.log_error(f"No order data found for {order_sn}", "Shopee Order Processing")
             return
-        det = order_list[0]
+        od = orders[0]
 
-        # Get escrow details
-        esc = _call("/api/v2/payment/get_escrow_detail", str(s.partner_id).strip(), s.partner_key,
-                    s.shop_id, s.access_token, {"order_sn": order_sn})
-        
+        # --- Escrow ---
+        esc = _call("/api/v2/payment/get_escrow_detail",
+                    str(s.partner_id).strip(), s.partner_key,
+                    s.shop_id, s.access_token,
+                    {"order_sn": order_sn})
         if esc.get("error"):
             frappe.log_error(f"Failed to get escrow detail for {order_sn}: {esc.get('message')}")
             esc = {"response": {}}
-            
         esc = esc.get("response", {}) or {}
 
-        # Create or get customer
-        customer = _create_or_get_customer(det)
+        # --- Customer ---
+        customer = _create_or_get_customer(od)
 
-        # Create Sales Invoice
+        # --- Sales Invoice header ---
         si = frappe.new_doc("Sales Invoice")
         si.customer = customer
         si.posting_date = nowdate()
@@ -492,61 +557,51 @@ def _process_order(order_sn: str):
         si.currency = "IDR"
         si.custom_shopee_order_sn = order_sn
         si.remarks = f"Shopee order SN {order_sn}"
-
-        # Set company from settings
         company = frappe.db.get_single_value("Global Defaults", "default_company")
         if company:
             si.company = company
 
-        # Add items to invoice
-        for it in det.get("item_list", []):
+        # --- Items ---
+        items = od.get("item_list") or od.get("items") or od.get("order_items") or []
+        frappe.logger().info({"order_sn": order_sn, "items_len": len(items)})
+
+        for it in items:
             try:
-                # SKU fallback priority: model_sku -> item_sku -> item_id-model_id
-                sku = (it.get("model_sku") or "").strip() or \
-                      (it.get("item_sku") or "").strip() or \
-                      f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
-                
-                # Ensure SKU is not empty
-                if not sku:
-                    sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
-                
                 qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-                rate = float(it.get("model_original_price") or it.get("model_discounted_price") or it.get("order_price") or 0)
-                
-                # Convert from Shopee micro units (if rate is very high, it's likely in micro units)
-                if rate > 1000000:  # Likely in micro units
+                rate = float(it.get("model_original_price")
+                             or it.get("model_discounted_price")
+                             or it.get("order_price")
+                             or it.get("item_price")
+                             or 0)
+                if rate > 1_000_000:  # guard micro-units
                     rate = rate / 100000
-                
-                # Auto-create item if not exists
-                item_code = _ensure_item_exists(sku, it, rate)
-                
+
+                item_code = _match_or_create_item(it, rate)
+
                 row = si.append("items", {})
                 row.item_code = item_code
                 row.qty = qty
                 row.rate = rate
                 row.amount = qty * rate
-                
-                # Set warehouse if configured
-                warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-                if warehouse:
-                    row.warehouse = warehouse
+
+                wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+                if wh:
+                    row.warehouse = wh
 
             except Exception as item_error:
-                frappe.log_error(f"Failed to process item in order {order_sn}: {str(item_error)}", 
-                               "Shopee Item Processing")
+                frappe.log_error(f"Failed to process item in order {order_sn}: {str(item_error)}",
+                                 "Shopee Item Processing")
                 continue
 
-        # Only proceed if we have items
         if not si.items:
             frappe.log_error(f"No valid items found for order {order_sn}", "Shopee Order Processing")
             return
 
         si.insert(ignore_permissions=True)
         si.submit()
-        
         frappe.logger().info(f"Created Sales Invoice {si.name} for order {order_sn}")
 
-        # Create Payment Entry if there's payment
+        # --- Payment Entry (optional) ---
         net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
         if net > 0:
             _create_payment_entry(si, esc, net, order_sn)
@@ -554,6 +609,7 @@ def _process_order(order_sn: str):
     except Exception as e:
         frappe.log_error(f"Failed to process order {order_sn}: {str(e)}", "Shopee Order Processing")
         raise
+
 
 def _create_or_get_customer(order_detail):
     """Create or get customer from order details."""
@@ -1424,3 +1480,135 @@ def diagnose_order(order_sn: str, lookback_days: int = 60, max_pages: int = 40):
     out["advice"] = advice
     out["ok"] = bool(found and (shop_ok or merch_ok))
     return out
+
+@frappe.whitelist()
+def backfill_mapping_from_legacy_codes(dry_run: int = 1):
+    import re
+    pats = [r"^SHP-(\d+)-(\d+)$", r"^(\d+)-(\d+)$", r"^(\d+)_(\d+)$"]
+    rows = frappe.get_all("Item", fields=["name","item_code"])
+    matched = 0
+    for r in rows:
+        for p in pats:
+            m = re.match(p, r.item_code or "")
+            if m:
+                item_id, model_id = m.group(1), m.group(2)
+                matched += 1
+                if not int(dry_run):
+                    frappe.db.set_value("Item", r.name, {
+                        "custom_shopee_item_id": item_id,
+                        "custom_shopee_model_id": model_id
+                    })
+                break
+    if not int(dry_run): frappe.db.commit()
+    return {"matched": matched, "updated": int(not dry_run)}
+
+@frappe.whitelist()
+def backfill_mapping_from_shopee(limit_pages: int = 999):
+    s = _settings()
+    updated = 0
+    offset, page_size, pages = 0, 50, 0
+    while pages < limit_pages:
+        lst = _call("/api/v2/product/get_item_list",
+                    str(s.partner_id).strip(), s.partner_key,
+                    s.shop_id, s.access_token,
+                    {"offset": offset, "page_size": page_size})
+        resp = lst.get("response") or {}
+        for it in resp.get("item", []) + resp.get("items", []):
+            item_id = str(it.get("item_id") or "")
+            md = _call("/api/v2/product/get_model_list",
+                       str(s.partner_id).strip(), s.partner_key,
+                       s.shop_id, s.access_token,
+                       {"item_id": int(item_id)})
+            for m in (md.get("response") or {}).get("model", []) + (md.get("response") or {}).get("model_list", []):
+                model_id = str(m.get("model_id") or "")
+                model_sku = (m.get("model_sku") or "").strip()
+                # cari item existing by legacy code / custom id / sku
+                candidates = [f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"]
+                name = (frappe.db.get_value("Item", {"custom_shopee_item_id": item_id, "custom_shopee_model_id": model_id}, "name")
+                        or (frappe.db.get_value("Item", {"item_code": model_sku}, "name") if model_sku else None))
+                if not name:
+                    for c in candidates:
+                        name = frappe.db.get_value("Item", {"item_code": c}, "name")
+                        if name: break
+                if name:
+                    updates = {
+                        "custom_shopee_item_id": item_id,
+                        "custom_shopee_model_id": model_id
+                    }
+                    if model_sku: updates["custom_model_sku"] = model_sku
+                    frappe.db.set_value("Item", name, updates)
+                    updated += 1
+        if not resp.get("has_next_page"): break
+        offset = resp.get("next_offset", offset + page_size); pages += 1
+    frappe.db.commit()
+    return {"updated": updated}
+
+def _clean_title(s: str) -> str:
+    if not s: return ""
+    s = s.strip()
+    # hapus pola ID yang suka nempel
+    import re
+    s = re.sub(r"SHP-\d+-\d+", "", s)
+    s = re.sub(r"\b\d{6,}\b", "", s)      # token angka panjang
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+def _ensure_mapping_fields(item_name: str, model_sku: str, item_id: str, model_id: str):
+    updates = {}
+    if model_sku and not frappe.db.get_value("Item", item_name, "custom_model_sku"):
+        updates["custom_model_sku"] = model_sku
+    if item_id and not frappe.db.get_value("Item", item_name, "custom_shopee_item_id"):
+        updates["custom_shopee_item_id"] = str(item_id)
+    if model_id and not frappe.db.get_value("Item", item_name, "custom_shopee_model_id"):
+        updates["custom_shopee_model_id"] = str(model_id)
+    if updates:
+        frappe.db.set_value("Item", item_name, updates)
+
+def _match_or_create_item(it: dict, rate: float) -> str:
+    model_sku = (it.get("model_sku") or "").strip()
+    item_id   = str(it.get("item_id") or "")
+    model_id  = str(it.get("model_id") or "0")
+
+    # 1) sudah ada by SKU (item_code/custom field)
+    if model_sku:
+        name = (frappe.db.get_value("Item", {"item_code": model_sku}, "name")
+                or frappe.db.get_value("Item", {"custom_model_sku": model_sku}, "name"))
+        if name:
+            _ensure_mapping_fields(name, model_sku, item_id, model_id)
+            return name
+
+    # 2) mapping by IDs
+    name = frappe.db.get_value("Item",
+                               {"custom_shopee_item_id": item_id, "custom_shopee_model_id": model_id},
+                               "name")
+    if name:
+        _ensure_mapping_fields(name, model_sku, item_id, model_id)
+        return name
+
+    # 3) legacy pola item_code berbasis ID
+    for c in (f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"):
+        name = frappe.db.get_value("Item", {"item_code": c}, "name")
+        if name:
+            _ensure_mapping_fields(name, model_sku, item_id, model_id)
+            return name
+
+    # 4) Buat baru → NAMA jangan pakai ID; pakai nama dari Shopee & dibersihkan
+    code = model_sku or f"{item_id}-{model_id}"      # item_code boleh pakai SKU/ID
+    nice_name = _clean_title(it.get("model_name") or it.get("item_name") or code)[:140]
+
+    item = frappe.new_doc("Item")
+    item.item_code = code
+    item.item_name = nice_name          # << ini yang diperbaiki
+    item.item_group = frappe.db.get_single_value("Stock Settings", "default_item_group") or "All Item Groups"
+    item.stock_uom = "Nos"
+    item.is_stock_item = 1
+    item.maintain_stock = 1
+    item.custom_model_sku = model_sku or ""
+    item.custom_shopee_item_id = item_id
+    item.custom_shopee_model_id = model_id
+    wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+    if wh:
+        item.append("item_defaults", {"default_warehouse": wh})
+    item.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return item.name
