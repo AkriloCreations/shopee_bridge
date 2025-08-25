@@ -1612,3 +1612,54 @@ def _match_or_create_item(it: dict, rate: float) -> str:
     item.insert(ignore_permissions=True)
     frappe.db.commit()
     return item.name
+
+@frappe.whitelist()
+def fix_item_names_from_shopee(update: int = 0, limit_pages: int = 999):
+    """Perbaiki item_name jadi nama model dari Shopee. Jalankan dulu dengan update=0 (preview)."""
+    s = _settings()
+    updated, preview = 0, []
+    offset, page_size, pages = 0, 50, 0
+    while pages < int(limit_pages):
+        lst = _call("/api/v2/product/get_item_list",
+                    str(s.partner_id).strip(), s.partner_key,
+                    s.shop_id, s.access_token,
+                    {"offset": offset, "page_size": page_size})
+        resp = lst.get("response") or {}
+        items = resp.get("item") or resp.get("items") or []
+        for it in items:
+            item_id = str(it.get("item_id") or "")
+            md = _call("/api/v2/product/get_model_list",
+                       str(s.partner_id).strip(), s.partner_key,
+                       s.shop_id, s.access_token,
+                       {"item_id": int(item_id)})
+            models = (md.get("response") or {}).get("model") or (md.get("response") or {}).get("model_list") or []
+            for m in models:
+                model_id = str(m.get("model_id") or "0")
+                model_name = _clean_title(m.get("model_name") or it.get("item_name") or "")
+                if not model_name:
+                    continue
+                # temukan item lokal
+                name = (frappe.db.get_value("Item", {"custom_shopee_item_id": item_id,
+                                                     "custom_shopee_model_id": model_id}, "name"))
+                if not name:
+                    for c in (f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"):
+                        name = frappe.db.get_value("Item", {"item_code": c}, "name")
+                        if name: break
+                if not name: 
+                    continue
+                cur = frappe.db.get_value("Item", name, "item_name")
+                # hanya ubah kalau nama sekarang kelihatan 'ID-ish'
+                import re
+                looks_bad = (cur == frappe.db.get_value("Item", name, "item_code") or
+                             re.search(r"SHP-\d+-\d+", cur or "") or
+                             re.fullmatch(r"\d{3,}-\d{1,}", cur or "") or
+                             re.fullmatch(r"\d{6,}", cur or ""))
+                if looks_bad and cur != model_name:
+                    preview.append({"item": name, "from": cur, "to": model_name})
+                    if int(update):
+                        frappe.db.set_value("Item", name, "item_name", model_name)
+                        updated += 1
+        if not resp.get("has_next_page"): break
+        offset = resp.get("next_offset", offset + page_size); pages += 1
+    if int(update): frappe.db.commit()
+    return {"updated": updated, "sample": preview[:50], "total_candidates": len(preview)}
