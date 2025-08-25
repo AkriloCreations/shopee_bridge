@@ -254,7 +254,7 @@ def sync_recent_orders(hours: int = 24):
                             seen.add(order_sn)
 
                             # skip jika sudah pernah dibuat
-                            if not frappe.db.exists("Sales Invoice", {"shopee_order_sn": order_sn}):
+                            if not frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
                                 _process_order(order_sn)
                                 batch_processed += 1
 
@@ -447,7 +447,7 @@ def _process_order(order_sn: str):
     s = _settings()
     
     # Check if order already processed
-    if frappe.db.exists("Sales Invoice", {"shopee_order_sn": order_sn}):
+    if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
         frappe.logger().info(f"Order {order_sn} already processed, skipping")
         return
 
@@ -486,7 +486,7 @@ def _process_order(order_sn: str):
         si.set_posting_time = 1
         si.update_stock = 1
         si.currency = "IDR"
-        si.shopee_order_sn = order_sn
+        si.custom_shopee_order_sn = order_sn
         si.remarks = f"Shopee order SN {order_sn}"
 
         # Set company from settings
@@ -1142,7 +1142,7 @@ def get_sync_status():
         s = _settings()
         
         # Get count of synced orders
-        total_orders = frappe.db.count("Sales Invoice", {"shopee_order_sn": ["!=", ""]})
+        total_orders = frappe.db.count("Sales Invoice", {"custom_shopee_order_sn": ["!=", ""]})
         
         # Get recent sync info
         last_sync_time = None
