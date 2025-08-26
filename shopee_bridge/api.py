@@ -520,36 +520,50 @@ def _short_log(message: str, title: str = "Shopee"):
     m = (message or "")[:4000]
     frappe.log_error(m, t)
 
+def _safe_set(doc, fieldname, value):
+    """Set field only if it exists on the DocType (hindari exception)."""
+    try:
+        if hasattr(doc, fieldname):
+            setattr(doc, fieldname, value)
+    except Exception:
+        pass
+
+
 def _process_order_to_so(order_sn: str):
-    """Phase 2: buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
+    """Phase 2: Buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
     s = _settings()
 
     # Skip kalau sudah pernah dibuat
-    if (frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-        or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
+    if (
+        frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
+        or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})
+    ):
         frappe.logger().info(f"[SO] Order {order_sn} already processed, skipping")
         return
 
     try:
-        # (opsional) segarkan token dulu
+        # (opsional) segarkan token dulu; aman kalau fungsi ini tak terima arg 'force'
         try:
-            refresh_if_needed(force=False)
+            refresh_if_needed()
         except Exception:
             pass
 
         # --- Ambil detail order dari Shopee ---
         det = _call(
             "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+            str(s.partner_id).strip(),
+            s.partner_key,
+            s.shop_id,
+            s.access_token,
             {
                 "order_sn_list": order_sn,
-                "response_optional_fields": "item_list,recipient_address,buyer_info"
-            }
+                "response_optional_fields": "item_list,recipient_address,buyer_info,cancel_by,cancel_reason,cancel_time"
+            },
         )
         if det.get("error"):
             _short_log(
                 f"Failed to get order detail for {order_sn}: {det.get('message')}",
-                "Shopee Phase2"
+                "Shopee Phase2",
             )
             return
 
@@ -559,6 +573,21 @@ def _process_order_to_so(order_sn: str):
             return
         od = orders[0]
 
+        # --- Baca info pembatalan (jika ada) ---
+        cancel_ts = int(
+            od.get("cancel_time")
+            or od.get("cancelled_time")
+            or od.get("actual_cancel_time")
+            or 0
+        )
+        cancel_dt_str = ""
+        if cancel_ts:
+            try:
+                cancel_dt_str = datetime.fromtimestamp(cancel_ts).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                cancel_dt_str = str(cancel_ts)
+        cancel_reason = (od.get("cancel_reason") or od.get("cancel_reason_ext") or "").strip()
+
         # --- Customer & Company ---
         customer = _create_or_get_customer(od)
         company = frappe.db.get_single_value("Global Defaults", "default_company")
@@ -566,32 +595,48 @@ def _process_order_to_so(order_sn: str):
         # --- Siapkan items ---
         items = []
         for it in od.get("item_list", []):
+            # Item Code (SKU) prioritas: model_sku -> item_sku -> fallback
             sku = (it.get("model_sku") or "").strip() or \
                   (it.get("item_sku") or "").strip() or \
                   f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
             if not sku:
                 sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
 
-            qty = int(it.get("model_quantity_purchased") or
-                      it.get("variation_quantity_purchased") or 1)
+            # Nama item: konsisten dgn sync_items → "Nama Produk - Nama Variasi"
+            composed_name = _compose_item_name(
+                it.get("item_name") or "",
+                it.get("model_name") or ""
+            )
+            # Potong 140 (ERPNext batas field item_name)
+            item_name_140 = _fit140(composed_name if composed_name else (it.get("item_name") or ""))
 
+            qty = int(
+                it.get("model_quantity_purchased")
+                or it.get("variation_quantity_purchased")
+                or 1
+            )
             rate = float(
-                it.get("model_original_price") or
-                it.get("model_discounted_price") or
-                it.get("order_price") or
-                it.get("item_price") or 0
+                it.get("model_original_price")
+                or it.get("model_discounted_price")
+                or it.get("order_price")
+                or it.get("item_price")
+                or 0
             )
             # guard kalau harga dari Shopee pakai micro unit
             if rate > 1_000_000:
                 rate = rate / 100000
 
+            # Pastikan item ada di master (auto-create bila perlu)
             item_code = _ensure_item_exists(sku, it, rate)
-            items.append({
-                "item_code": item_code,
-                "item_name": it.get("item_name") or it.get("model_name"),
-                "qty": qty,
-                "rate": rate
-            })
+
+            items.append(
+                {
+                    "item_code": item_code,
+                    "item_name": item_name_140,
+                    "qty": qty,
+                    "rate": rate,
+                }
+            )
 
         if not items:
             _short_log(f"No valid items for {order_sn}", "Shopee Phase2")
@@ -606,25 +651,35 @@ def _process_order_to_so(order_sn: str):
         so.transaction_date = nowdate()
 
         # DELIVERY DATE WAJIB:
-        # pakai lead time dari settings kalau ada, default 0 hari (hari ini)
+        # Pakai lead time dari settings kalau ada, default 0 hari (hari ini)
         lead_days = cint(getattr(s, "delivery_lead_days", 0) or 0)
         delivery_date = add_days(nowdate(), lead_days)
         so.delivery_date = delivery_date
 
         so.custom_shopee_order_sn = order_sn
-        so.remarks = f"Shopee order SN {order_sn}"
+
+        # Tambahkan context Shopee (pembatalan) ke remarks / custom field
+        base_remark = f"Shopee order SN {order_sn}"
+        if cancel_dt_str or cancel_reason:
+            extra = f" | Cancel at: {cancel_dt_str}" if cancel_dt_str else ""
+            extra += f" | Reason: {cancel_reason}" if cancel_reason else ""
+            so.remarks = f"{base_remark}{extra}"
+            # set ke custom field bila tersedia
+            _safe_set(so, "custom_shopee_cancel_time", cancel_dt_str)
+            _safe_set(so, "custom_shopee_cancel_reason", cancel_reason)
+        else:
+            so.remarks = base_remark
 
         for it in items:
             r = so.append("items", {})
             r.item_code = it["item_code"]
-            r.item_name = it.get("item_name")
+            r.item_name = _fit140(it.get("item_name") or "")  # enforce 140 tiap row
             r.qty = it["qty"]
             r.rate = it["rate"]
             # penting: row-level delivery date juga harus diisi
             r.delivery_date = delivery_date
 
         _insert_submit_with_retry(so, max_tries=3)
-
 
         frappe.logger().info(f"Created Sales Order {so.name} for order {order_sn}")
         return {"ok": True, "sales_order": so.name}
