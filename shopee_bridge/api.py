@@ -1152,16 +1152,119 @@ def _get_item_base_info(item_id: int):
     lst = (res.get("response") or {}).get("item_list", []) or []
     return lst[0] if lst and isinstance(lst, list) else {}
 
+# ===== Helpers (ADD jika belum ada) =========================================
+
 def _fit140(s: str) -> str:
     return ((s or "").strip())[:140]
+
+
+def _upsert_item(item_code: str,
+                 item_name: str,
+                 item_group: str,
+                 stock_uom: str,
+                 standard_rate: float = 0.0,
+                 meta: dict | None = None) -> str:
+    """
+    Buat / update Item master.
+    - Item Code = item_code (maks 140)
+    - Item Name dipotong 140
+    - full name disimpan di description (jika dikirim)
+    - mapping Shopee di custom fields: custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
+    Return: item.name yang dipakai.
+    """
+    meta = meta or {}
+    code140 = _fit140(item_code)
+    name140 = _fit140(item_name)
+
+    if frappe.db.exists("Item", code140):
+        item = frappe.get_doc("Item", code140)
+        # update minimal (hindari overwrite berlebihan)
+        if name140 and item.item_name != name140:
+            item.item_name = name140
+        if meta.get("description"):
+            item.description = meta["description"]
+        if meta.get("custom_model_sku") is not None:
+            item.custom_model_sku = _fit140(meta["custom_model_sku"])
+        if meta.get("custom_shopee_item_id") is not None:
+            item.custom_shopee_item_id = str(meta["custom_shopee_item_id"])
+        if meta.get("custom_shopee_model_id") is not None:
+            item.custom_shopee_model_id = str(meta["custom_shopee_model_id"])
+        # optional: standard_rate
+        try:
+            if standard_rate and float(standard_rate) > 0:
+                item.standard_rate = float(standard_rate)
+        except Exception:
+            pass
+        item.save(ignore_permissions=True)
+        frappe.db.commit()
+        return item.name
+
+    # create baru
+    item = frappe.new_doc("Item")
+    item.item_code = code140
+    item.item_name = name140
+    item.item_group = item_group or "Products"
+    item.stock_uom = stock_uom or "Nos"
+    item.is_stock_item = 1
+    # simpan nama lengkap (kalau ada) ke description
+    if meta.get("description"):
+        item.description = meta["description"]
+    # mapping shopee
+    item.custom_model_sku = _fit140(meta.get("custom_model_sku", "")) if meta else ""
+    item.custom_shopee_item_id = str(meta.get("custom_shopee_item_id", "")) if meta else ""
+    item.custom_shopee_model_id = str(meta.get("custom_shopee_model_id", "")) if meta else ""
+    try:
+        if standard_rate and float(standard_rate) > 0:
+            item.standard_rate = float(standard_rate)
+    except Exception:
+        pass
+
+    item.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return item.name
+
+
+def _upsert_price(item_code: str, price_list: str, currency: str, rate: float):
+    """
+    Buat / update Item Price pada price_list tertentu.
+    """
+    if not price_list or rate is None:
+        return
+
+    # cari Item Price yang cocok
+    existing = frappe.get_all(
+        "Item Price",
+        filters={"item_code": item_code, "price_list": price_list, "currency": currency},
+        fields=["name"],
+        limit=1,
+    )
+    if existing:
+        ip = frappe.get_doc("Item Price", existing[0].name)
+        ip.price_list_rate = float(rate or 0)
+        ip.save(ignore_permissions=True)
+        frappe.db.commit()
+        return
+
+    ip = frappe.new_doc("Item Price")
+    ip.item_code = item_code
+    ip.price_list = price_list
+    ip.currency = currency
+    ip.price_list_rate = float(rate or 0)
+    ip.selling = 1
+    ip.insert(ignore_permissions=True)
+    frappe.db.commit()
+
+# ====== SYNC ITEMS (REPLACE fungsi lama) ====================================
 
 @frappe.whitelist()
 def sync_items(hours: int = 720, status: str = "NORMAL"):
     """
-    Enhanced item sync with better error handling.
-    Sinkron Item dari Shopee ke ERPNext dengan model_sku sebagai Item Code bila ada.
-    - hours: jendela update_time ke belakang (default 30 hari).
-    - status: filter Shopee item_status (default 'NORMAL').
+    Sinkron Item dari Shopee ke ERPNext.
+    - Item Code: pakai model_sku bila ada, else 'SHP-<item_id>' atau 'SHP-<item_id>-<model_id>'
+    - Item Name: dipotong 140; full name disimpan di description
+    - Mapping Shopee disimpan di custom fields:
+        custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
+    - Paging aman lintas region (has_next/has_next_page/more)
     """
     s = _settings()
     defaults = _cfg_defaults()
@@ -1178,15 +1281,27 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
 
     frappe.logger().info(f"Starting item sync: from {time_from} to {time_to}")
 
-    # Ensure token is valid
-    refresh_if_needed()
-
+    # Refresh token kalau hampir expired (jangan memblokir kalau error)
     try:
+        refresh_if_needed()
+    except Exception:
+        pass
+
+    def _normalize_rate(x) -> float:
+        try:
+            v = float(x or 0)
+            # Shopee kadang pakai micro units
+            if v > 1_000_000:
+                v = v / 100000
+            return v
+        except Exception:
+            return 0.0
+
+    try:  # try luar WAJIB punya except/finally
         while True:
             try:
-                # Add small delay between API calls
                 if processed_items > 0:
-                    time.sleep(0.3)
+                    time.sleep(0.3)  # throttle ringan
 
                 gl = _call(
                     "/api/v2/product/get_item_list",
@@ -1203,7 +1318,6 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
                     },
                 )
 
-                # Guard: pastikan dict & bukan error
                 if not isinstance(gl, dict):
                     frappe.log_error(
                         f"Unexpected get_item_list payload type: {type(gl).__name__}",
@@ -1212,86 +1326,110 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
                     return {"ok": False, "error": "bad_payload_type"}
 
                 if gl.get("error"):
-                    error_msg = f"get_item_list error: {gl.get('error')} - {gl.get('message')}"
-                    frappe.log_error(error_msg, "Shopee sync_items")
-                    
-                    # Handle token expiration
-                    if "access token expired" in str(gl.get("message", "")).lower():
-                        refresh_result = refresh_if_needed()
-                        if refresh_result.get("status") == "refreshed":
-                            continue  # Retry with new token
-                    
+                    msg = f"get_item_list error: {gl.get('error')} - {gl.get('message')}"
+                    frappe.log_error(msg, "Shopee sync_items")
+                    # auto-refresh jika token invalid/expired
+                    if "access token" in str(gl.get("message", "")).lower():
+                        ri = refresh_if_needed()
+                        if ri.get("status") == "refreshed":
+                            continue
                     return {"ok": False, "error": gl.get("error"), "message": gl.get("message")}
 
                 resp = gl.get("response") or {}
-                # Beberapa region: 'item' vs 'items', 'has_next_page' vs 'has_next'
-                item_list = (resp.get("item") or resp.get("items") or [])
+                item_list = resp.get("item") or resp.get("items") or []
                 if not isinstance(item_list, list):
                     item_list = []
 
-                has_next = bool(resp.get("has_next_page") or resp.get("has_next") or False)
+                has_next = bool(resp.get("has_next_page") or resp.get("has_next") or resp.get("more"))
 
                 for it in item_list:
                     try:
                         processed_items += 1
                         item_id = int(it.get("item_id"))
-                        base = _get_item_base_info(item_id)
-                        base_name = base.get("item_name") or f"Item {item_id}"
 
-                        models = _get_models_for_item(item_id)
+                        # Base info
+                        base = _get_item_base_info(item_id) or {}
+                        base_name = (base.get("item_name") or "").strip()
+                        base_sku  = (base.get("item_sku") or "").strip()
 
-                        # Tanpa model → satu Item
+                        # Models
+                        models = _get_models_for_item(item_id) or []
+                        if not isinstance(models, list):
+                            models = []
+
+                        # --- Tanpa model -> 1 Item ---
                         if not models:
-                            sku = str(base.get("item_sku") or item_id)
-                            rate = float(base.get("normal_price") or 0)
-                            
-                            # Convert from micro units if needed
-                            if rate > 1000000:
-                                rate = rate / 100000
-                            
+                            sku = base_sku if base_sku else f"SHP-{item_id}"
+                            full_name = base_name or sku
+                            name_140  = _fit140(full_name)
+                            rate = _normalize_rate(base.get("normal_price") or base.get("price") or base.get("original_price"))
+
                             before_exists = frappe.db.exists("Item", {"item_code": sku})
                             used_code = _upsert_item(
-                                sku, base_name, defaults["item_group"], defaults["stock_uom"], rate
+                                sku, name_140,
+                                defaults["item_group"], defaults["stock_uom"], rate,
+                                meta={
+                                    "description": full_name,
+                                    "custom_model_sku": base_sku,
+                                    "custom_shopee_item_id": str(item_id),
+                                    "custom_shopee_model_id": "0",
+                                },
                             )
                             _upsert_price(used_code, defaults["price_list"], currency, rate)
-                            
+
                             if not before_exists:
                                 created += 1
                             else:
                                 updated += 1
                             continue
 
-                        # Ada model → satu Item per model
+                        # --- Ada model -> 1 Item per model ---
                         for m in models:
                             try:
+                                model_id = str(m.get("model_id") or "0")
                                 model_sku = (m.get("model_sku") or "").strip()
-                                sku = model_sku if model_sku else f"{item_id}-{m.get('model_id')}"
-                                model_name = m.get("model_name") or ""
-                                name = f"{base_name} - {model_name}" if model_name else base_name
-                                rate = float(m.get("price") or m.get("original_price") or 0)
+                                sku = model_sku if model_sku else f"SHP-{item_id}-{model_id}"
 
-                                # Convert from micro units if needed
-                                if rate > 1000000:
-                                    rate = rate / 100000
+                                model_name = (m.get("model_name") or "").strip()
+                                full_name = (base_name or sku)
+                                if model_name:
+                                    full_name = f"{full_name} - {model_name}"
+                                name_140 = _fit140(full_name)
+
+                                rate = _normalize_rate(m.get("price") or m.get("original_price"))
 
                                 before_exists = frappe.db.exists("Item", {"item_code": sku})
                                 used_code = _upsert_item(
-                                    sku, name, defaults["item_group"], defaults["stock_uom"], rate
+                                    sku, name_140,
+                                    defaults["item_group"], defaults["stock_uom"], rate,
+                                    meta={
+                                        "description": full_name,
+                                        "custom_model_sku": model_sku,
+                                        "custom_shopee_item_id": str(item_id),
+                                        "custom_shopee_model_id": model_id,
+                                    },
                                 )
                                 _upsert_price(used_code, defaults["price_list"], currency, rate)
-                                
+
                                 if not before_exists:
                                     created += 1
                                 else:
                                     updated += 1
+
                             except Exception as model_error:
                                 error_count += 1
-                                frappe.log_error(f"Failed to process model {m.get('model_id')} for item {item_id}: {str(model_error)}", "Shopee Model Processing")
+                                frappe.log_error(
+                                    f"Failed model {m.get('model_id')} for item {item_id}: {model_error}",
+                                    "Shopee Model Processing",
+                                )
                                 continue
 
                     except Exception as item_error:
                         error_count += 1
-                        frappe.log_error(f"Failed to process item {it.get('item_id')}: {str(item_error)}", "Shopee Item Processing")
+                        frappe.log_error(
+                            f"Failed to process item {it.get('item_id')}: {item_error}",
+                            "Shopee Item Processing",
+                        )
                         continue
 
                 if not has_next:
@@ -1300,7 +1438,7 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
 
             except Exception as batch_error:
                 error_count += 1
-                frappe.log_error(f"Error processing item batch: {str(batch_error)}", "Shopee Item Sync")
+                frappe.log_error(f"Error processing item batch: {batch_error}", "Shopee Item Sync")
                 if error_count > 5:
                     break
                 continue
@@ -1311,23 +1449,15 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
             "processed_items": processed_items,
             "created": created,
             "updated": updated,
-            "errors": error_count
+            "errors": error_count,
         }
-        
         frappe.logger().info(f"Item sync completed: {result}")
         return result
 
     except Exception as e:
-        frappe.log_error(f"Item sync failed: {str(e)}", "Shopee Item Sync Critical Error")
-        return {
-            "ok": False,
-            "error": "critical_error",
-            "message": str(e),
-            "processed_items": processed_items,
-            "created": created,
-            "updated": updated,
-            "errors": error_count
-        }
+        frappe.log_error(f"Item sync crashed: {e}", "Shopee Item Sync")
+        return {"ok": False, "error": "exception", "message": str(e)}
+
 
 @frappe.whitelist()
 def test_connection():
