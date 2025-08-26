@@ -1,5 +1,5 @@
 import time, hmac, hashlib, requests, frappe, re  # pyright: ignore[reportMissingImports]
-from frappe.utils import get_url, nowdate, cint, add_days, now, format_datetime, get_time_zone, formatdate # pyright: ignore[reportMissingImports]
+from frappe.utils import get_url, nowdate, cint, add_days, now, format_datetime, get_system_timezone, convert_utc_to_system_timezone, formatdate # pyright: ignore[reportMissingImports]
 from datetime import datetime, timedelta, timezone
 import json
 
@@ -19,23 +19,23 @@ def _base():
         return "https://partner.shopeemobile.com"
     return "https://partner.test-stable.shopeemobile.com"
 
-def _to_user_dt(ts: int | None):
-    """Epoch detik → datetime aware di timezone user."""
+def _to_system_dt(ts: int | None):
+    """Epoch detik -> datetime aware di system timezone (Frappe v15)."""
     if not ts:
         return None
-    tz = get_time_zone() or "UTC"
     dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-    return dt_utc.astimezone(ZoneInfo(tz)) if ZoneInfo else dt_utc  # fallback: UTC
+    return convert_utc_to_system_timezone(dt_utc)
 
 def _hum_epoch(ts: int | None):
-    """Epoch detik → string tanggal+jam sesuai TZ user."""
-    dt = _to_user_dt(ts)
+    """Epoch -> string tanggal+jam sesuai system timezone user/site."""
+    dt = _to_system_dt(ts)
     return format_datetime(dt) if dt else None
 
 def _hum_date(ts: int | None):
-    """Epoch detik → string tanggal (YYYY-MM-DD) sesuai TZ user."""
-    dt = _to_user_dt(ts)
+    """Epoch -> string tanggal sesuai format user."""
+    dt = _to_system_dt(ts)
     return formatdate(dt.date()) if dt else None
+
 
 def _sign(key: str, s: str) -> str:
     return hmac.new((key or "").strip().encode(), s.encode(), hashlib.sha256).hexdigest()
