@@ -2501,3 +2501,48 @@ def diagnose_order(order_sn: str, hours: int = 72):
         "detail": summary if summary else None,
         "escrow": esc_summary if esc_summary else None,
     }
+
+@frappe.whitelist()
+def force_cancel_shopee_orders(batch_size=20):
+    """Force cancel Shopee orders without using bulk operations."""
+    orders = frappe.get_all("Sales Order", 
+        filters={
+            "custom_shopee_order_sn": ["!=", ""], 
+            "docstatus": 1
+        }, 
+        fields=["name", "custom_shopee_order_sn"],
+        limit=int(batch_size))
+    
+    cancelled = []
+    errors = []
+    
+    for order in orders:
+        try:
+            # Check for linked documents
+            linked_si = frappe.db.exists("Sales Invoice", 
+                {"custom_shopee_order_sn": order.custom_shopee_order_sn})
+            linked_dn = frappe.db.exists("Delivery Note", 
+                {"custom_shopee_order_sn": order.custom_shopee_order_sn})
+            
+            if linked_si or linked_dn:
+                errors.append(f"{order.name}: Has linked documents")
+                continue
+                
+            so = frappe.get_doc("Sales Order", order.name)
+            so.flags.ignore_permissions = True
+            so.flags.ignore_mandatory = True
+            so.cancel()
+            cancelled.append(order.name)
+            
+        except Exception as e:
+            errors.append(f"{order.name}: {str(e)}")
+        
+        # Commit every record to avoid transaction locks
+        frappe.db.commit()
+    
+    return {
+        "cancelled": len(cancelled),
+        "errors": len(errors),
+        "cancelled_orders": cancelled,
+        "error_details": errors[:5]  # Show first 5 errors
+    }
