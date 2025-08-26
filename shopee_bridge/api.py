@@ -1,5 +1,5 @@
 import time, hmac, hashlib, requests, frappe
-from frappe.utils import get_url, nowdate
+from frappe.utils import get_url, nowdate, cint
 from datetime import datetime, timedelta
 import json
 
@@ -441,6 +441,7 @@ def _ensure_catch_all_item():
         except Exception as e:
             frappe.log_error(f"Failed to create catch-all item: {str(e)}", "Shopee Catch All Item")
     return catch_all_sku
+
 def _ensure_mapping_fields(item_name: str, model_sku: str, item_id: str, model_id: str):
     updates = {}
     if model_sku and not frappe.db.get_value("Item", item_name, "custom_model_sku"):
@@ -505,43 +506,122 @@ def _match_or_create_item(it: dict, rate: float) -> str:
     frappe.db.commit()
     return item.name
 
-def _process_order(order_sn: str):
-    """Enhanced order processing with mapping (model_sku ↔ ID) & better item handling."""
+def _short_log(message: str, title: str = "Shopee"):
+    t = (title or "Shopee")[:140]
+    m = (message or "")[:4000]
+    frappe.log_error(m, t)
+
+def _process_order_to_so(order_sn: str):
+    """Phase 2: buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
     s = _settings()
 
-    # Skip bila sudah ada
-    if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
-        frappe.logger().info(f"Order {order_sn} already processed, skipping")
+    # Skip jika sudah ada SO/SI
+    if (frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
+        or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
+        frappe.logger().info(f"[SO] Order {order_sn} already processed, skipping")
         return
 
     try:
-        # --- Order detail: minta item_list eksplisit ---
+        # --- Order detail ---
         det = _call(
             "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(), s.partner_key,
-            s.shop_id, s.access_token,
-            {
-                "order_sn_list": order_sn,
-                "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info"
-            }
+            str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,buyer_info"}
         )
         if det.get("error"):
-            frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
+            _short_log(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee Phase2")
             return
 
         orders = (det.get("response") or {}).get("order_list", []) or []
         if not orders:
-            frappe.log_error(f"No order data found for {order_sn}", "Shopee Order Processing")
+            _short_log(f"No order data found for {order_sn}", "Shopee Phase2")
             return
         od = orders[0]
 
-        # --- Escrow ---
+        # --- Customer & Company ---
+        customer = _create_or_get_customer(od)
+        company  = frappe.db.get_single_value("Global Defaults", "default_company")
+
+        # --- Siapkan items ---
+        items = []
+        for it in od.get("item_list", []):
+            sku = (it.get("model_sku") or "").strip() or \
+                  (it.get("item_sku") or "").strip() or \
+                  f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+            if not sku:
+                sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
+            qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+            rate = float(it.get("model_original_price") or it.get("model_discounted_price")
+                         or it.get("order_price") or it.get("item_price") or 0)
+            if rate > 1_000_000:
+                rate = rate / 100000
+
+            item_code = _ensure_item_exists(sku, it, rate)
+            items.append({"item_code": item_code,
+                          "item_name": it.get("item_name") or it.get("model_name"),
+                          "qty": qty, "rate": rate})
+
+        if not items:
+            _short_log(f"No valid items for {order_sn}", "Shopee Phase2")
+            return
+
+        # --- Buat Sales Order ---
+        so = frappe.new_doc("Sales Order")
+        so.customer = customer
+        so.company = company
+        so.transaction_date = nowdate()
+        so.custom_shopee_order_sn = order_sn
+        so.remarks = f"Shopee order SN {order_sn}"
+
+        for it in items:
+            r = so.append("items", {})
+            r.item_code = it["item_code"]
+            r.item_name = it.get("item_name")
+            r.qty = it["qty"]
+            r.rate = it["rate"]
+
+        so.insert(ignore_permissions=True)
+        so.submit()
+
+        frappe.logger().info(f"Created Sales Order {so.name} for order {order_sn}")
+        return {"ok": True, "sales_order": so.name}
+
+    except Exception as e:
+        _short_log(f"Failed to create SO for {order_sn}: {e}", "Shopee Phase2")
+        raise
+
+def _process_order_to_si(order_sn: str):
+    """Jalur lama: langsung buat Sales Invoice. Ada fallback jika stok kurang."""
+    s = _settings()
+
+    # Skip jika sudah pernah dibuat
+    if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
+        frappe.logger().info(f"[SI] Order {order_sn} already processed, skipping")
+        return
+
+    try:
+        # --- Order detail (minta item_list eksplisit kalau perlu) ---
+        det = _call(
+            "/api/v2/order/get_order_detail",
+            str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info"}
+        )
+        if det.get("error"):
+            _short_log(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee SI Flow")
+            return
+
+        orders = (det.get("response") or {}).get("order_list", []) or []
+        if not orders:
+            _short_log(f"No order data found for {order_sn}", "Shopee SI Flow")
+            return
+        od = orders[0]
+
+        # --- Escrow (opsional) ---
         esc = _call("/api/v2/payment/get_escrow_detail",
-                    str(s.partner_id).strip(), s.partner_key,
-                    s.shop_id, s.access_token,
+                    str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
                     {"order_sn": order_sn})
         if esc.get("error"):
-            frappe.log_error(f"Failed to get escrow detail for {order_sn}: {esc.get('message')}")
+            _short_log(f"Escrow fail {order_sn}: {esc.get('message')}", "Shopee SI Flow")
             esc = {"response": {}}
         esc = esc.get("response", {}) or {}
 
@@ -553,63 +633,96 @@ def _process_order(order_sn: str):
         si.customer = customer
         si.posting_date = nowdate()
         si.set_posting_time = 1
-        si.update_stock = 1
+        si.update_stock = 1  # default: gerakkan stok; akan fallback ke 0 jika error stok
         si.currency = "IDR"
         si.custom_shopee_order_sn = order_sn
         si.remarks = f"Shopee order SN {order_sn}"
+
         company = frappe.db.get_single_value("Global Defaults", "default_company")
         if company:
             si.company = company
 
         # --- Items ---
-        items = od.get("item_list") or od.get("items") or od.get("order_items") or []
-        frappe.logger().info({"order_sn": order_sn, "items_len": len(items)})
-
-        for it in items:
-            try:
-                qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-                rate = float(it.get("model_original_price")
-                             or it.get("model_discounted_price")
-                             or it.get("order_price")
-                             or it.get("item_price")
-                             or 0)
-                if rate > 1_000_000:  # guard micro-units
-                    rate = rate / 100000
-
-                item_code = _match_or_create_item(it, rate)
-
-                row = si.append("items", {})
-                row.item_code = item_code
-                row.qty = qty
-                row.rate = rate
-                row.amount = qty * rate
-
-                wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-                if wh:
-                    row.warehouse = wh
-
-            except Exception as item_error:
-                frappe.log_error(f"Failed to process item in order {order_sn}: {str(item_error)}",
-                                 "Shopee Item Processing")
-                continue
-
-        if not si.items:
-            frappe.log_error(f"No valid items found for order {order_sn}", "Shopee Order Processing")
+        items = od.get("item_list") or od.get("items") or []
+        if not items:
+            _short_log(f"No items from Shopee for {order_sn}", "Shopee SI Flow")
             return
 
+        default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+
+        for it in items:
+            sku = (it.get("model_sku") or "").strip() or \
+                  (it.get("item_sku") or "").strip() or \
+                  f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+            if not sku:
+                sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
+
+            qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+            rate = float(it.get("model_original_price") or it.get("model_discounted_price")
+                         or it.get("order_price") or it.get("item_price") or 0)
+            if rate > 1_000_000:   # micro-unit guard
+                rate = rate / 100000
+
+            item_code = _ensure_item_exists(sku, it, rate)
+
+            row = si.append("items", {})
+            row.item_code = item_code
+            row.qty = qty
+            row.rate = rate
+            row.amount = qty * rate
+            if default_wh:
+                row.warehouse = default_wh
+
+        if not si.items:
+            _short_log(f"No valid items for {order_sn}", "Shopee SI Flow")
+            return
+
+        # --- Insert + submit dengan fallback stok kurang ---
         si.insert(ignore_permissions=True)
-        si.submit()
+        try:
+            si.submit()
+        except Exception as e:
+            msg = str(e)
+            if "needed in Warehouse" in msg or "negative stock" in msg.lower():
+                si.reload()
+                si.update_stock = 0
+                si.save()
+                si.submit()
+                si.add_comment("Comment",
+                    text=f"Auto-submitted with update_stock=0 (stock shortage). Original: {msg}")
+                frappe.logger().warning(f"Submitted SI {si.name} without stock movement (order {order_sn}).")
+            else:
+                raise
+
         frappe.logger().info(f"Created Sales Invoice {si.name} for order {order_sn}")
 
-        # --- Payment Entry (optional) ---
+        # --- Payment Entry (opsional) ---
         net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
         if net > 0:
             _create_payment_entry(si, esc, net, order_sn)
 
+        return {"ok": True, "sales_invoice": si.name}
+
     except Exception as e:
-        frappe.log_error(f"Failed to process order {order_sn}: {str(e)}", "Shopee Order Processing")
+        _short_log(f"Failed to process order {order_sn}: {e}", "Shopee SI Flow")
         raise
 
+
+def _process_order(order_sn: str):
+    """
+    Router:
+    - Jika Shopee Settings.use_sales_order_flow = 1  -> buat Sales Order (Phase-2)
+    - Jika 0 -> jalur lama (langsung Sales Invoice)
+    """
+    s = _settings()
+    try:
+        if cint(getattr(s, "use_sales_order_flow", 0)):
+            return _process_order_to_so(order_sn)
+        else:
+            return _process_order_to_si(order_sn)
+    except Exception as e:
+        _short_log(f"Failed to process order {order_sn}: {e}", "Shopee Order Processing")
+        raise
 
 def _create_or_get_customer(order_detail):
     """Create or get customer from order details."""
