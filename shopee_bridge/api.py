@@ -632,6 +632,7 @@ def _process_order_to_so(order_sn: str):
     except Exception as e:
         _short_log(f"Failed to create SO for {order_sn}: {e}", "Shopee Phase2")
         raise
+LOCK_ERRORS = ("Lock wait timeout exceeded", "deadlock found")
 
 def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
     """
