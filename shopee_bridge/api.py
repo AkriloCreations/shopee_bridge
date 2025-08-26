@@ -218,10 +218,11 @@ def refresh_if_needed():
 
 def _default_item_group() -> str:
     """
-    Resolusi Item Group:
+    Resolusi Item Group yang kompatibel dengan berbagai versi ERPNext:
     1) Shopee Settings.default_item_group (kalau field itu ada)
-    2) Stock Settings.default_item_group
-    3) 'Products' (fallback), atau 1 item group non-group apa saja
+    2) Selling Settings.default_item_group (versi lama ERPNext)
+    3) Stock Settings.default_item_group (versi baru ERPNext, jika ada)
+    4) 'Products' (fallback), atau item group non-group lainnya
     """
     # 1) dari Shopee Settings (jika kamu sudah tambah field custom)
     try:
@@ -231,16 +232,30 @@ def _default_item_group() -> str:
     except Exception:
         pass
 
-    # 2) dari Stock Settings
-    ig = frappe.db.get_single_value("Stock Settings", "default_item_group")
-    if ig:
-        return ig
+    # 2) dari Selling Settings (lebih umum tersedia)
+    try:
+        ig = frappe.db.get_single_value("Selling Settings", "default_item_group")
+        if ig:
+            return ig
+    except Exception:
+        pass
 
-    # 3) fallback
+    # 3) dari Stock Settings (hanya jika field ada)
+    try:
+        ig = frappe.db.get_single_value("Stock Settings", "default_item_group")
+        if ig:
+            return ig
+    except Exception:
+        pass
+
+    # 4) fallback
     if frappe.db.exists("Item Group", "Products"):
         return "Products"
+    
+    # Cari item group yang bukan group (leaf node)
     names = frappe.db.get_list("Item Group", filters={"is_group": 0}, pluck="name", limit=1)
-    return names[0] if names else "Products"
+    return names[0] if names else "All Item Groups"
+
 
 
 @frappe.whitelist()
@@ -271,7 +286,7 @@ def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
     return {"preview": dry_run == 1, "changes": changed}
 
 def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
-    """Pastikan Item ada; kalau belum, buat pakai Item Group dari Stock Settings."""
+    """Pastikan Item ada; kalau belum, buat pakai Item Group yang aman."""
     sku = (sku or "").strip()
     if not sku:
         sku = f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
@@ -280,9 +295,18 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
     var  = (it.get("model_name") or "").strip()
     item_name = (f"{base} | {var}" if var else base)[:140] or sku
 
+    # Gunakan fungsi yang aman
     item_group = _default_item_group()
-    stock_uom  = frappe.db.get_single_value("Stock Settings", "stock_uom") or \
-                 frappe.db.get_single_value("Stock Settings", "default_uom") or "Nos"
+    
+    # Stock UOM yang aman
+    stock_uom = "Nos"  # Default fallback
+    try:
+        stock_uom = frappe.db.get_single_value("Stock Settings", "stock_uom") or stock_uom
+    except Exception:
+        try:
+            stock_uom = frappe.db.get_single_value("Stock Settings", "default_uom") or stock_uom
+        except Exception:
+            pass
 
     # update bila sudah ada
     if frappe.db.exists("Item", {"item_code": sku}):
@@ -306,6 +330,8 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
     doc.is_stock_item = 1
     doc.insert(ignore_permissions=True)
     return doc.name
+
+
 
 
 def _get_item_group():
@@ -1077,30 +1103,70 @@ def exchange_code(code: str, shop_id: str | None = None):
 def _cfg_defaults():
     """Ambil default yg aman lintas versi ERPNext."""
     # Item Group: coba Selling Settings dulu, fallback ke 'Products'
-    item_group = (
-        frappe.db.get_single_value("Selling Settings", "default_item_group")
-        or frappe.db.exists("Item Group", "Products") and "Products"
-        or frappe.db.get_value("Item Group", {"is_group": 0}, "name")  # ambil satu leaf kalau ada
-        or "Products"
-    )
+    item_group = None
+    
+    # Coba berbagai sumber untuk item group
+    try:
+        item_group = frappe.db.get_single_value("Selling Settings", "default_item_group")
+    except Exception:
+        pass
+    
+    if not item_group:
+        try:
+            item_group = frappe.db.get_single_value("Stock Settings", "default_item_group")
+        except Exception:
+            pass
+    
+    if not item_group:
+        if frappe.db.exists("Item Group", "Products"):
+            item_group = "Products"
+        else:
+            # Ambil item group pertama yang bukan group
+            item_groups = frappe.db.get_list("Item Group", filters={"is_group": 0}, pluck="name", limit=1)
+            item_group = item_groups[0] if item_groups else "All Item Groups"
 
     # Stock UOM: coba Stock Settings, fallback ke 'Nos'
-    stock_uom = (
-        frappe.db.get_single_value("Stock Settings", "stock_uom")
-        or frappe.db.get_value("UOM", {"name": "Nos"}, "name")
-        or "Nos"
-    )
+    stock_uom = None
+    try:
+        stock_uom = frappe.db.get_single_value("Stock Settings", "stock_uom")
+    except Exception:
+        pass
+    
+    if not stock_uom:
+        try:
+            stock_uom = frappe.db.get_single_value("Stock Settings", "default_uom")
+        except Exception:
+            pass
+    
+    if not stock_uom:
+        stock_uom = "Nos"
 
     # Price List: coba Selling Settings, fallback ke Standard Selling / selling enabled pertama
-    price_list = (
-        frappe.db.get_single_value("Selling Settings", "selling_price_list")
-        or (frappe.db.exists("Price List", "Standard Selling") and "Standard Selling")
-        or frappe.db.get_value("Price List", {"selling": 1, "enabled": 1}, "name")
-    )
+    price_list = None
+    try:
+        price_list = frappe.db.get_single_value("Selling Settings", "selling_price_list")
+    except Exception:
+        pass
+    
+    if not price_list:
+        if frappe.db.exists("Price List", "Standard Selling"):
+            price_list = "Standard Selling"
+        else:
+            price_lists = frappe.db.get_list("Price List", filters={"selling": 1, "enabled": 1}, pluck="name", limit=1)
+            price_list = price_lists[0] if price_lists else None
 
     # Warehouse & Company (opsional)
-    default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    default_wh = None
+    try:
+        default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+    except Exception:
+        pass
+    
+    company = None
+    try:
+        company = frappe.db.get_single_value("Global Defaults", "default_company")
+    except Exception:
+        pass
 
     return {
         "item_group": item_group,
