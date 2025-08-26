@@ -139,8 +139,16 @@ def _call(path: str, partner_id: str, partner_key: str,
         if isinstance(data, list):
             data = {"response": {"_list_payload": data}}
 
+        # FIX: Add detailed logging untuk debug
+        if path == "/api/v2/shop/get_shop_info":
+            frappe.logger().info(f"Shopee API {path} - Status: {r.status_code}")
+            frappe.logger().info(f"Shopee API {path} - Response: {data}")
+            frappe.logger().info(f"Shopee API {path} - URL: {url}")
+            frappe.logger().info(f"Shopee API {path} - Params: {qp if use_get else q}")
+        
         return data
     except requests.exceptions.RequestException as e:
+        frappe.log_error(f"Shopee API {path} request failed: {str(e)}", "Shopee API Call")
         return {"error": "REQUEST_ERROR", "message": str(e)}
 
 @frappe.whitelist()
