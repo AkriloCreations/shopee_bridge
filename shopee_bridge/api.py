@@ -839,56 +839,49 @@ def _process_order(order_sn: str):
         _short_log(f"Failed to process order {order_sn}: {e}", "Shopee Order Processing")
         raise
 
-def _create_or_get_customer(order_detail, order_sn):
-    """Create customer using buyer_username + order SN pattern."""
-    
-    # Primary: gunakan buyer_username jika tersedia
-    buyer_username = (order_detail.get("buyer_username") or "").strip()
-    
-    if buyer_username and buyer_username != "****":
-        # Gunakan buyer_username sebagai identifier
-        customer_name = f"SHP-{buyer_username[:15]}"
-    else:
-        # Fallback: gunakan 6 karakter dari Order SN
-        sn_clean = re.sub(r'[^A-Z0-9]', '', order_sn.upper())
-        identifier = sn_clean[:6] if len(sn_clean) >= 6 else sn_clean.ljust(6, '0')
-        customer_name = f"SHP-{identifier}"
-    """Extract customer info from Shopee order and create/get customer."""
-    # Try to get recipient address info
+def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
+    """Create/get Customer dari detail order Shopee.
+    Bisa dipanggil _create_or_get_customer(order_detail) saja.
+    """
+    # Ambil order_sn jika tidak dipassing
+    order_sn = (order_sn or order_detail.get("order_sn") or "").strip()
+
+    # Sumber identitas
     addr = order_detail.get("recipient_address") or {}
     buyer_username = (order_detail.get("buyer_username") or "").strip()
     buyer_user_id = str(order_detail.get("buyer_user_id") or "").strip()
-    
-    # Build customer name
     recipient_name = (addr.get("name") or "").strip()
     phone = (addr.get("phone") or "").strip()
-    
-    # Use recipient name if available, otherwise buyer username, otherwise buyer ID
-    base_name = recipient_name or buyer_username or f"buyer-{buyer_user_id}"
-    
-    # Clean name (remove special chars)
-    import re
+
+    # Base name: recipient → username → buyer-id
+    base_name = recipient_name or buyer_username or (f"buyer-{buyer_user_id}" if buyer_user_id else "buyer")
     clean_name = re.sub(r'[^A-Za-z0-9\- ]', '', base_name)[:20] or "buyer"
-    
-    # Get phone digits for unique identifier
+
+    # Suffix unik: last4 phone → last4 buyer_user_id → 6 char dari order_sn → "0000"
     phone_digits = re.sub(r'\D', '', phone)
-    phone_suffix = phone_digits[-4:] if phone_digits else buyer_user_id[-4:] if buyer_user_id else "0000"
-    
-    customer_name = f"SHP-{clean_name}-{phone_suffix}"
-    
-    # Check if customer exists
+    if phone_digits:
+        suffix = phone_digits[-4:]
+    elif buyer_user_id:
+        suffix = buyer_user_id[-4:]
+    else:
+        sn_clean = re.sub(r'[^A-Z0-9]', '', (order_sn or "").upper())
+        suffix = sn_clean[:6] if len(sn_clean) >= 6 else (sn_clean.ljust(6, '0') if sn_clean else "0000")
+
+    customer_name = f"SHP-{clean_name}-{suffix}"
+
+    # Sudah ada? langsung pakai
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
         return customer_name
-    
-    # Create new customer
+
+    # Buat Customer
     customer = frappe.new_doc("Customer")
     customer.customer_name = customer_name
     customer.customer_group = "All Customer Groups"
     customer.customer_type = "Individual"
     customer.territory = "All Territories"
     customer.insert(ignore_permissions=True)
-    
-    # Create address if we have address info
+
+    # Buat Address jika ada data
     if addr and (addr.get("full_address") or addr.get("city")):
         try:
             address = frappe.new_doc("Address")
@@ -902,8 +895,11 @@ def _create_or_get_customer(order_detail, order_sn):
             address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
             address.insert(ignore_permissions=True)
         except Exception as e:
-            frappe.log_error(f"Failed to create address for {customer_name}: {e}", "Customer Address Creation")
-    
+            frappe.log_error(
+                f"Failed to create address for {customer_name}: {e}",
+                "Customer Address Creation"
+            )
+
     return customer_name
 
 def _extract_dates_from_order(order_detail):
