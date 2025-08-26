@@ -339,7 +339,7 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
                 pass
         
         return fallback_sku
-        
+
 def _get_item_group():
     """Get or create Shopee item group."""
     item_group_name = "Shopee Products"
@@ -839,7 +839,20 @@ def _process_order(order_sn: str):
         _short_log(f"Failed to process order {order_sn}: {e}", "Shopee Order Processing")
         raise
 
-def _create_or_get_customer(order_detail):
+def _create_or_get_customer(order_detail, order_sn):
+    """Create customer using buyer_username + order SN pattern."""
+    
+    # Primary: gunakan buyer_username jika tersedia
+    buyer_username = (order_detail.get("buyer_username") or "").strip()
+    
+    if buyer_username and buyer_username != "****":
+        # Gunakan buyer_username sebagai identifier
+        customer_name = f"SHP-{buyer_username[:15]}"
+    else:
+        # Fallback: gunakan 6 karakter dari Order SN
+        sn_clean = re.sub(r'[^A-Z0-9]', '', order_sn.upper())
+        identifier = sn_clean[:6] if len(sn_clean) >= 6 else sn_clean.ljust(6, '0')
+        customer_name = f"SHP-{identifier}"
     """Extract customer info from Shopee order and create/get customer."""
     # Try to get recipient address info
     addr = order_detail.get("recipient_address") or {}
