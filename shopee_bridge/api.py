@@ -211,7 +211,8 @@ def refresh_if_needed():
     if s.token_expire_at and (int(s.token_expire_at) - now) > 300:
         return {"status": "token_still_valid"}
         
-    res = _call("/api/v2/auth/access_token/get", str(s.partner_id).strip(), s.partner_key,
+    # FIX: Gunakan endpoint yang benar untuk token refresh
+    res = _call("/api/v2/auth/token/get", str(s.partner_id).strip(), s.partner_key,
                 s.shop_id, None, {"refresh_token": s.refresh_token, "shop_id": s.shop_id})
     
     if res.get("error"):
@@ -1076,7 +1077,7 @@ def exchange_code(code: str, shop_id: str | None = None):
     ts = int(time.time())
     path = "/api/v2/auth/token/get"
     
-    # For token exchange, signature is: partner_id + path + timestamp (NO access_token/shop_id)
+    # FIX: For token exchange, signature is: partner_id + path + timestamp (NO access_token/shop_id)
     base_string = f"{partner_id}{path}{ts}"
     sign = _sign(partner_key, base_string)
 
@@ -1618,7 +1619,10 @@ def test_connection():
                       str(s.partner_id).strip(), s.partner_key,
                       s.shop_id, s.access_token, {})
         
+        # FIX: Add better error handling and logging
         if result.get("error"):
+            frappe.log_error(f"Shopee connection test failed: {result.get('error')} - {result.get('message')}", "Shopee Connection Test")
+            
             # Try to refresh token if expired
             if "access token expired" in str(result.get("message", "")).lower():
                 refresh_result = refresh_if_needed()
@@ -1627,11 +1631,20 @@ def test_connection():
                     result = _call("/api/v2/shop/get_shop_info", 
                                   str(s.partner_id).strip(), s.partner_key,
                                   s.shop_id, s.access_token, {})
+                    
+                    if result.get("error"):
+                        return {"success": False, "error": result.get("error"), "message": result.get("message")}
             
             if result.get("error"):
                 return {"success": False, "error": result.get("error"), "message": result.get("message")}
         
         shop_info = result.get("response", {})
+        
+        # FIX: Check if we actually got shop data
+        if not shop_info or not shop_info.get("shop_name"):
+            frappe.log_error(f"Shopee API returned empty shop info: {result}", "Shopee Connection Test")
+            return {"success": False, "error": "No shop information returned", "message": "API call succeeded but returned empty data"}
+        
         return {
             "success": True,
             "shop_name": shop_info.get("shop_name"),
@@ -1641,6 +1654,7 @@ def test_connection():
         }
         
     except Exception as e:
+        frappe.log_error(f"Shopee connection test exception: {str(e)}", "Shopee Connection Test")
         return {"success": False, "error": "exception", "message": str(e)}
 
 @frappe.whitelist()
@@ -1870,7 +1884,15 @@ def sync_recent_orders(hours: int = 24):
     now = int(time.time())
     last = int(s.last_success_update_time or 0)
     overlap = 600  # 10 minutes overlap
-    time_from = (now - hours * 3600) if last == 0 else max(0, last - overlap)
+    
+    # FIX: Logic waktu yang benar
+    if last == 0:
+        # First time sync: look back specified hours
+        time_from = now - hours * 3600
+    else:
+        # Subsequent syncs: use last sync time with overlap
+        time_from = max(0, last - overlap)
+    
     time_to = now
 
     offset, page_size = 0, 50
@@ -1893,7 +1915,32 @@ def sync_recent_orders(hours: int = 24):
         if ol.get("error"):
             errors += 1
             frappe.log_error(f"get_order_list error: {ol.get('error')} - {ol.get('message')}", "Shopee Sync")
-            break
+            # FIX: Don't break, try to continue
+            if "access token" in str(ol.get("message", "")).lower():
+                # Try to refresh token and retry once
+                try:
+                    refresh_result = refresh_if_needed()
+                    if refresh_result.get("status") == "refreshed":
+                        # Retry with new token
+                        ol = _call("/api/v2/order/get_order_list", str(s.partner_id).strip(), s.partner_key,
+                                   s.shop_id, s.access_token, {
+                                       "time_range_field": "update_time",
+                                       "time_from": time_from,
+                                       "time_to": time_to,
+                                       "page_size": page_size,
+                                       "order_status": "READY_TO_SHIP",
+                                       "offset": offset
+                                   })
+                        if not ol.get("error"):
+                            errors -= 1  # Remove the error since we retried successfully
+                        else:
+                            break  # Still failing after refresh, break
+                    else:
+                        break  # Can't refresh token, break
+                except:
+                    break  # Refresh failed, break
+            else:
+                break  # Non-token error, break
             
         resp = ol.get("response") or {}
         orders = resp.get("order_list", [])
