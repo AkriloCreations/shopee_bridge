@@ -2466,3 +2466,26 @@ def force_cancel_shopee_orders(batch_size=250):
         "cancelled_orders": cancelled,
         "error_details": errors[:5]  # Show first 5 errors
     }
+
+def scheduled_hourly_sync():
+    """Scheduled function to sync orders hourly (backup)."""
+    try:
+        frappe.logger().info("Starting hourly order sync")
+        result = sync_recent_orders(hours=1)  # Sync last hour
+        
+        if result.get("errors", 0) > 0:
+            frappe.logger().warning(f"Hourly sync completed with {result.get('errors')} errors")
+        else:
+            frappe.logger().info(f"Hourly sync completed successfully: {result.get('processed_orders')} orders processed")
+            
+    except Exception as e:
+        frappe.log_error(f"Hourly order sync failed: {str(e)}", "Hourly Order Sync")
+
+def scheduled_cleanup():
+    """Scheduled function to cleanup old data."""
+    try:
+        frappe.logger().info("Starting scheduled cleanup")
+        # Add cleanup logic here if needed
+        frappe.logger().info("Cleanup completed successfully")
+    except Exception as e:
+        frappe.log_error(f"Scheduled cleanup failed: {str(e)}", "Scheduled Cleanup")

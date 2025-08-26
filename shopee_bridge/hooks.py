@@ -117,31 +117,17 @@ after_install = "shopee_bridge.setup.install.after_install"
 # ---------------
 
 scheduler_events = {
-    # Every 15 minutes - Check token and sync recent orders
     "cron": {
+        # Setiap 15 menit - Refresh token dan sync orders terbaru
         "*/15 * * * *": [
             "shopee_bridge.api.scheduled_token_refresh",
             "shopee_bridge.api.scheduled_order_sync"
         ],
-        # Every hour - Full order sync
-        "0 * * * *": [
-            "shopee_bridge.api.sync_recent_orders"
-        ],
-        # Every day at 2 AM - Sync items
+        # Setiap hari jam 2 pagi - Sync items
         "0 2 * * *": [
             "shopee_bridge.api.scheduled_item_sync"
         ]
-    },
-    # Alternative simpler format (choose one)
-    # "all": [
-    #     "shopee_bridge.tasks.all"
-    # ],
-    # "hourly": [
-    #     "shopee_bridge.shopee_bridge.doctype.shopee_settings.api.scheduled_order_sync"
-    # ],
-    # "daily": [
-    #     "shopee_bridge.shopee_bridge.doctype.shopee_settings.api.scheduled_item_sync"
-    # ]
+    }
 }
 
 # Testing
