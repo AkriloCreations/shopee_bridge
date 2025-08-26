@@ -1856,7 +1856,7 @@ def webhook_handler():
         return {"success": False, "error": str(e)}
 
 @frappe.whitelist()
-def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
+def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_status: str | None = None):
     """Sync orders by absolute UNIX seconds window."""
     s = _settings()
     if not s.access_token:
@@ -1870,7 +1870,12 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
         pass
 
     use_so_flow = cint(getattr(s, "use_sales_order_flow", 0) or 0)
-    statuses = ["READY_TO_SHIP"]
+
+    # Jika order_status None/"ALL"/"" -> ambil semua status (tanpa filter)
+    if not order_status or str(order_status).strip().upper() == "ALL":
+        statuses = [None]
+    else:
+        statuses = [str(order_status).strip().upper()]
 
     highest = int(s.last_success_update_time or 0)
     processed = errors = 0
@@ -1879,21 +1884,24 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
     for st in statuses:
         offset = 0
         while True:
+            params = {
+                "time_range_field": "update_time",
+                "time_from": int(time_from),
+                "time_to": int(time_to),
+                "page_size": int(page_size),
+                "offset": offset,
+            }
+            if st:
+                params["order_status"] = st
+
             resp = _call(
                 "/api/v2/order/get_order_list",
                 str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-                {
-                    "time_range_field": "update_time",
-                    "time_from": int(time_from),
-                    "time_to": int(time_to),
-                    "page_size": int(page_size),
-                    "order_status": st,
-                    "offset": offset,
-                },
+                params,
             )
             if resp.get("error"):
                 errors += 1
-                frappe.log_error(f"sync_orders_range[{st}] {resp.get('error')}: {resp.get('message')}",
+                frappe.log_error(f"sync_orders_range[{st or 'ALL'}] {resp.get('error')}: {resp.get('message')}",
                                  "Shopee Sync")
                 break
 
@@ -1907,6 +1915,12 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
                 if not order_sn or order_sn in seen:
                     continue
                 seen.add(order_sn)
+
+                # Skip bila SO-flow namun status tidak memenuhi kriteria SO (mis. COMPLETED)
+                if use_so_flow:
+                    st_now = (o.get("order_status") or "").upper()
+                    if not _should_make_so(st_now):
+                        continue
 
                 if frappe.db.exists("Sales Order",  {"custom_shopee_order_sn": order_sn}) \
                    or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
