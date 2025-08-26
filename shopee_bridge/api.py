@@ -1627,6 +1627,10 @@ def test_connection():
                       str(s.partner_id).strip(), s.partner_key,
                       s.shop_id, s.access_token, {})
         
+        # FIX: Add manual logging untuk debug
+        print(f"DEBUG: Shopee API response: {result}")
+        frappe.log_error(f"DEBUG: Shopee API response: {result}", "Shopee Debug")
+        
         # FIX: Add better error handling and logging
         if result.get("error"):
             # FIX: Gunakan title yang pendek untuk log
@@ -1652,7 +1656,7 @@ def test_connection():
         # FIX: Check if we actually got shop data
         if not shop_info or not shop_info.get("shop_name"):
             # FIX: Log dengan title pendek
-            frappe.log_error(f"Empty shop info returned", "Shopee Test")
+            frappe.log_error(f"Empty shop info returned: {result}", "Shopee Test")
             return {"success": False, "error": "No shop information returned", "message": "API call succeeded but returned empty data"}
         
         return {
