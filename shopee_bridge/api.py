@@ -2184,16 +2184,32 @@ def fix_item_names_from_shopee(update: int = 0, limit_pages: int = 999):
 
 @frappe.whitelist()
 def debug_get_order_detail(order_sn: str):
-    """Return payload mentah get_order_detail untuk 1 SN."""
+    """Ambil 1 order + field opsional selengkap mungkin (v2)."""
     s = _settings()
+    optional = ",".join([
+        # identitas pembeli (bisa null/masked tergantung region/izin)
+        "buyer_user_id","buyer_username",
+        # alamat/recipient
+        "recipient_address",
+        # item & harga
+        "item_list","payment_method","total_amount","pay_time",
+        # logistik & paket
+        "shipping_carrier","package_list","edt",
+        # pembatalan
+        "buyer_cancel_reason","cancel_by","cancel_reason",
+        # lain-lain
+        "fulfillment_flag","note","note_update_time","order_chargeable_weight_gram"
+    ])
     return _call(
         "/api/v2/order/get_order_detail",
         str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
         {
-            "order_sn_list": str(order_sn),  # HARUS string, bukan array
-            "response_optional_fields": "item_list,recipient_address,buyer_info"
+            "order_sn_list": str(order_sn),            # WAJIB string, bukan array
+            "response_optional_fields": optional,
+            # "request_order_status_pending": True,    # hanya jika kamu butuh dukung PENDING (opsional)
         }
     )
+
 
 @frappe.whitelist()
 def diagnose_order(order_sn: str, hours: int = 72):
