@@ -217,12 +217,31 @@ def refresh_if_needed():
     return {"status": "no_new_token"}
 
 def _default_item_group() -> str:
-    # Ambil dari Stock Settings kalau ada; kalau tidak, pakai Shopee Products (dibuat otomatis oleh _get_item_group)
-    return (
-        frappe.db.get_single_value("Stock Settings", "default_item_group")
-        or _get_item_group()  # akan membuat "Shopee Products" jika belum ada
-        or "All Item Groups"
-    )
+    """
+    Resolusi Item Group:
+    1) Shopee Settings.default_item_group (kalau field itu ada)
+    2) Stock Settings.default_item_group
+    3) 'Products' (fallback), atau 1 item group non-group apa saja
+    """
+    # 1) dari Shopee Settings (jika kamu sudah tambah field custom)
+    try:
+        ig = frappe.db.get_value("Shopee Settings", None, "default_item_group")
+        if ig:
+            return ig
+    except Exception:
+        pass
+
+    # 2) dari Stock Settings
+    ig = frappe.db.get_single_value("Stock Settings", "default_item_group")
+    if ig:
+        return ig
+
+    # 3) fallback
+    if frappe.db.exists("Item Group", "Products"):
+        return "Products"
+    names = frappe.db.get_list("Item Group", filters={"is_group": 0}, pluck="name", limit=1)
+    return names[0] if names else "Products"
+
 
 @frappe.whitelist()
 def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
@@ -251,54 +270,43 @@ def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
 
     return {"preview": dry_run == 1, "changes": changed}
 
-def _ensure_item_exists(sku: str, sh_it: dict, default_rate: float) -> str:
-    """
-    Pastikan item ada.
-    - Item Code = SKU (bukan Shopee item_id)
-    - Simpan mapping Shopee di custom fields:
-      custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
-    - Jika sudah ada item (by SKU atau by custom fields), pakai itu.
-    """
-    code = (sku or "").strip()
-    if not code:
-        # fallback minimal
-        code = f"SHP-{sh_it.get('item_id')}-{sh_it.get('model_id', '0')}"
+def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
+    """Pastikan Item ada; kalau belum, buat pakai Item Group dari Stock Settings."""
+    sku = (sku or "").strip()
+    if not sku:
+        sku = f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
 
-    # 1) Cek by Item Code (SKU)
-    if frappe.db.exists("Item", code):
-        return code
+    base = (it.get("item_name") or "").strip()
+    var  = (it.get("model_name") or "").strip()
+    item_name = (f"{base} | {var}" if var else base)[:140] or sku
 
-    # 2) Cek by custom fields (kalau sebelumnya pernah buat dengan code lain)
-    filt = {
-        "custom_shopee_item_id": str(sh_it.get("item_id") or ""),
-        "custom_shopee_model_id": str(sh_it.get("model_id") or "0"),
-    }
-    if filt["custom_shopee_item_id"]:
-        existing = frappe.db.get_value("Item", filt, "name")
-        if existing:
-            return existing
+    item_group = _default_item_group()
+    stock_uom  = frappe.db.get_single_value("Stock Settings", "stock_uom") or \
+                 frappe.db.get_single_value("Stock Settings", "default_uom") or "Nos"
 
-    # 3) Buat baru dengan Item Code = SKU
-    item = frappe.new_doc("Item")
-    item.item_code = code[:140]
-    item.item_name = (sh_it.get("item_name") or sh_it.get("model_name") or code)[:140]
-    item.item_group = _default_item_group()
-    item.is_stock_item = 1
+    # update bila sudah ada
+    if frappe.db.exists("Item", {"item_code": sku}):
+        doc = frappe.get_doc("Item", sku)
+        # Perbarui nama bila kosong/berbeda (opsional)
+        if item_name and doc.item_name != item_name:
+            doc.item_name = item_name
+        if doc.item_group != item_group:
+            doc.item_group = item_group
+        if doc.stock_uom != stock_uom:
+            doc.stock_uom = stock_uom
+        doc.save(ignore_permissions=True)
+        return doc.name
 
-    # optional harga awal
-    try:
-        item.standard_rate = float(default_rate or 0)
-    except Exception:
-        pass
+    # create baru
+    doc = frappe.new_doc("Item")
+    doc.item_code   = sku
+    doc.item_name   = item_name
+    doc.item_group  = item_group
+    doc.stock_uom   = stock_uom
+    doc.is_stock_item = 1
+    doc.insert(ignore_permissions=True)
+    return doc.name
 
-    # simpan identitas Shopee
-    item.custom_model_sku = (sh_it.get("model_sku") or sh_it.get("item_sku") or "")[:140]
-    item.custom_shopee_item_id = str(sh_it.get("item_id") or "")
-    item.custom_shopee_model_id = str(sh_it.get("model_id") or "0")
-
-    item.insert(ignore_permissions=True)
-    frappe.db.commit()
-    return item.name
 
 def _get_item_group():
     """Get or create Shopee item group."""
