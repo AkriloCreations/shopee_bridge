@@ -1,4 +1,4 @@
-import time, hmac, hashlib, requests, frappe
+import time, hmac, hashlib, requests, frappe, re
 from frappe.utils import get_url, nowdate, cint, add_days, now
 from datetime import datetime, timedelta
 import json
@@ -619,6 +619,8 @@ def _process_order_to_so(order_sn: str):
         so.company = company
         so.customer = customer
         so.transaction_date = nowdate()
+        so.po_no = order_sn
+        so.custom_shopee_order_sn = order_sn
 
         # delivery date dari lead days (settings), default hari ini
         lead_days = cint(getattr(s, "delivery_lead_days", 0) or 0)
@@ -825,26 +827,26 @@ def _process_order(order_sn: str):
         raise
 
 def _create_or_get_customer(order_detail):
-    """Create/get Customer dari recipient_address terlebih dulu, fallback buyer info.
-       Return: (customer_name, address_name|None, contact_name|None)
-    """
+    """Customer dibentuk dari nama penerima + 4 digit hp (fallback buyer info)."""
     addr = order_detail.get("recipient_address") or {}
     buyer_username = (order_detail.get("buyer_username") or "").strip()
     buyer_user_id  = str(order_detail.get("buyer_user_id") or "").strip()
 
-    # Nama paling stabil = nama penerima; fallback ke buyer_username; terakhir buyer_user_id
-    base_name = (addr.get("name") or buyer_username or (f"buyer_{buyer_user_id}" if buyer_user_id else "buyer")).strip()
+    base_raw = (addr.get("name") or buyer_username or (f"buyer_{buyer_user_id}" if buyer_user_id else "buyer"))
+    # buang karakter aneh/emoji
+    safe_base = re.sub(r"[^A-Za-z0-9\- ]+", "", (base_raw or "")).strip() or "buyer"
     phone     = (addr.get("phone") or addr.get("tel") or "").strip()
-    customer_name = f"SHP-{base_name}"
+    digits    = re.sub(r"\D", "", phone)
+    tail4     = (digits[-4:] if digits else "0000")
 
-    # Sudah ada?
+    customer_name = f"SHP-{safe_base[:20]}-{tail4}"
+
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
-        # cari juga alamat & contact kalau ada
         address_name = frappe.db.get_value("Address", {"address_title": customer_name}, "name")
-        contact_name = frappe.db.get_value("Contact", {"first_name": base_name}, "name")
+        contact_name = frappe.db.get_value("Contact", {"first_name": safe_base[:140]}, "name")
         return customer_name, address_name, contact_name
 
-    # Buat Customer
+    # Customer
     c = frappe.new_doc("Customer")
     c.customer_name  = customer_name
     c.customer_group = _get_customer_group()
@@ -852,30 +854,27 @@ def _create_or_get_customer(order_detail):
     c.territory      = "All Territories"
     c.insert(ignore_permissions=True)
 
-    # Buat Address (Shipping)
+    # Address
     address_name = None
     if addr:
         a = frappe.new_doc("Address")
         a.address_title = customer_name
         a.address_type  = "Shipping"
-        # rakit alamat kalau tersedia
-        lines = [
-            (addr.get("full_address") or "").strip(),
-            " ".join([str(addr.get("town","")).strip(), str(addr.get("district","")).strip()]).strip()
-        ]
-        a.address_line1 = (lines[0] or lines[1] or customer_name)[:140]
-        a.city          = (addr.get("city") or addr.get("state") or "")[:140]
-        a.country       = addr.get("country") or "Indonesia"
-        a.phone         = phone
+        full_line = (addr.get("full_address") or "").strip()
+        city      = (addr.get("city") or addr.get("state") or "").strip()
+        a.address_line1 = (full_line or city or customer_name)[:140]
+        a.city      = city[:140]
+        a.country   = addr.get("country") or "Indonesia"
+        a.phone     = phone
         a.append("links", {"link_doctype": "Customer", "link_name": customer_name})
         a.insert(ignore_permissions=True)
         address_name = a.name
 
-    # Buat Contact
+    # Contact
     contact_name = None
     try:
         ct = frappe.new_doc("Contact")
-        ct.first_name = base_name or customer_name
+        ct.first_name = safe_base[:140] or customer_name
         if phone:
             ct.append("phone_nos", {"phone": phone, "is_primary_phone": 1})
         ct.append("links", {"link_doctype": "Customer", "link_name": customer_name})
@@ -885,25 +884,6 @@ def _create_or_get_customer(order_detail):
         pass
 
     return customer_name, address_name, contact_name
-
-def _create_customer_contact(customer_name, address_data):
-    """Create contact for customer."""
-    try:
-        contact = frappe.new_doc("Contact")
-        contact.first_name = address_data.get("name", customer_name)
-        contact.phone = address_data.get("phone", "")
-        
-        # Link to customer
-        contact.append("links", {
-            "link_doctype": "Customer",
-            "link_name": customer_name
-        })
-        
-        contact.insert(ignore_permissions=True)
-        return contact.name
-    except Exception as e:
-        frappe.log_error(f"Failed to create contact for {customer_name}: {str(e)}", "Shopee Contact Creation")
-        return None
 
 def _create_payment_entry(si, esc, net, order_sn):
     """Create payment entry with Shopee fees."""
@@ -1151,39 +1131,64 @@ def _upsert_price(item_code: str, price_list: str, currency: str, rate: float):
         frappe.log_error(f"Failed to upsert price for {item_code}: {str(e)}", "Shopee Price Update")
 
 def _upsert_item(item_code: str, item_name: str, item_group: str, stock_uom: str, rate: float) -> str:
-    """Idempotent upsert Item. Return item_code actually used."""
+    """Buat/Update Item. Item Group diset di Item, bukan di Item Default."""
+    item_code = (item_code or "").strip()
+    item_name = (item_name or "").strip()[:140] or item_code
+
+    if not item_code:
+        raise Exception("Empty item_code in _upsert_item")
+
+    # Pastikan Item Group ada
+    if not frappe.db.exists("Item Group", item_group):
+        ig = frappe.new_doc("Item Group")
+        ig.item_group_name = item_group
+        ig.parent_item_group = "All Item Groups"
+        ig.is_group = 0
+        ig.insert(ignore_permissions=True)
+
+    # Buat / update Item
+    if frappe.db.exists("Item", item_code):
+        it = frappe.get_doc("Item", item_code)
+        changed = False
+        if it.item_name != item_name:
+            it.item_name = item_name
+            changed = True
+        if it.item_group != item_group:
+            it.item_group = item_group
+            changed = True
+        if it.stock_uom != stock_uom:
+            it.stock_uom = stock_uom
+            changed = True
+        # simpan kalau ada perubahan
+        if changed:
+            it.save(ignore_permissions=True)
+    else:
+        it = frappe.new_doc("Item")
+        it.item_code  = item_code
+        it.item_name  = item_name
+        it.description = item_name
+        it.item_group = item_group
+        it.stock_uom  = stock_uom
+        it.is_stock_item = 1
+        it.has_variants  = 0
+        it.insert(ignore_permissions=True)
+
+    # Tambahkan Item Default minimal (company/warehouse) bila perlu
     try:
-        exists = frappe.db.exists("Item", {"item_code": item_code})
-        if exists:
-            doc = frappe.get_doc("Item", exists)
-            # update minimal fields bila kosong/berubah
-            if item_name and doc.item_name != item_name[:140]:
-                doc.item_name = item_name[:140]
-            if doc.item_group != item_group:
-                doc.item_group = item_group
-            if doc.stock_uom != stock_uom:
-                doc.stock_uom = stock_uom
-            # standar rate hanya sebagai default (boleh diupdate)
-            if rate and (float(doc.get("standard_rate") or 0) != float(rate)):
-                doc.standard_rate = rate
-            doc.save(ignore_permissions=True)
-            return doc.name
-        else:
-            doc = frappe.new_doc("Item")
-            doc.item_code = item_code
-            doc.item_name = item_name[:140]
-            doc.item_group = item_group
-            doc.stock_uom = stock_uom
-            doc.is_stock_item = 1
-            doc.is_sales_item = 1
-            if rate:
-                doc.standard_rate = rate
-            doc.insert(ignore_permissions=True)
-            return doc.name
-    except Exception as e:
-        frappe.log_error(f"Failed to upsert item {item_code}: {str(e)}", "Shopee Item Upsert")
-        # fallback terakhir
-        return _create_fallback_item(item_code, item_name, rate)
+        company   = frappe.db.get_single_value("Global Defaults", "default_company")
+        warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+        if company and warehouse:
+            has_row = any([d.company == company for d in (it.item_defaults or [])])
+            if not has_row:
+                d = it.append("item_defaults", {})
+                d.company = company
+                d.default_warehouse = warehouse
+                it.save(ignore_permissions=True)
+    except Exception:
+        pass
+
+    return it.item_code
+
 
 def _get_models_for_item(item_id: int):
     """Get models/variations for a Shopee item."""
