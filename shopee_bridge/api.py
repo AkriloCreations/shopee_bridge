@@ -277,21 +277,22 @@ def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
 def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
     """Fixed version of item creation."""
     if not sku:
-        sku = f"SHP-UNKNOWN-{it.get('item_id', 'NOITEM')}"  # Changed here
+        sku = f"SHP-UNKNOWN-{it.get('item_id', 'NOITEM')}"
     
     # Check if exists
     if frappe.db.exists("Item", sku):
         return sku
     
     # Create item name
-    item_name = it.get("item_name") or it.get("model_name") or sku  # Changed here
+    item_name = it.get("item_name") or it.get("model_name") or sku
     
     try:
         item = frappe.new_doc("Item")
         item.item_code = sku
         item.item_name = item_name[:140]
         item.item_group = "All Item Groups"
-        item.stock_uom = "Nos"
+        # PERBAIKAN: Gunakan UOM yang lebih umum
+        item.stock_uom = _get_default_stock_uom()  # ← Ganti ini
         item.is_stock_item = 1
         item.is_sales_item = 1
         item.maintain_stock = 1
@@ -343,7 +344,7 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
                 fallback.item_code = fallback_sku
                 fallback.item_name = "Shopee Fallback Item"
                 fallback.item_group = "All Item Groups"
-                fallback.stock_uom = "Nos"
+                fallback.stock_uom = _get_default_stock_uom()  # Ganti "Nos"
                 fallback.is_stock_item = 1
                 fallback.is_sales_item = 1
                 fallback.description = "Fallback item for Shopee products that failed to create"
@@ -391,7 +392,7 @@ def _create_fallback_item(sku: str, item_name: str, rate: float) -> str:
         item.item_code = sku
         item.item_name = item_name[:140]
         item.item_group = "All Item Groups"  # Use default group as fallback
-        item.stock_uom = "Nos"
+        item.stock_uom = _get_default_stock_uom()  # Ganti "Nos"
         item.is_stock_item = 1
         item.is_sales_item = 1
         item.standard_rate = rate
@@ -411,7 +412,7 @@ def _ensure_catch_all_item():
             item.item_code = catch_all_sku
             item.item_name = "Shopee Unknown Item"
             item.item_group = "All Item Groups"
-            item.stock_uom = "Nos"
+            item.stock_uom = _get_default_stock_uom()  # Ganti "Nos"
             item.is_stock_item = 1
             item.is_sales_item = 1
             item.standard_rate = 0
@@ -470,7 +471,7 @@ def _match_or_create_item(it: dict, rate: float) -> str:
     item.item_code =  _fit140(code)
     item.item_name = _fit140(itname)  
     item.item_group = frappe.db.get_single_value("Stock Settings", "default_item_group") or "All Item Groups"
-    item.stock_uom = "Nos"
+    item.stock_uom = _get_default_stock_uom()  # Ganti "Nos"
     item.is_stock_item = 1
     item.maintain_stock = 1
     # set mapping
@@ -1131,13 +1132,8 @@ def _cfg_defaults():
     # Item Group - simple fallback
     item_group = _default_item_group()
     
-    # Stock UOM - ambil yang paling umum
-    stock_uom = "Nos"  # Default fallback
-    common_uoms = ["Pcs", "Nos", "Unit"]
-    for uom in common_uoms:
-        if frappe.db.exists("UOM", uom):
-            stock_uom = uom
-            break
+    # Stock UOM - PERBAIKAN: prefer Pcs
+    stock_uom = _get_default_stock_uom()  # ← Gunakan fungsi helper
     
     # Price List - cari yang selling=1
     price_list = None
@@ -1231,7 +1227,7 @@ def _upsert_item(item_code: str,
 
     # Pastikan stock_uom ada
     if not stock_uom:
-        stock_uom = "Nos"
+        stock_uom = _get_default_stock_uom()
 
     if frappe.db.exists("Item", code140):
         item = frappe.get_doc("Item", code140)
@@ -2489,3 +2485,15 @@ def scheduled_cleanup():
         frappe.logger().info("Cleanup completed successfully")
     except Exception as e:
         frappe.log_error(f"Scheduled cleanup failed: {str(e)}", "Scheduled Cleanup")
+
+def _get_default_stock_uom() -> str:
+    """Get default stock UOM, prefer Pcs over Nos."""
+    # Priority order: Pcs > Unit > Nos > fallback
+    preferred_uoms = ["Pcs", "Unit", "Nos"]
+    
+    for uom in preferred_uoms:
+        if frappe.db.exists("UOM", uom):
+            return uom
+    
+    # Ultimate fallback
+    return "Nos"
