@@ -1,5 +1,5 @@
 import time, hmac, hashlib, requests, frappe
-from frappe.utils import get_url, nowdate, cint, add_days
+from frappe.utils import get_url, nowdate, cint, add_days, now
 from datetime import datetime, timedelta
 import json
 
@@ -528,43 +528,55 @@ def _safe_set(doc, fieldname, value):
     except Exception:
         pass
 
+def _maybe_create_work_orders(so):
+    """Auto create Work Order untuk item yang ada BOM (opsional)."""
+    try:
+        for row in so.items:
+            # cek Item & BOM
+            item_doc = frappe.get_doc("Item", row.item_code)
+            bom_no = getattr(item_doc, "default_bom", None)
+            if not bom_no:
+                continue
+
+            wo = frappe.new_doc("Work Order")
+            wo.company            = so.company
+            wo.production_item    = item_doc.name
+            wo.qty                = row.qty
+            wo.sales_order        = so.name
+            wo.bom_no             = bom_no
+            wo.planned_start_date = now()
+            wo.expected_delivery_date = so.delivery_date
+            # warehouse default (boleh diubah)
+            wo.wip_warehouse      = frappe.db.get_single_value("Manufacturing Settings", "default_wip_warehouse") \
+                                    or frappe.db.get_single_value("Stock Settings", "default_warehouse")
+            wo.fg_warehouse       = row.warehouse or frappe.db.get_single_value("Stock Settings", "default_warehouse")
+            wo.insert(ignore_permissions=True)
+            # kalau mau langsung submit: wo.submit()
+    except Exception as e:
+        frappe.log_error(f"Auto WO failed for {so.name}: {e}", "Shopee Phase2 WO")
 
 def _process_order_to_so(order_sn: str):
-    """Phase 2: Buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
+    """Phase 2: buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
     s = _settings()
 
-    # Skip kalau sudah pernah dibuat
-    if (
-        frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-        or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})
-    ):
+    if (frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
+        or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
         frappe.logger().info(f"[SO] Order {order_sn} already processed, skipping")
         return
 
     try:
-        # (opsional) segarkan token dulu; aman kalau fungsi ini tak terima arg 'force'
         try:
-            refresh_if_needed()
+            refresh_if_needed(force=False)
         except Exception:
             pass
 
-        # --- Ambil detail order dari Shopee ---
         det = _call(
             "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(),
-            s.partner_key,
-            s.shop_id,
-            s.access_token,
-            {
-                "order_sn_list": order_sn,
-                "response_optional_fields": "item_list,recipient_address,buyer_info,cancel_by,cancel_reason,cancel_time"
-            },
+            str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,buyer_info"}
         )
         if det.get("error"):
-            _short_log(
-                f"Failed to get order detail for {order_sn}: {det.get('message')}",
-                "Shopee Phase2",
-            )
+            _short_log(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee Phase2")
             return
 
         orders = (det.get("response") or {}).get("order_list", []) or []
@@ -573,113 +585,75 @@ def _process_order_to_so(order_sn: str):
             return
         od = orders[0]
 
-        # --- Baca info pembatalan (jika ada) ---
-        cancel_ts = int(
-            od.get("cancel_time")
-            or od.get("cancelled_time")
-            or od.get("actual_cancel_time")
-            or 0
-        )
-        cancel_dt_str = ""
-        if cancel_ts:
-            try:
-                cancel_dt_str = datetime.fromtimestamp(cancel_ts).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                cancel_dt_str = str(cancel_ts)
-        cancel_reason = (od.get("cancel_reason") or od.get("cancel_reason_ext") or "").strip()
+        # --- Customer, Address, Contact ---
+        customer, addr_name, contact_name = _create_or_get_customer(od)
+        company  = frappe.db.get_single_value("Global Defaults", "default_company")
 
-        # --- Customer & Company ---
-        customer = _create_or_get_customer(od)
-        company = frappe.db.get_single_value("Global Defaults", "default_company")
-
-        # --- Siapkan items ---
+        # --- Items (nama dipotong 140) ---
         items = []
         for it in od.get("item_list", []):
-            # Item Code (SKU) prioritas: model_sku -> item_sku -> fallback
-            sku = (it.get("model_sku") or "").strip() or \
-                  (it.get("item_sku") or "").strip() or \
-                  f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+            sku = (it.get("model_sku") or "").strip() or (it.get("item_sku") or "").strip() \
+                  or f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
             if not sku:
                 sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
 
-            # Nama item: konsisten dgn sync_items → "Nama Produk - Nama Variasi"
-            composed_name = _compose_item_name(
-                it.get("item_name") or "",
-                it.get("model_name") or ""
-            )
-            # Potong 140 (ERPNext batas field item_name)
-            item_name_140 = _fit140(composed_name if composed_name else (it.get("item_name") or ""))
-
-            qty = int(
-                it.get("model_quantity_purchased")
-                or it.get("variation_quantity_purchased")
-                or 1
-            )
-            rate = float(
-                it.get("model_original_price")
-                or it.get("model_discounted_price")
-                or it.get("order_price")
-                or it.get("item_price")
-                or 0
-            )
-            # guard kalau harga dari Shopee pakai micro unit
+            qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+            rate = float(it.get("model_original_price") or it.get("model_discounted_price") or
+                         it.get("order_price") or it.get("item_price") or 0)
             if rate > 1_000_000:
                 rate = rate / 100000
 
-            # Pastikan item ada di master (auto-create bila perlu)
+            # pastikan item ada
             item_code = _ensure_item_exists(sku, it, rate)
 
-            items.append(
-                {
-                    "item_code": item_code,
-                    "item_name": item_name_140,
-                    "qty": qty,
-                    "rate": rate,
-                }
-            )
+            # nama human readable (base + varian kalau tersedia)
+            readable_name = (it.get("item_name") or it.get("model_name") or "").strip()
+            items.append({"item_code": item_code, "item_name": _fit140(readable_name), "qty": qty, "rate": rate})
 
         if not items:
             _short_log(f"No valid items for {order_sn}", "Shopee Phase2")
             return
 
-        # --- Buat Sales Order ---
+        # --- Buat SO ---
         so = frappe.new_doc("Sales Order")
-        so.customer = customer
         so.company = company
-
-        # Tanggal transaksi = hari ini
+        so.customer = customer
         so.transaction_date = nowdate()
 
-        # DELIVERY DATE WAJIB:
-        # Pakai lead time dari settings kalau ada, default 0 hari (hari ini)
+        # delivery date dari lead days (settings), default hari ini
         lead_days = cint(getattr(s, "delivery_lead_days", 0) or 0)
         delivery_date = add_days(nowdate(), lead_days)
         so.delivery_date = delivery_date
 
+        # mapping optional: address & contact
+        if addr_name:
+            so.customer_address = addr_name
+        if contact_name:
+            so.contact_person = contact_name
+
+        # SN & cancel-by timestamp
         so.custom_shopee_order_sn = order_sn
+        cancel_ts = cint(od.get("auto_cancel_time") or 0)
+        if cancel_ts and hasattr(so, "custom_shopee_cancel_by"):
+            try:
+                so.custom_shopee_cancel_by = frappe.utils.datetime.datetime.fromtimestamp(cancel_ts)
+            except Exception:
+                pass
 
-        # Tambahkan context Shopee (pembatalan) ke remarks / custom field
-        base_remark = f"Shopee order SN {order_sn}"
-        if cancel_dt_str or cancel_reason:
-            extra = f" | Cancel at: {cancel_dt_str}" if cancel_dt_str else ""
-            extra += f" | Reason: {cancel_reason}" if cancel_reason else ""
-            so.remarks = f"{base_remark}{extra}"
-            # set ke custom field bila tersedia
-            _safe_set(so, "custom_shopee_cancel_time", cancel_dt_str)
-            _safe_set(so, "custom_shopee_cancel_reason", cancel_reason)
-        else:
-            so.remarks = base_remark
-
+        # items
         for it in items:
             r = so.append("items", {})
             r.item_code = it["item_code"]
-            r.item_name = _fit140(it.get("item_name") or "")  # enforce 140 tiap row
-            r.qty = it["qty"]
-            r.rate = it["rate"]
-            # penting: row-level delivery date juga harus diisi
+            r.item_name = it["item_name"]     # ≤140
+            r.qty       = it["qty"]
+            r.rate      = it["rate"]
             r.delivery_date = delivery_date
 
-        _insert_submit_with_retry(so, max_tries=3)
+        _insert_submit_with_retry(so, max_tries=3)   # insert + submit dengan retry aman
+
+        # (opsional) otomatis buat Work Order untuk yang ada BOM
+        if cint(getattr(s, "use_sales_order_flow", 0) or 0):
+            _maybe_create_work_orders(so)
 
         frappe.logger().info(f"Created Sales Order {so.name} for order {order_sn}")
         return {"ok": True, "sales_order": so.name}
@@ -687,7 +661,7 @@ def _process_order_to_so(order_sn: str):
     except Exception as e:
         _short_log(f"Failed to create SO for {order_sn}: {e}", "Shopee Phase2")
         raise
-    
+
 LOCK_ERRORS = ("Lock wait timeout exceeded", "deadlock found")
 
 def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
@@ -851,34 +825,66 @@ def _process_order(order_sn: str):
         raise
 
 def _create_or_get_customer(order_detail):
-    """Create or get customer from order details."""
-    buyer_username = order_detail.get("buyer_username") or f"buyer_{order_detail.get('buyer_user_id', 'unknown')}"
-    customer_name = f"SHP-{buyer_username}"
-    
-    # Check if customer exists
-    if frappe.db.exists("Customer", {"customer_name": customer_name}):
-        return customer_name
+    """Create/get Customer dari recipient_address terlebih dulu, fallback buyer info.
+       Return: (customer_name, address_name|None, contact_name|None)
+    """
+    addr = order_detail.get("recipient_address") or {}
+    buyer_username = (order_detail.get("buyer_username") or "").strip()
+    buyer_user_id  = str(order_detail.get("buyer_user_id") or "").strip()
 
-    # Create new customer
+    # Nama paling stabil = nama penerima; fallback ke buyer_username; terakhir buyer_user_id
+    base_name = (addr.get("name") or buyer_username or (f"buyer_{buyer_user_id}" if buyer_user_id else "buyer")).strip()
+    phone     = (addr.get("phone") or addr.get("tel") or "").strip()
+    customer_name = f"SHP-{base_name}"
+
+    # Sudah ada?
+    if frappe.db.exists("Customer", {"customer_name": customer_name}):
+        # cari juga alamat & contact kalau ada
+        address_name = frappe.db.get_value("Address", {"address_title": customer_name}, "name")
+        contact_name = frappe.db.get_value("Contact", {"first_name": base_name}, "name")
+        return customer_name, address_name, contact_name
+
+    # Buat Customer
+    c = frappe.new_doc("Customer")
+    c.customer_name  = customer_name
+    c.customer_group = _get_customer_group()
+    c.customer_type  = "Individual"
+    c.territory      = "All Territories"
+    c.insert(ignore_permissions=True)
+
+    # Buat Address (Shipping)
+    address_name = None
+    if addr:
+        a = frappe.new_doc("Address")
+        a.address_title = customer_name
+        a.address_type  = "Shipping"
+        # rakit alamat kalau tersedia
+        lines = [
+            (addr.get("full_address") or "").strip(),
+            " ".join([str(addr.get("town","")).strip(), str(addr.get("district","")).strip()]).strip()
+        ]
+        a.address_line1 = (lines[0] or lines[1] or customer_name)[:140]
+        a.city          = (addr.get("city") or addr.get("state") or "")[:140]
+        a.country       = addr.get("country") or "Indonesia"
+        a.phone         = phone
+        a.append("links", {"link_doctype": "Customer", "link_name": customer_name})
+        a.insert(ignore_permissions=True)
+        address_name = a.name
+
+    # Buat Contact
+    contact_name = None
     try:
-        c = frappe.new_doc("Customer")
-        c.customer_name = customer_name
-        c.customer_group = _get_customer_group()
-        c.customer_type = "Individual"
-        c.territory = "All Territories"  # Default territory
-        
-        # Set customer primary contact if available
-        recipient_address = order_detail.get("recipient_address", {})
-        if recipient_address:
-            c.customer_primary_contact = _create_customer_contact(customer_name, recipient_address)
-        
-        c.insert(ignore_permissions=True)
-        return customer_name
-        
-    except Exception as e:
-        frappe.log_error(f"Failed to create customer {customer_name}: {str(e)}", "Shopee Customer Creation")
-        # Return the name anyway, customer might have been created by another process
-        return customer_name
+        ct = frappe.new_doc("Contact")
+        ct.first_name = base_name or customer_name
+        if phone:
+            ct.append("phone_nos", {"phone": phone, "is_primary_phone": 1})
+        ct.append("links", {"link_doctype": "Customer", "link_name": customer_name})
+        ct.insert(ignore_permissions=True)
+        contact_name = ct.name
+    except Exception:
+        pass
+
+    return customer_name, address_name, contact_name
 
 def _create_customer_contact(customer_name, address_data):
     """Create contact for customer."""
@@ -1194,8 +1200,12 @@ def _get_models_for_item(item_id: int):
     models = resp.get("model") or resp.get("models") or []
     return models if isinstance(models, list) else []
 
-def _get_item_base_info(item_id: int):
-    """Get base item information from Shopee."""
+def _get_item_base_info(item_id: int) -> dict:
+    """
+    Ambil judul produk (item_name) + SKU dasarnya dari Shopee.
+    Sumber utama: /api/v2/product/get_item_base_info
+    Return selalu dict dengan minimal key: item_name, item_sku.
+    """
     s = _settings()
     res = _call(
         "/api/v2/product/get_item_base_info",
@@ -1203,10 +1213,36 @@ def _get_item_base_info(item_id: int):
         s.partner_key,
         s.shop_id,
         s.access_token,
-        {"item_id_list": [int(item_id)]},
+        {"item_id_list": str(item_id)}
     )
-    lst = (res.get("response") or {}).get("item_list", []) or []
-    return lst[0] if lst and isinstance(lst, list) else {}
+
+    base = {}
+    if isinstance(res, dict) and not res.get("error"):
+        lst = (res.get("response") or {}).get("item_list") or []
+        if lst:
+            base = lst[0] or {}
+
+    # Normalisasi minimal field
+    item_name = (base.get("item_name") or "").strip()
+    item_sku  = (base.get("item_sku")  or "").strip()
+
+    # Fallback terakhir: kalau masih kosong banget, coba /get_model_list dulu untuk ambil item_sku
+    if not item_sku:
+        try:
+            ml = _call(
+                "/api/v2/product/get_model_list",
+                str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                {"item_id": int(item_id)}
+            )
+            if isinstance(ml, dict) and not ml.get("error"):
+                resp = (ml.get("response") or {})
+                item = (resp.get("item") or {})
+                item_sku = (item.get("item_sku") or "").strip()
+        except Exception:
+            pass
+
+    return {"item_name": item_name, "item_sku": item_sku}
+
 
 # ===== Helpers (ADD jika belum ada) =========================================
 from typing import Optional
@@ -1325,12 +1361,32 @@ def _upsert_price(item_code: str, price_list: str, currency: str, rate: float):
 @frappe.whitelist()
 def sync_items(hours: int = 720, status: str = "NORMAL"):
     """
-    Sinkron Item dari Shopee ke ERPNext.
-    - Item Code: model_sku bila ada, else 'SHP-<item_id>' atau 'SHP-<item_id>-<model_id>'
-    - Item Name: 'Nama Produk - Nama Variasi' (max 140); nama lengkap ke description
-    - Simpan mapping Shopee di custom fields (custom_model_sku, custom_shopee_item_id, custom_shopee_model_id)
-    - Paging: handle has_next/has_next_page/more
+    Sinkron Item Shopee -> ERPNext.
+    - Code: model_sku (jika ada) else SHP-<item_id> / SHP-<item_id>-<model_id>
+    - Name: "Judul Produk - Nama Varian" (max 140)
+    - Mapping custom fields: custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
     """
+    import time
+
+    # ---- util lokal (hindari dependensi) ----
+    def _fit140_local(s: str) -> str:
+        return ((s or "").strip())[:140]
+
+    def _compose_local(base_name: str, model_name: str) -> str:
+        b = (base_name or "").strip()
+        m = (model_name or "").strip()
+        if b and m: return f"{b} - {m}"
+        return b or m or ""
+
+    def _norm_rate(x) -> float:
+        try:
+            v = float(x or 0)
+            if v > 1_000_000:  # sebagian region pakai micro units
+                v = v / 100000
+            return v
+        except Exception:
+            return 0.0
+
     s = _settings()
     defaults = _cfg_defaults()
     currency = "IDR"
@@ -1344,150 +1400,164 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
     processed_items = 0
     error_count = 0
 
-    frappe.logger().info(f"Starting item sync: from {time_from} to {time_to}")
-
-    # Pastikan token valid (jangan blokir jika gagal)
+    # segarkan token kalau perlu (abaikan error)
     try:
         refresh_if_needed()
     except Exception:
         pass
 
-    try:  # try luar (wajib ada except agar lint happy)
+    frappe.logger().info(f"[sync_items] from={time_from} to={time_to} status={status}")
+
+    try:
         while True:
-            try:
-                if processed_items > 0:
-                    time.sleep(0.3)  # throttle ringan
+            # throttle ringan
+            if processed_items > 0:
+                time.sleep(0.2)
 
-                gl = _call(
-                    "/api/v2/product/get_item_list",
-                    str(s.partner_id).strip(),
-                    s.partner_key,
-                    s.shop_id,
-                    s.access_token,
-                    {
-                        "offset": offset,
-                        "page_size": page_size,
-                        "update_time_from": time_from,
-                        "update_time_to": time_to,
-                        "item_status": status,
-                    },
-                )
+            gl = _call(
+                "/api/v2/product/get_item_list",
+                str(s.partner_id).strip(),
+                s.partner_key,
+                s.shop_id,
+                s.access_token,
+                {
+                    "offset": offset,
+                    "page_size": page_size,
+                    "update_time_from": time_from,
+                    "update_time_to": time_to,
+                    "item_status": status,
+                },
+            )
 
-                if not isinstance(gl, dict):
-                    frappe.log_error(f"Unexpected payload: {type(gl).__name__}", "Shopee sync_items")
-                    return {"ok": False, "error": "bad_payload_type"}
+            if not isinstance(gl, dict):
+                frappe.log_error(f"Unexpected payload type: {type(gl).__name__}", "Shopee sync_items")
+                return {"ok": False, "error": "bad_payload_type"}
 
-                if gl.get("error"):
-                    msg = f"get_item_list error: {gl.get('error')} - {gl.get('message')}"
-                    frappe.log_error(msg, "Shopee sync_items")
-                    if "access token" in str(gl.get("message", "")).lower():
-                        ri = refresh_if_needed()
-                        if ri.get("status") == "refreshed":
-                            continue
-                    return {"ok": False, "error": gl.get("error"), "message": gl.get("message")}
+            if gl.get("error"):
+                msg = f"get_item_list error: {gl.get('error')} - {gl.get('message')}"
+                frappe.log_error(msg, "Shopee sync_items")
+                # refresh token lalu coba ulang 1x
+                if "access token" in str(gl.get("message", "")).lower():
+                    ri = refresh_if_needed()
+                    if ri.get("status") == "refreshed":
+                        continue
+                return {"ok": False, "error": gl.get("error"), "message": gl.get("message")}
 
-                resp = gl.get("response") or {}
-                item_list = resp.get("item") or resp.get("items") or []
-                if not isinstance(item_list, list):
-                    item_list = []
+            resp = gl.get("response") or {}
+            item_list = resp.get("item") or resp.get("items") or []
+            if not isinstance(item_list, list):
+                item_list = []
 
-                has_next = bool(resp.get("has_next_page") or resp.get("has_next") or resp.get("more"))
+            has_next = bool(resp.get("has_next_page") or resp.get("has_next") or resp.get("more"))
 
-                for it in item_list:
-                    try:
-                        processed_items += 1
-                        item_id = int(it.get("item_id"))
+            for it in item_list:
+                try:
+                    processed_items += 1
+                    item_id = int(it.get("item_id"))
 
-                        base = _get_item_base_info(item_id) or {}
-                        base_name = (base.get("item_name") or "").strip()
-                        base_sku  = (base.get("item_sku") or "").strip()
+                    # ---- ambil judul produk (base) ----
+                    base_info = _call(
+                        "/api/v2/product/get_item_base_info",
+                        str(s.partner_id).strip(),
+                        s.partner_key,
+                        s.shop_id,
+                        s.access_token,
+                        {"item_id_list": str(item_id)},
+                    )
+                    base_name = ""
+                    base_sku = ""
+                    if isinstance(base_info, dict) and not base_info.get("error"):
+                        lst = (base_info.get("response") or {}).get("item_list") or []
+                        if lst:
+                            base_name = (lst[0].get("item_name") or "").strip()
+                            base_sku = (lst[0].get("item_sku") or "").strip()
 
-                        models = _get_models_for_item(item_id) or []
+                    # ---- ambil model list (varian) ----
+                    ml = _call(
+                        "/api/v2/product/get_model_list",
+                        str(s.partner_id).strip(),
+                        s.partner_key,
+                        s.shop_id,
+                        s.access_token,
+                        {"item_id": item_id},
+                    )
+                    models = []
+                    if isinstance(ml, dict) and not ml.get("error"):
+                        models = (ml.get("response") or {}).get("model") or []
                         if not isinstance(models, list):
                             models = []
 
-                        # --- Tanpa model -> 1 Item ---
-                        if not models:
-                            sku = base_sku if base_sku else f"SHP-{item_id}"
-                            full_name = _compose_item_name(base_name, None) or base_name or ""
-                            name_140  = _fit140(full_name if full_name else sku)
-                            rate = _normalize_rate(
-                                base.get("normal_price") or base.get("price") or base.get("original_price")
-                            )
+                    # ===== tanpa model: 1 item =====
+                    if not models:
+                        sku = base_sku if base_sku else f"SHP-{item_id}"
+                        full_name = base_name or ""
+                        name_140 = _fit140_local(full_name or base_name or "")
+                        if not name_140:
+                            name_140 = _fit140_local(sku)
+
+                        rate = _norm_rate(
+                            (lst[0].get("normal_price") if (isinstance(base_info, dict) and not base_info.get("error") and lst) else None)
+                        )
+
+                        existed = bool(frappe.db.exists("Item", {"item_code": sku}))
+                        used_code = _upsert_item(
+                            sku, name_140,
+                            defaults.get("item_group"), defaults.get("stock_uom"), rate,
+                            meta={
+                                "description": (full_name or base_name or sku),
+                                "custom_model_sku": base_sku,
+                                "custom_shopee_item_id": str(item_id),
+                                "custom_shopee_model_id": "0",
+                            },
+                        )
+                        _upsert_price(used_code, defaults.get("price_list"), currency, rate)
+                        if existed: updated += 1
+                        else:       created += 1
+                        continue
+
+                    # ===== ada model: 1 item per varian =====
+                    for m in models:
+                        try:
+                            model_id  = str(m.get("model_id") or "0")
+                            model_sku = (m.get("model_sku") or "").strip()
+                            sku       = model_sku if model_sku else f"SHP-{item_id}-{model_id}"
+
+                            model_name = (m.get("model_name") or "").strip()
+                            full_name  = _compose_local(base_name, model_name)
+                            name_140   = _fit140_local(full_name if full_name else sku)
+                            rate       = _norm_rate(m.get("price") or m.get("original_price"))
 
                             existed = bool(frappe.db.exists("Item", {"item_code": sku}))
                             used_code = _upsert_item(
                                 sku, name_140,
                                 defaults.get("item_group"), defaults.get("stock_uom"), rate,
                                 meta={
-                                    "description": (full_name or sku),
-                                    "custom_model_sku": base_sku,
+                                    "description": (full_name or f"{base_name} - {model_name}" or sku),
+                                    "custom_model_sku": model_sku,
                                     "custom_shopee_item_id": str(item_id),
-                                    "custom_shopee_model_id": "0",
+                                    "custom_shopee_model_id": model_id,
                                 },
                             )
                             _upsert_price(used_code, defaults.get("price_list"), currency, rate)
-                            if existed:
-                                updated += 1
-                            else:
-                                created += 1
+                            if existed: updated += 1
+                            else:       created += 1
+
+                        except Exception as model_err:
+                            error_count += 1
+                            frappe.log_error(
+                                f"Process model {m.get('model_id')} for item {item_id}: {model_err}",
+                                "Shopee sync_items/model",
+                            )
                             continue
 
-                        # --- Ada model -> 1 Item per model ---
-                        for m in models:
-                            try:
-                                model_id = str(m.get("model_id") or "0")
-                                model_sku = (m.get("model_sku") or "").strip()
-                                sku = model_sku if model_sku else f"SHP-{item_id}-{model_id}"
+                except Exception as item_err:
+                    error_count += 1
+                    frappe.log_error(f"Process item {it.get('item_id')}: {item_err}", "Shopee sync_items/item")
+                    continue
 
-                                model_name = (m.get("model_name") or "").strip()
-                                full_name = _compose_item_name(base_name, model_name) or model_name or base_name or ""
-                                name_140 = _fit140(full_name if full_name else sku)
-                                rate = _normalize_rate(m.get("price") or m.get("original_price"))
-
-                                existed = bool(frappe.db.exists("Item", {"item_code": sku}))
-                                used_code = _upsert_item(
-                                    sku, name_140,
-                                    defaults.get("item_group"), defaults.get("stock_uom"), rate,
-                                    meta={
-                                        "description": (full_name or sku),
-                                        "custom_model_sku": model_sku,
-                                        "custom_shopee_item_id": str(item_id),
-                                        "custom_shopee_model_id": model_id,
-                                    },
-                                )
-                                _upsert_price(used_code, defaults.get("price_list"), currency, rate)
-                                if existed:
-                                    updated += 1
-                                else:
-                                    created += 1
-
-                            except Exception as model_error:
-                                error_count += 1
-                                frappe.log_error(
-                                    f"Failed model {m.get('model_id')} for item {item_id}: {model_error}",
-                                    "Shopee Model Processing",
-                                )
-                                continue
-
-                    except Exception as item_error:
-                        error_count += 1
-                        frappe.log_error(
-                            f"Failed to process item {it.get('item_id')}: {item_error}",
-                            "Shopee Item Processing",
-                        )
-                        continue
-
-                if not has_next:
-                    break
-                offset = resp.get("next_offset", offset + page_size)
-
-            except Exception as batch_error:
-                error_count += 1
-                frappe.log_error(f"Error processing item batch: {batch_error}", "Shopee Item Sync")
-                if error_count > 5:
-                    break
-                continue
+            if not has_next:
+                break
+            offset = resp.get("next_offset", offset + page_size)
 
         result = {
             "ok": True,
@@ -1497,11 +1567,11 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
             "updated": updated,
             "errors": error_count,
         }
-        frappe.logger().info(f"Item sync completed: {result}")
+        frappe.logger().info(f"[sync_items] done {result}")
         return result
 
     except Exception as e:
-        frappe.log_error(f"Item sync crashed: {e}", "Shopee Item Sync")
+        frappe.log_error(f"sync_items crashed: {e}", "Shopee sync_items")
         return {"ok": False, "error": "exception", "message": str(e)}
 
 
