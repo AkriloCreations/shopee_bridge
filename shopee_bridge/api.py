@@ -1,5 +1,5 @@
-import time, hmac, hashlib, requests, frappe, re
-from frappe.utils import get_url, nowdate, cint, add_days, now
+import time, hmac, hashlib, requests, frappe, re  # pyright: ignore[reportMissingImports]
+from frappe.utils import get_url, nowdate, cint, add_days, now  # pyright: ignore[reportMissingImports]
 from datetime import datetime, timedelta
 import json
 
@@ -554,26 +554,51 @@ def _maybe_create_work_orders(so):
             # kalau mau langsung submit: wo.submit()
     except Exception as e:
         frappe.log_error(f"Auto WO failed for {so.name}: {e}", "Shopee Phase2 WO")
+def _safe_int(v, d=0):
+    try:
+        return int(v) if v not in (None, "") else d
+    except Exception:
+        return d
+
+def _safe_flt(v, d=0.0):
+    try:
+        return float(v) if v not in (None, "") else d
+    except Exception:
+        return d
+
+def _ts_to_date(ts):
+    if not ts:
+        return None
+    return frappe.utils.formatdate(frappe.utils.convert_utc_to_user_datetime(ts).date())
+
+def _compose_customer_name(od):
+    uname = (od.get("buyer_username") or "").strip()
+    if uname:
+        return f"SHP-{uname}"[:140]
+    uid = str(od.get("buyer_user_id") or "")[-4:] or "0000"
+    return f"SHP-buyer-{uid}"
 
 def _process_order_to_so(order_sn: str):
-    """Phase 2: buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
+    """Buat SO pakai field standar saja."""
     s = _settings()
 
-    if (frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-        or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
-        frappe.logger().info(f"[SO] Order {order_sn} already processed, skipping")
+    # Cegah duplikat via po_no (Customer's Purchase Order)
+    if frappe.db.exists("Sales Order", {"po_no": order_sn}) or \
+       frappe.db.exists("Sales Invoice", {"po_no": order_sn}):
+        frappe.logger().info(f"[SO] {order_sn} already processed, skipping")
         return
 
     try:
         try:
-            refresh_if_needed(force=False)
+            refresh_if_needed()
         except Exception:
             pass
 
+        # Ambil detail order
         det = _call(
             "/api/v2/order/get_order_detail",
             str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,buyer_info"}
+            {"order_sn_list": order_sn, "response_optional_fields":"item_list,recipient_address,buyer_info"}
         )
         if det.get("error"):
             _short_log(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee Phase2")
@@ -585,79 +610,65 @@ def _process_order_to_so(order_sn: str):
             return
         od = orders[0]
 
-        # --- Customer, Address, Contact ---
-        customer, addr_name, contact_name = _create_or_get_customer(od)
+        # Tanggal
+        create_ts  = _safe_int(od.get("create_time"))
+        pay_ts     = _safe_int(od.get("pay_time"))
+        ship_by_ts = _safe_int(od.get("ship_by_date"))
+        if not ship_by_ts:
+            dts = _safe_int(od.get("days_to_ship"))
+            if dts and create_ts:
+                ship_by_ts = create_ts + dts * 86400
+
+        transaction_date = _ts_to_date(create_ts) or nowdate()
+        delivery_date    = _ts_to_date(ship_by_ts) or transaction_date
+        customer_po_date = _ts_to_date(pay_ts) or None  # opsional
+
+        # Customer/Address/Contact pakai fungsi yang sudah ada
+        customer = _create_or_get_customer(od) or _compose_customer_name(od)
         company  = frappe.db.get_single_value("Global Defaults", "default_company")
 
-        # --- Items (nama dipotong 140) ---
-        items = []
-        for it in od.get("item_list", []):
-            sku = (it.get("model_sku") or "").strip() or (it.get("item_sku") or "").strip() \
-                  or f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
-            if not sku:
-                sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
-
-            qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-            rate = float(it.get("model_original_price") or it.get("model_discounted_price") or
-                         it.get("order_price") or it.get("item_price") or 0)
-            if rate > 1_000_000:
-                rate = rate / 100000
-
-            # pastikan item ada
-            item_code = _ensure_item_exists(sku, it, rate)
-
-            # nama human readable (base + varian kalau tersedia)
-            readable_name = (it.get("item_name") or it.get("model_name") or "").strip()
-            items.append({"item_code": item_code, "item_name": _fit140(readable_name), "qty": qty, "rate": rate})
-
-        if not items:
-            _short_log(f"No valid items for {order_sn}", "Shopee Phase2")
-            return
-
-        # --- Buat SO ---
+        # Build SO
         so = frappe.new_doc("Sales Order")
         so.company = company
         so.customer = customer
-        so.transaction_date = nowdate()
-        so.po_no = order_sn
-        so.custom_shopee_order_sn = order_sn
-
-        # delivery date dari lead days (settings), default hari ini
-        lead_days = cint(getattr(s, "delivery_lead_days", 0) or 0)
-        delivery_date = add_days(nowdate(), lead_days)
+        so.transaction_date = transaction_date
         so.delivery_date = delivery_date
+        so.po_no = order_sn  # simpan Order SN di field standar
+        if hasattr(so, "customer_purchase_order_date") and customer_po_date:
+            so.customer_purchase_order_date = customer_po_date
 
-        # mapping optional: address & contact
-        if addr_name:
-            so.customer_address = addr_name
-        if contact_name:
-            so.contact_person = contact_name
+        # Remarks hanya sebagai catatan (tidak wajib)
+        so.remarks = f"Shopee order {order_sn}. create={transaction_date}, ship_by={delivery_date}"
 
-        # SN & cancel-by timestamp
-        so.custom_shopee_order_sn = order_sn
-        cancel_ts = cint(od.get("auto_cancel_time") or 0)
-        if cancel_ts and hasattr(so, "custom_shopee_cancel_by"):
-            try:
-                so.custom_shopee_cancel_by = frappe.utils.datetime.datetime.fromtimestamp(cancel_ts)
-            except Exception:
-                pass
+        # Items
+        for it in (od.get("item_list") or []):
+            sku = (it.get("model_sku") or "").strip() or \
+                  (it.get("item_sku") or "").strip() or \
+                  f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
+            qty = _safe_int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+            rate = _safe_flt(
+                it.get("model_discounted_price")
+                or it.get("order_price")
+                or it.get("item_price")
+                or it.get("model_original_price")
+                or 0
+            )
+            if rate > 1_000_000:
+                rate /= 100000
 
-        # items
-        for it in items:
-            r = so.append("items", {})
-            r.item_code = it["item_code"]
-            r.item_name = it["item_name"]     # ≤140
-            r.qty       = it["qty"]
-            r.rate      = it["rate"]
-            r.delivery_date = delivery_date
+            item_code = _ensure_item_exists(sku, it, rate)
 
-        _insert_submit_with_retry(so, max_tries=3)   # insert + submit dengan retry aman
+            row = so.append("items", {})
+            row.item_code = item_code
+            row.item_name = (it.get("item_name") or it.get("model_name") or item_code)[:140]
+            row.qty = qty
+            row.rate = rate
+            row.delivery_date = delivery_date  # tenggat kirim
 
-        # (opsional) otomatis buat Work Order untuk yang ada BOM
-        if cint(getattr(s, "use_sales_order_flow", 0) or 0):
-            _maybe_create_work_orders(so)
+        _insert_submit_with_retry(so, max_tries=3)
+        frappe.logger().info(f"[SO] Created {so.name} for {order_sn}")
 
-        frappe.logger().info(f"Created Sales Order {so.name} for order {order_sn}")
+        # Payment Entry NANTI ambil escrow saat bikin PE (tanpa menyimpan di SO).
         return {"ok": True, "sales_order": so.name}
 
     except Exception as e:
@@ -1252,7 +1263,7 @@ def _get_item_base_info(item_id: int) -> dict:
 # ===== Helpers (ADD jika belum ada) =========================================
 from typing import Optional
 import time
-import frappe
+import frappe  # pyright: ignore[reportMissingImports]
 
 def _fit140(s: str) -> str:
     return ((s or "").strip())[:140]
