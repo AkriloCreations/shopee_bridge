@@ -519,170 +519,130 @@ def _date_from_epoch(ts):
 
 def _should_make_so(order_status: str) -> bool:
     """
-    Hanya bikin Sales Order untuk status tertentu (fase produksi/pengiriman).
-    COMPLETED/CANCELLED akan di-skip.
+    Buat SO hanya untuk status2 proses.
+    COMPLETED/CANCELLED/RETURNED dlsb -> skip.
     """
-    allowed = {"UNPAID", "READY_TO_SHIP", "PROCESSED", "INVOICE_PENDING"}
+    allowed = {"READY_TO_SHIP"}
     return (order_status or "").upper() in allowed
 
-
 # --- MAIN: buat Sales Order dari satu order_sn (phase 2) ---------------------
-
 @frappe.whitelist()
 def _process_order_to_so(order_sn: str):
-    """
-    Buat Sales Order (SO) untuk order Shopee yang masih di tahap proses.
-    - SKIP: kalau status bukan target (mis. COMPLETED/CANCELLED), atau sudah ada SO/SI.
-    - Isi tanggal dari create_time & ship_by_date/days_to_ship.
-    - Item name: "Product | Variant" (maks 140 char).
-    - Opsional: baris Ongkir + discount header agar total ≈ total_amount Shopee.
-    """
+    """Buat Sales Order untuk order yang masih dalam proses; skip COMPLETED/CANCELLED."""
     s = _settings()
 
-    # 1) Hard guard: jangan duplikat
+    # anti duplikat
     if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
-        frappe.logger().info(f"[SO] Skip {order_sn}: already has Sales Invoice")
         return {"skipped": True, "reason": "already_invoiced"}
     if frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn}):
-        frappe.logger().info(f"[SO] Skip {order_sn}: already has Sales Order")
         return {"skipped": True, "reason": "already_has_so"}
 
-    # 2) Ambil detail
+    # refresh token bila perlu (abaikan error)
     try:
-        # refresh token opsional
+        refresh_if_needed()
+    except Exception:
+        pass
+
+    # minta field yang kita perlukan
+    opt = ",".join([
+        "buyer_user_id","buyer_username",
+        "recipient_address","payment_method",
+        "item_list","total_amount","create_time",
+        "days_to_ship","ship_by_date","order_status"
+    ])
+    det = _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+        {"order_sn_list": str(order_sn), "response_optional_fields": opt}
+    )
+    if det.get("error"):
+        frappe.log_error(f"get_order_detail {order_sn}: {det.get('message')}", "Shopee Phase2")
+        return {"skipped": True, "reason": "detail_error", "message": det.get("message")}
+
+    orders = (det.get("response") or {}).get("order_list") or []
+    if not orders:
+        return {"skipped": True, "reason": "no_order_data"}
+    od = orders[0]
+
+    status = (od.get("order_status") or "").upper()
+    if not _should_make_so(status):
+        # tidak bikin SO untuk COMPLETED/CANCELLED
+        return {"skipped": True, "reason": f"status_{status.lower()}"}
+
+    # customer
+    cust = _create_or_get_customer(od)
+    customer = cust[0] if isinstance(cust, (list, tuple)) else cust
+    company  = frappe.db.get_single_value("Global Defaults", "default_company")
+
+    # tanggal
+    create_ts  = int(od.get("create_time") or 0)
+    ship_by_ts = int(od.get("ship_by_date") or 0)
+    if not ship_by_ts:
+        dts = int(od.get("days_to_ship") or 0)
+        if dts and create_ts:
+            ship_by_ts = create_ts + dts * 86400
+
+    def _d(ts, fallback_today=True):
         try:
-            refresh_if_needed()
+            return datetime.utcfromtimestamp(int(ts)).date().isoformat()
         except Exception:
-            pass
+            return nowdate() if fallback_today else None
 
-        optional = ",".join([
-            "buyer_user_id","buyer_username",
-            "recipient_address",
-            "item_list","payment_method","total_amount","pay_time",
-            "actual_shipping_fee","estimated_shipping_fee",
-            "days_to_ship","ship_by_date","create_time",
-            "order_status"
-        ])
+    transaction_date = _d(create_ts)
+    delivery_date    = _d(ship_by_ts) or transaction_date
 
-        det = _call(
-            "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-            {"order_sn_list": str(order_sn), "response_optional_fields": optional}
+    # header SO
+    so = frappe.new_doc("Sales Order")
+    so.customer = customer
+    if company:
+        so.company = company
+    so.transaction_date = transaction_date
+    so.delivery_date    = delivery_date
+    so.po_no = order_sn                      # field standar
+    so.custom_shopee_order_sn = order_sn     # field custom
+    so.remarks = f"Shopee {order_sn} | status {status}"
+
+    # items
+    items = od.get("item_list") or []
+    if not items:
+        return {"skipped": True, "reason": "no_items"}
+
+    for it in items:
+        sku = (it.get("model_sku") or "").strip() or \
+              (it.get("item_sku") or "").strip() or \
+              f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
+        qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+        rate = float(
+            it.get("model_discounted_price")
+            or it.get("order_price")
+            or it.get("item_price")
+            or it.get("model_original_price")
+            or 0
         )
-        if det.get("error"):
-            frappe.log_error(f"get_order_detail {order_sn}: {det.get('message')}", "Shopee Phase2")
-            return {"skipped": True, "reason": "detail_error", "message": det.get("message")}
+        if rate > 1_000_000:  # guard micro-unit
+            rate /= 100000.0
 
-        orders = (det.get("response") or {}).get("order_list") or []
-        if not orders:
-            frappe.log_error(f"No order data for {order_sn}", "Shopee Phase2")
-            return {"skipped": True, "reason": "no_order_data"}
+        base   = (it.get("item_name") or "").strip()
+        var    = (it.get("model_name") or "").strip()
+        iname  = (f"{base} | {var}" if var else base)[:140]
 
-        od = orders[0]
-        status = (od.get("order_status") or "").upper()
+        item_code = _ensure_item_exists(sku, it, rate)
 
-        # 3) Filter status: JANGAN bikin SO kalau sudah COMPLETED/CANCELLED dkk
-        if not _should_make_so(status):
-            frappe.logger().info(f"[SO] Skip {order_sn}: status={status}")
-            return {"skipped": True, "reason": f"status_{status.lower()}"}
+        r = so.append("items", {})
+        r.item_code = item_code
+        r.item_name = iname
+        r.qty = qty
+        r.rate = rate
+        r.delivery_date = delivery_date
 
-        # 4) Customer
-        customer = _create_or_get_customer(od)
-        company  = frappe.db.get_single_value("Global Defaults", "default_company")
-
-        # 5) Tanggal
-        create_ts   = _to_int(od.get("create_time"))
-        ship_by_ts  = _to_int(od.get("ship_by_date"))
-        if not ship_by_ts:
-            dts = _to_int(od.get("days_to_ship"))
-            if dts and create_ts:
-                ship_by_ts = create_ts + dts * 86400
-
-        transaction_date = _date_from_epoch(create_ts)
-        delivery_date    = _date_from_epoch(ship_by_ts) if ship_by_ts else transaction_date
-
-        # 6) Buat dokumen SO
-        so = frappe.new_doc("Sales Order")
-        so.customer = customer
-        if company:
-            so.company = company
-        so.transaction_date = transaction_date
-        so.delivery_date = delivery_date
-        so.po_no = order_sn                                       # gunakan field standar
-        so.custom_shopee_order_sn = order_sn                      # field custom yang kamu buat
-        so.remarks = f"Shopee {order_sn} | status {status}"
-
-        # 7) Items
-        items = od.get("item_list") or []
-        if not items:
-            frappe.log_error(f"No items for {order_sn}", "Shopee Phase2")
-            return {"skipped": True, "reason": "no_items"}
-
-        items_total = 0.0
-        for it in items:
-            sku = (it.get("model_sku") or "").strip() or \
-                  (it.get("item_sku") or "").strip() or \
-                  f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
-
-            qty = _to_int(it.get("model_quantity_purchased") or
-                          it.get("variation_quantity_purchased") or 1)
-
-            rate = _to_flt(
-                it.get("model_discounted_price")
-                or it.get("order_price")
-                or it.get("item_price")
-                or it.get("model_original_price")
-                or 0.0
-            )
-            if rate > 1_000_000:
-                rate /= 100000.0  # micro unit guard
-
-            base_name = (it.get("item_name") or "").strip()
-            variant   = (it.get("model_name") or "").strip()
-            item_name = (f"{base_name} | {variant}" if variant else base_name)[:140]
-
-            item_code = _ensure_item_exists(sku, it, rate)
-
-            row = so.append("items", {})
-            row.item_code = item_code
-            row.item_name = item_name
-            row.qty = qty
-            row.rate = rate
-            row.delivery_date = delivery_date
-
-            items_total += qty * rate
-
-        # 8) (Opsional) Tambah ongkir sebagai baris barang non-stock
-        ship_fee = _to_flt(od.get("actual_shipping_fee") or od.get("estimated_shipping_fee") or 0.0)
-        if ship_fee > 0:
-            ship_item_code = _ensure_item_exists("ONGKIR-SHOPEE", {"item_name": "Ongkir Shopee"}, ship_fee)
-            r_ship = so.append("items", {})
-            r_ship.item_code = ship_item_code
-            r_ship.item_name = "Ongkir Shopee"
-            r_ship.qty = 1
-            r_ship.rate = ship_fee
-            r_ship.delivery_date = delivery_date
-            items_total += ship_fee
-
-        # 9) (Opsional) Cocokkan ke total_amount Shopee dengan discount header
-        buyer_paid_total = _to_flt(od.get("total_amount") or 0.0)
-        if buyer_paid_total > 0:
-            reduce = items_total - buyer_paid_total
-            if reduce > 0:
-                so.apply_discount_on = "Grand Total"
-                so.discount_amount = reduce
-
-        # 10) Simpan
+    # simpan & submit (retry kalau kena lock)
+    try:
+        _insert_submit_with_retry(so, max_tries=3)
+    except Exception:
         so.insert(ignore_permissions=True)
         so.submit()
 
-        frappe.logger().info(f"[SO] Created {so.name} for {order_sn} (status={status})")
-        return {"ok": True, "sales_order": so.name, "status": status}
-
-    except Exception as e:
-        frappe.log_error(f"Failed to create SO for {order_sn}: {e}", "Shopee Phase2")
-        raise
-
+    return {"ok": True, "sales_order": so.name, "status": status}
 LOCK_ERRORS = ("Lock wait timeout exceeded", "deadlock found")
 
 def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
@@ -1776,97 +1736,177 @@ def webhook_handler():
 
 @frappe.whitelist()
 def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
-    """Sync orders by absolute date range (epoch seconds)."""
+    """Sync orders by absolute UNIX seconds window."""
     s = _settings()
     if not s.access_token:
         frappe.throw("Access token required. Please authenticate with Shopee first.")
     if not time_from or not time_to or time_from > time_to:
         frappe.throw("Invalid time range")
 
-    refresh_if_needed()
+    try:
+        refresh_if_needed()
+    except Exception:
+        pass
 
     use_so_flow = cint(getattr(s, "use_sales_order_flow", 0) or 0)
+    statuses = ["READY_TO_SHIP"]
 
-    # Status list yg discan
-    if use_so_flow:
-        # HANYA status yg memang perlu dibuat SO
-        statuses = ["UNPAID", "READY_TO_SHIP", "PROCESSED", "INVOICE_PENDING"]
-    else:
-        # Alur langsung invoice, completed tetap diproses
-        statuses = ["READY_TO_SHIP", "PROCESSED", "COMPLETED"]
-
-    seen = set()
-    processed_count, error_count = 0, 0
     highest = int(s.last_success_update_time or 0)
-    page_size = int(page_size)
+    processed = errors = 0
+    seen = set()
 
     for st in statuses:
         offset = 0
         while True:
-            try:
-                resp = _call(
-                    "/api/v2/order/get_order_list",
-                    str(s.partner_id).strip(), s.partner_key,
-                    s.shop_id, s.access_token,
-                    {
-                        "time_range_field": "update_time",
-                        "time_from": int(time_from),
-                        "time_to": int(time_to),
-                        "page_size": page_size,
-                        "order_status": st,
-                        "offset": offset,
-                    },
-                )
+            resp = _call(
+                "/api/v2/order/get_order_list",
+                str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                {
+                    "time_range_field": "update_time",
+                    "time_from": int(time_from),
+                    "time_to": int(time_to),
+                    "page_size": int(page_size),
+                    "order_status": st,
+                    "offset": offset,
+                },
+            )
+            if resp.get("error"):
+                errors += 1
+                frappe.log_error(f"sync_orders_range[{st}] {resp.get('error')}: {resp.get('message')}",
+                                 "Shopee Sync")
+                break
 
-                if resp.get("error"):
-                    frappe.log_error(f"sync_orders_range error: {resp}", "Shopee API")
-                    break
+            data   = resp.get("response") or {}
+            orders = data.get("order_list") or []
+            if not orders:
+                break
 
-                data = resp.get("response") or {}
-                orders = data.get("order_list") or []
-                if not orders:
-                    break
+            for o in orders:
+                order_sn = o.get("order_sn")
+                if not order_sn or order_sn in seen:
+                    continue
+                seen.add(order_sn)
 
-                for o in orders:
-                    order_sn = o.get("order_sn")
-                    if not order_sn or order_sn in seen:
-                        continue
-                    seen.add(order_sn)
+                if frappe.db.exists("Sales Order",  {"custom_shopee_order_sn": order_sn}) \
+                   or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
+                    continue
 
-                    # --- Routing berdasarkan flow ---
-                    if use_so_flow:
-                        # Pastikan tidak bikin SO jika sudah ada SO/SI
-                        if (not frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-                            and not frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
-                            # Guard tambahan: jangan bikin SO untuk status non-SO
-                            if _should_make_so(st):
-                                _process_order_to_so(order_sn)
-                                processed_count += 1
-                            else:
-                                # Non target (mis. COMPLETED), skip saja
-                                pass
-                    else:
-                        # Flow langsung invoice
-                        if not frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
-                            _process_order(order_sn)
-                            processed_count += 1
+                try:
+                    _process_order(order_sn)
+                    processed += 1
+                except Exception as e:
+                    errors += 1
+                    frappe.log_error(f"Process {order_sn} failed: {e}", "Shopee Sync Range")
+                    continue
 
-                    ut = int(o.get("update_time") or 0)
-                    if ut > highest:
-                        highest = ut
+                ut = int(o.get("update_time") or 0)
+                if ut > highest:
+                    highest = ut
 
-                if not data.get("has_next_page"):
-                    break
-                offset = data.get("next_offset", offset + page_size)
-
-            except Exception as e:
-                error_count += 1
-                frappe.log_error(f"sync_orders_range batch error: {e}", "Shopee Sync Range")
-                if error_count > 5:
-                    break
-                continue
+            if not data.get("has_next_page"):
+                break
+            offset = data.get("next_offset", offset + page_size)
 
     if highest > int(s.last_success_update_time or 0):
+        s.last_success_update_time = highest
+        s.save(ignore_permissions=True)
+        frappe.db.commit()
+
+    return {
+        "from": int(time_from),
+        "to": int(time_to),
+        "max_update_time": highest,
+        "processed_orders": processed,
+        "errors": errors,
+        "success": errors == 0,
+    }
+
+@frappe.whitelist()
+def sync_recent_orders(hours: int = 24):
+    """
+    Sinkron order window terakhir.
+    - Jika Use Sales Order Flow = 1 -> scan UNPAID/READY_TO_SHIP/PROCESSED/INVOICE_PENDING
+    - Jika tidak (langsung SI)       -> scan READY_TO_SHIP/PROCESSED/COMPLETED
+    """
+    s = _settings()
+    if not s.access_token:
+        frappe.throw("Access token required. Please authenticate with Shopee first.")
+
+    # refresh token (silent)
+    try:
+        refresh_if_needed()
+    except Exception:
+        pass
+
+    now_ts = int(time.time())
+    last   = int(s.last_success_update_time or 0)
+    overlap = int(getattr(s, "overlap_seconds", 600) or 600)
+    time_from = (now_ts - hours * 3600) if last == 0 else max(0, last - overlap)
+    time_to   = now_ts
+
+    use_so_flow = cint(getattr(s, "use_sales_order_flow", 0) or 0)
+    statuses = ["READY_TO_SHIP"]
+
+    page_size = 50
+    highest = last
+    processed = errors = 0
+    seen = set()
+
+    for st in statuses:
+        offset = 0
+        while True:
+            ol = _call(
+                "/api/v2/order/get_order_list",
+                str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                {
+                    "time_range_field": "update_time",
+                    "time_from": time_from,
+                    "time_to": time_to,
+                    "page_size": page_size,
+                    "order_status": st,
+                    "offset": offset,
+                },
+            )
+            if ol.get("error"):
+                errors += 1
+                frappe.log_error(f"get_order_list[{st}] {ol.get('error')}: {ol.get('message')}",
+                                 "Shopee Sync")
+                break
+
+            resp   = ol.get("response") or {}
+            orders = resp.get("order_list") or []
+            if not orders:
+                break
+
+            for o in orders:
+                order_sn = o.get("order_sn")
+                if not order_sn or order_sn in seen:
+                    continue
+                seen.add(order_sn)
+
+                # jangan proses ulang kalau sudah ada
+                if frappe.db.exists("Sales Order",  {"custom_shopee_order_sn": order_sn}) \
+                   or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
+                    continue
+
+                try:
+                    # router: _process_order akan pilih SO/SI sesuai setting
+                    _process_order(order_sn)
+                    processed += 1
+                except Exception as e:
+                    errors += 1
+                    frappe.log_error(f"Process {order_sn} failed: {e}", "Shopee Sync")
+                    continue
+
+                ut = int(o.get("update_time") or 0)
+                if ut > highest:
+                    highest = ut
+
+            if not resp.get("has_next_page"):
+                break
+            offset = resp.get("next_offset", offset + page_size)
+
+    if highest > (s.last_success_update_time or 0):
         s.last_success_update_time = highest
         s.save(ignore_permissions=True)
         frappe.db.commit()
@@ -1875,172 +1915,10 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
         "from": time_from,
         "to": time_to,
         "max_update_time": highest,
-        "processed_orders": processed_count,
-        "errors": error_count,
-        "success": error_count < processed_count or processed_count == 0,
+        "processed_orders": processed,
+        "errors": errors,
+        "success": errors == 0,
     }
-
-
-@frappe.whitelist()
-def sync_recent_orders(hours: int = 24):
-    """Sync by last N hours with token refresh & retry, SO-aware."""
-    s = _settings()
-    if not s.access_token:
-        frappe.throw("Access token required. Please authenticate with Shopee first.")
-
-    refresh_result = refresh_if_needed()
-    frappe.logger().info(f"Token refresh status: {refresh_result.get('status')}")
-
-    now_ts = int(time.time())
-    last = int(s.last_success_update_time or 0)
-    overlap = int(getattr(s, "overlap_seconds", 600) or 600)
-    time_from = (now_ts - hours * 3600) if last == 0 else max(0, last - overlap)
-    time_to = now_ts
-
-    page_size = 50
-    highest = last
-    processed_count = 0
-    error_count = 0
-    retry_attempts = 0
-    max_retries = 3
-
-    use_so_flow = cint(getattr(s, "use_sales_order_flow", 0) or 0)
-
-    # Status yg dipindai
-    if use_so_flow:
-        statuses = ["UNPAID", "READY_TO_SHIP", "PROCESSED", "INVOICE_PENDING"]
-    else:
-        statuses = ["READY_TO_SHIP", "PROCESSED", "COMPLETED"]
-
-    seen = set()
-
-    frappe.logger().info(f"Starting order sync: from {time_from} to {time_to} (use_so_flow={use_so_flow})")
-
-    try:
-        for st in statuses:
-            offset = 0
-            while True:
-                try:
-                    if processed_count > 0 or retry_attempts > 0:
-                        time.sleep(0.5 + retry_attempts * 0.5)
-
-                    ol = _call(
-                        "/api/v2/order/get_order_list",
-                        str(s.partner_id).strip(), s.partner_key,
-                        s.shop_id, s.access_token,
-                        {
-                            "time_range_field": "update_time",
-                            "time_from": time_from,
-                            "time_to": time_to,
-                            "page_size": page_size,
-                            "order_status": st,
-                            "offset": offset
-                        }
-                    )
-
-                    if ol.get("error"):
-                        msg_lc = (ol.get("message") or "").lower()
-
-                        if ("access token expired" in msg_lc or "invalid access token" in msg_lc) and retry_attempts < max_retries:
-                            frappe.logger().info(f"Token issue, refreshing (attempt {retry_attempts+1})")
-                            r = refresh_if_needed()
-                            if r.get("status") == "refreshed":
-                                retry_attempts += 1
-                                continue
-
-                        if ("rate limit" in msg_lc or "too many requests" in msg_lc) and retry_attempts < max_retries:
-                            wait_time = 5 + retry_attempts * 2
-                            frappe.logger().info(f"Rate limited, waiting {wait_time}s…")
-                            time.sleep(wait_time)
-                            retry_attempts += 1
-                            continue
-
-                        error_full = f"Failed to get orders: {ol.get('error')} - {ol.get('message')}"
-                        frappe.log_error(error_full, "Shopee API Error")
-                        error_count += 1
-                        if error_count > 3:
-                            frappe.throw(error_full)
-                        break
-
-                    resp = ol.get("response") or {}
-                    orders = resp.get("order_list", []) or []
-
-                    if not orders:
-                        frappe.logger().info(f"No orders for status {st}, moving on")
-                        break
-
-                    batch_processed = 0
-                    for o in orders:
-                        try:
-                            order_sn = o.get("order_sn")
-                            if not order_sn:
-                                continue
-                            if order_sn in seen:
-                                continue
-                            seen.add(order_sn)
-
-                            if use_so_flow:
-                                # Jangan duplikat SO/SI
-                                if (not frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-                                    and not frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
-                                    if _should_make_so(st):
-                                        _process_order_to_so(order_sn)
-                                        batch_processed += 1
-                                    else:
-                                        # COMPLETED/CANCELLED etc → skip
-                                        pass
-                            else:
-                                if not frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
-                                    _process_order(order_sn)
-                                    batch_processed += 1
-
-                            ut = int(o.get("update_time") or 0)
-                            if ut > highest:
-                                highest = ut
-                        except Exception as order_error:
-                            error_count += 1
-                            frappe.log_error(
-                                f"Failed to process order {o.get('order_sn')}: {str(order_error)}",
-                                "Shopee Order Processing"
-                            )
-                            continue
-
-                    processed_count += batch_processed
-                    frappe.logger().info(f"[{st}] processed {batch_processed} this page, total {processed_count}")
-
-                    if not resp.get("has_next_page"):
-                        break
-                    offset = resp.get("next_offset", offset + page_size)
-                    retry_attempts = 0
-
-                except Exception as e:
-                    error_count += 1
-                    frappe.log_error(f"Error processing batch [{st}]: {str(e)}", "Shopee Sync Error")
-                    if error_count > 5:
-                        frappe.logger().error("Too many errors, stopping sync")
-                        break
-                    continue
-
-        if highest > (s.last_success_update_time or 0):
-            s.last_success_update_time = highest
-            s.save(ignore_permissions=True)
-            frappe.db.commit()
-            frappe.logger().info(f"Updated last success time to: {highest}")
-
-        result = {
-            "from": time_from,
-            "to": time_to,
-            "max_update_time": highest,
-            "processed_orders": processed_count,
-            "errors": error_count,
-            "success": error_count < processed_count or processed_count == 0
-        }
-        frappe.logger().info(f"Sync completed: {result}")
-        return result
-
-    except Exception as e:
-        frappe.log_error(f"Sync failed: {str(e)}", "Shopee Sync Critical Error")
-        raise
 
 @frappe.whitelist()
 def diagnose_order(order_sn: str, hours: int = 72):
