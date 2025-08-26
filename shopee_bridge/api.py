@@ -157,6 +157,14 @@ def refresh_if_needed():
     
     return {"status": "no_new_token"}
 
+def _default_item_group() -> str:
+    # Ambil dari Stock Settings kalau ada; kalau tidak, pakai Shopee Products (dibuat otomatis oleh _get_item_group)
+    return (
+        frappe.db.get_single_value("Stock Settings", "default_item_group")
+        or _get_item_group()  # akan membuat "Shopee Products" jika belum ada
+        or "All Item Groups"
+    )
+
 @frappe.whitelist()
 def sync_recent_orders(hours: int = 24):
     """Enhanced version with better error handling and retry logic (multi-status safe)."""
@@ -363,9 +371,7 @@ def _ensure_item_exists(sku: str, sh_it: dict, default_rate: float) -> str:
     item = frappe.new_doc("Item")
     item.item_code = code[:140]
     item.item_name = (sh_it.get("item_name") or sh_it.get("model_name") or code)[:140]
-    item.item_group = frappe.db.get_single_value("Item Default", "default_item_group") \
-                    or frappe.db.get_single_value("Stock Settings", "default_item_group") \
-                    or "Products"
+    item.item_group = _default_item_group()
     item.is_stock_item = 1
 
     # optional harga awal
@@ -554,6 +560,7 @@ def _maybe_create_work_orders(so):
             # kalau mau langsung submit: wo.submit()
     except Exception as e:
         frappe.log_error(f"Auto WO failed for {so.name}: {e}", "Shopee Phase2 WO")
+
 def _safe_int(v, d=0):
     try:
         return int(v) if v not in (None, "") else d
@@ -2111,3 +2118,126 @@ def fix_item_names_from_shopee(update: int = 0, limit_pages: int = 999):
         offset = resp.get("next_offset", offset + page_size); pages += 1
     if int(update): frappe.db.commit()
     return {"updated": updated, "sample": preview[:50], "total_candidates": len(preview)}
+
+@frappe.whitelist()
+def debug_get_order_detail(order_sn: str):
+    """Return payload mentah get_order_detail untuk 1 SN."""
+    s = _settings()
+    return _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+        {
+            "order_sn_list": str(order_sn),  # HARUS string, bukan array
+            "response_optional_fields": "item_list,recipient_address,buyer_info"
+        }
+    )
+
+@frappe.whitelist()
+def diagnose_order(order_sn: str, hours: int = 72):
+    """Diagnosa cepat: detail, escrow, dan apakah order muncul di get_order_list dalam window waktu."""
+    import time, json
+    now = int(time.time())
+    s = _settings()
+
+    # detail
+    detail = _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+        {"order_sn_list": str(order_sn), "response_optional_fields": "item_list,recipient_address,buyer_info"}
+    )
+
+    # escrow
+    escrow = _call(
+        "/api/v2/payment/get_escrow_detail",
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+        {"order_sn": str(order_sn)}
+    )
+
+    # visibility di list
+    ol = _call(
+        "/api/v2/order/get_order_list",
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+        {
+            "time_range_field": "update_time",
+            "time_from": now - int(hours) * 3600,
+            "time_to": now,
+            "page_size": 50,
+            "offset": 0
+        }
+    )
+
+    visible_in_list = False
+    status_hits = []
+    if isinstance(ol, dict) and not ol.get("error"):
+        for o in (ol.get("response") or {}).get("order_list", []) or []:
+            if o.get("order_sn") == order_sn:
+                visible_in_list = True
+                status_hits.append(o.get("order_status"))
+
+    # ringkas detail
+    summary = {}
+    if isinstance(detail, dict) and not detail.get("error"):
+        lst = (detail.get("response") or {}).get("order_list", []) or []
+        if lst:
+            od = lst[0]
+            def _safe_int(v): 
+                try: return int(v or 0)
+                except: return 0
+            ct  = _safe_int(od.get("create_time"))
+            sbd = _safe_int(od.get("ship_by_date"))
+            dts = _safe_int(od.get("days_to_ship"))
+            if not sbd and ct and dts:
+                sbd = ct + dts * 86400
+
+            def _hum(ts):
+                try:
+                    return frappe.utils.format_datetime(frappe.utils.convert_utc_to_user_datetime(ts))
+                except: 
+                    return None
+
+            items = []
+            for it in (od.get("item_list") or []):
+                items.append({
+                    "item_id": it.get("item_id"),
+                    "model_id": it.get("model_id"),
+                    "item_name": it.get("item_name"),
+                    "model_name": it.get("model_name"),
+                    "qty": it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"),
+                    "price": it.get("model_discounted_price") or it.get("order_price") or it.get("item_price")
+                })
+
+            summary = {
+                "order_sn": od.get("order_sn"),
+                "status": od.get("order_status"),
+                "create_time": ct, "create_time_human": _hum(ct),
+                "ship_by": sbd,    "ship_by_human": _hum(sbd),
+                "buyer_username": od.get("buyer_username"),
+                "recipient_name": (od.get("recipient_address") or {}).get("name"),
+                "items": items
+            }
+
+    esc_summary = {}
+    if isinstance(escrow, dict) and not escrow.get("error"):
+        er = (escrow.get("response") or {}) or {}
+        def _f(x):
+            try: return float(x or 0)
+            except: return 0.0
+        esc_summary = {
+            "net": _f(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
+            "commission": _f(er.get("seller_commission_fee") or er.get("commission_fee")),
+            "service": _f(er.get("seller_service_fee") or er.get("service_fee")),
+            "protection": _f(er.get("shipping_seller_protection_fee_amount")),
+            "shipdiff": _f(er.get("shipping_fee_difference")),
+            "voucher": _f(er.get("voucher_seller")) + _f(er.get("coin_cash_back")) + _f(er.get("voucher_code_seller")),
+        }
+
+    return {
+        "ok": bool(summary),
+        "order_sn": order_sn,
+        "visible_in_list": visible_in_list,
+        "visible_status_hits": status_hits,
+        "detail_error": detail if detail.get("error") else None,
+        "escrow_error": escrow if escrow.get("error") else None,
+        "detail": summary if summary else None,
+        "escrow": esc_summary if esc_summary else None,
+    }
