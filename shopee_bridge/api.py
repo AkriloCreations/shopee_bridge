@@ -1,18 +1,15 @@
 import time, hmac, hashlib, requests, frappe, re  # pyright: ignore[reportMissingImports]
-from frappe.utils import get_url, nowdate, cint, add_days, now, convert_utc_to_user_timezone, format_datetime # pyright: ignore[reportMissingImports]
+from frappe.utils import get_url, nowdate, cint, add_days, now, format_datetime, get_time_zone, formatdate # pyright: ignore[reportMissingImports]
 from datetime import datetime, timedelta, timezone
 import json
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
 def _settings():
     return frappe.get_single("Shopee Settings")
-
-def _hum_epoch(ts: int | None):
-    """Epoch detik -> string waktu sesuai timezone user, atau None."""
-    if not ts:
-        return None
-    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-    dt_user = convert_utc_to_user_timezone(dt_utc)
-    return format_datetime(dt_user)
 
 def _base():
     """Host Shopee sesuai Environment di Shopee Settings."""
@@ -21,6 +18,24 @@ def _base():
     if env == "Production":
         return "https://partner.shopeemobile.com"
     return "https://partner.test-stable.shopeemobile.com"
+
+def _to_user_dt(ts: int | None):
+    """Epoch detik → datetime aware di timezone user."""
+    if not ts:
+        return None
+    tz = get_time_zone() or "UTC"
+    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    return dt_utc.astimezone(ZoneInfo(tz)) if ZoneInfo else dt_utc  # fallback: UTC
+
+def _hum_epoch(ts: int | None):
+    """Epoch detik → string tanggal+jam sesuai TZ user."""
+    dt = _to_user_dt(ts)
+    return format_datetime(dt) if dt else None
+
+def _hum_date(ts: int | None):
+    """Epoch detik → string tanggal (YYYY-MM-DD) sesuai TZ user."""
+    dt = _to_user_dt(ts)
+    return formatdate(dt.date()) if dt else None
 
 def _sign(key: str, s: str) -> str:
     return hmac.new((key or "").strip().encode(), s.encode(), hashlib.sha256).hexdigest()
@@ -584,7 +599,7 @@ def _safe_flt(v, d=0.0):
 def _ts_to_date(ts):
     if not ts:
         return None
-    return frappe.utils.formatdate(frappe.utils.convert_utc_to_user_datetime(ts).date())
+    return _hum_date(ts)
 
 def _compose_customer_name(od):
     uname = (od.get("buyer_username") or "").strip()
@@ -2239,7 +2254,7 @@ def diagnose_order(order_sn: str, hours: int = 72):
 
             def _hum(ts):
                 try:
-                    return frappe.utils.format_datetime(frappe.utils.convert_utc_to_user_datetime(ts))
+                    return _hum_epoch(ts)
                 except: 
                     return None
 
