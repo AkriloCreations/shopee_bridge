@@ -2503,7 +2503,7 @@ def diagnose_order(order_sn: str, hours: int = 72):
     }
 
 @frappe.whitelist()
-def force_cancel_shopee_orders(batch_size=20):
+def force_cancel_shopee_orders(batch_size=250):
     """Force cancel Shopee orders without using bulk operations."""
     orders = frappe.get_all("Sales Order", 
         filters={
