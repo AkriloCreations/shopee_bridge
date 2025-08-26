@@ -1107,12 +1107,39 @@ def exchange_code(code: str, shop_id: str | None = None):
     }
 
 def _cfg_defaults():
-    """Get configuration defaults from settings."""
-    s = _settings()
+    """Ambil default yg aman lintas versi ERPNext."""
+    # Item Group: coba Selling Settings dulu, fallback ke 'Products'
+    item_group = (
+        frappe.db.get_single_value("Selling Settings", "default_item_group")
+        or frappe.db.exists("Item Group", "Products") and "Products"
+        or frappe.db.get_value("Item Group", {"is_group": 0}, "name")  # ambil satu leaf kalau ada
+        or "Products"
+    )
+
+    # Stock UOM: coba Stock Settings, fallback ke 'Nos'
+    stock_uom = (
+        frappe.db.get_single_value("Stock Settings", "stock_uom")
+        or frappe.db.get_value("UOM", {"name": "Nos"}, "name")
+        or "Nos"
+    )
+
+    # Price List: coba Selling Settings, fallback ke Standard Selling / selling enabled pertama
+    price_list = (
+        frappe.db.get_single_value("Selling Settings", "selling_price_list")
+        or (frappe.db.exists("Price List", "Standard Selling") and "Standard Selling")
+        or frappe.db.get_value("Price List", {"selling": 1, "enabled": 1}, "name")
+    )
+
+    # Warehouse & Company (opsional)
+    default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+
     return {
-        "price_list": getattr(s, "price_list", None) or "Standard Selling",
-        "item_group": getattr(s, "item_group", None) or "Products",
-        "stock_uom": getattr(s, "stock_uom", None) or "Nos",
+        "item_group": item_group,
+        "stock_uom": stock_uom,
+        "price_list": price_list,
+        "default_warehouse": default_wh,
+        "company": company,
     }
 
 def _get_or_create_price_list(pl_name: str):
