@@ -304,75 +304,84 @@ def sync_recent_orders(hours: int = 24):
     except Exception as e:
         frappe.log_error(f"Sync failed: {str(e)}", "Shopee Sync Critical Error")
         raise
-
-
-def _ensure_item_exists(sku: str, item_data: dict, rate: float) -> str:
+    
+@frappe.whitelist()
+def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
     """
-    Enhanced item creation with better error handling.
-    Ensure item exists in ERPNext, create if not found.
-    Returns the item_code to use.
+    Temukan item yang tampak pakai ID (angka panjang) tapi punya custom_model_sku,
+    lalu rename ke SKU. dry_run=1 hanya preview.
     """
-    # Sanitize SKU to ensure it's valid
-    if not sku or not sku.strip():
-        sku = f"SHP-UNKNOWN-{item_data.get('item_id', 'NOITEM')}-{int(time.time())}"
-    
-    sku = sku.strip()[:140]  # ERPNext item_code limit
-    
-    # Check if item already exists
-    if frappe.db.exists("Item", sku):
-        return sku
-    
-    # Extract item info from Shopee data
-    item_name = item_data.get("item_name") or \
-                item_data.get("model_name") or \
-                item_data.get("variation_name") or \
-                f"Shopee Item {sku}"
-    
-    # Create new Item
+    rows = frappe.db.get_all(
+        "Item",
+        fields=["name", "item_code", "custom_model_sku", "custom_shopee_item_id", "custom_shopee_model_id"],
+        limit=limit
+    )
+    changed = []
+    for r in rows:
+        code = r.item_code or ""
+        sku = (r.custom_model_sku or "").strip()
+        # heuristik: item_code cuma angka panjang dan tersedia SKU
+        if sku and code.isdigit() and len(code) >= 8 and sku != code:
+            changed.append({"from": r.name, "to": sku})
+            if not dry_run:
+                try:
+                    frappe.rename_doc("Item", r.name, sku, merge=False, force=True)
+                    frappe.db.commit()
+                except Exception as e:
+                    frappe.log_error(f"Rename {r.name} -> {sku} failed: {e}", "Fix Item Codes")
+
+    return {"preview": dry_run == 1, "changes": changed}
+
+def _ensure_item_exists(sku: str, sh_it: dict, default_rate: float) -> str:
+    """
+    Pastikan item ada.
+    - Item Code = SKU (bukan Shopee item_id)
+    - Simpan mapping Shopee di custom fields:
+      custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
+    - Jika sudah ada item (by SKU atau by custom fields), pakai itu.
+    """
+    code = (sku or "").strip()
+    if not code:
+        # fallback minimal
+        code = f"SHP-{sh_it.get('item_id')}-{sh_it.get('model_id', '0')}"
+
+    # 1) Cek by Item Code (SKU)
+    if frappe.db.exists("Item", code):
+        return code
+
+    # 2) Cek by custom fields (kalau sebelumnya pernah buat dengan code lain)
+    filt = {
+        "custom_shopee_item_id": str(sh_it.get("item_id") or ""),
+        "custom_shopee_model_id": str(sh_it.get("model_id") or "0"),
+    }
+    if filt["custom_shopee_item_id"]:
+        existing = frappe.db.get_value("Item", filt, "name")
+        if existing:
+            return existing
+
+    # 3) Buat baru dengan Item Code = SKU
+    item = frappe.new_doc("Item")
+    item.item_code = code[:140]
+    item.item_name = (sh_it.get("item_name") or sh_it.get("model_name") or code)[:140]
+    item.item_group = frappe.db.get_single_value("Item Default", "default_item_group") \
+                    or frappe.db.get_single_value("Stock Settings", "default_item_group") \
+                    or "Products"
+    item.is_stock_item = 1
+
+    # optional harga awal
     try:
-        item = frappe.new_doc("Item")
-        item.item_code = sku
-        item.item_name = item_name[:140]  # ERPNext limit
-        item.item_group = _get_item_group()
-        item.stock_uom = "Nos"  # Default UOM
-        item.is_stock_item = 1
-        item.include_item_in_manufacturing = 0
-        item.is_sales_item = 1
-        item.is_purchase_item = 1
-        item.maintain_stock = 1
-        item.valuation_rate = rate
-        item.standard_rate = rate
-        
-        # Shopee specific fields (if custom fields exist)
-        if hasattr(item, 'shopee_item_id'):
-            item.shopee_item_id = item_data.get("item_id")
-        if hasattr(item, 'shopee_model_id'):
-            item.shopee_model_id = item_data.get("model_id")
-        if hasattr(item, 'shopee_sku'):
-            item.shopee_sku = item_data.get("model_sku") or item_data.get("item_sku")
-        
-        # Description with Shopee info
-        description_parts = []
-        if item_data.get("item_name"):
-            description_parts.append(f"Item: {item_data.get('item_name')}")
-        if item_data.get("model_name"):
-            description_parts.append(f"Variant: {item_data.get('model_name')}")
-        if item_data.get("item_id"):
-            description_parts.append(f"Shopee ID: {item_data.get('item_id')}")
-        if item_data.get("model_id"):
-            description_parts.append(f"Model ID: {item_data.get('model_id')}")
-            
-        item.description = " | ".join(description_parts)[:500]  # ERPNext limit
-        
-        item.insert(ignore_permissions=True)
-        
-        frappe.logger().info(f"Auto-created item: {sku} - {item_name}")
-        return sku
-        
-    except Exception as e:
-        # If item creation fails, log error and return fallback
-        frappe.log_error(f"Failed to create item {sku}: {str(e)}", "Shopee Item Creation")
-        return _create_fallback_item(sku, item_name, rate)
+        item.standard_rate = float(default_rate or 0)
+    except Exception:
+        pass
+
+    # simpan identitas Shopee
+    item.custom_model_sku = (sh_it.get("model_sku") or sh_it.get("item_sku") or "")[:140]
+    item.custom_shopee_item_id = str(sh_it.get("item_id") or "")
+    item.custom_shopee_model_id = str(sh_it.get("model_id") or "0")
+
+    item.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return item.name
 
 def _get_item_group():
     """Get or create Shopee item group."""
@@ -510,7 +519,7 @@ def _short_log(message: str, title: str = "Shopee"):
     t = (title or "Shopee")[:140]
     m = (message or "")[:4000]
     frappe.log_error(m, t)
-    
+
 def _process_order_to_so(order_sn: str):
     """Phase 2: buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
     s = _settings()
@@ -614,8 +623,8 @@ def _process_order_to_so(order_sn: str):
             # penting: row-level delivery date juga harus diisi
             r.delivery_date = delivery_date
 
-        so.insert(ignore_permissions=True)
-        so.submit()
+        _insert_submit_with_retry(so, max_tries=3)
+
 
         frappe.logger().info(f"Created Sales Order {so.name} for order {order_sn}")
         return {"ok": True, "sales_order": so.name}
@@ -624,6 +633,31 @@ def _process_order_to_so(order_sn: str):
         _short_log(f"Failed to create SO for {order_sn}: {e}", "Shopee Phase2")
         raise
 
+def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
+    """
+    Insert + submit dengan retry saat kena lock/deadlock.
+    Gunakan utk SO/DN/SI.
+    """
+    last_err = None
+    for i in range(max_tries):
+        try:
+            doc.insert(ignore_permissions=True)
+            # commit kecil setelah insert agar kunci cepat lepas
+            frappe.db.commit()
+            doc.submit()
+            frappe.db.commit()
+            return doc
+        except Exception as e:
+            msg = str(e)
+            last_err = e
+            if any(k.lower() in msg.lower() for k in LOCK_ERRORS):
+                frappe.db.rollback()
+                time.sleep(sleep_base * (i + 1))  # backoff
+                continue
+            # error lain: lempar
+            raise
+    # kalau mentok retry, lempar error terakhir
+    raise last_err
 
 def _process_order_to_si(order_sn: str):
     """Jalur lama: langsung buat Sales Invoice. Ada fallback jika stok kurang."""
