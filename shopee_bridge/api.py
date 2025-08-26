@@ -8,6 +8,9 @@ try:
 except Exception:
     ZoneInfo = None
 
+# 1. Pindahkan LOCK_ERRORS ke bagian atas setelah import
+LOCK_ERRORS = ("Lock wait timeout exceeded", "deadlock found")
+
 def _settings():
     return frappe.get_single("Shopee Settings")
 
@@ -20,12 +23,14 @@ def _base():
     return "https://partner.test-stable.shopeemobile.com"
 
 def _safe_int(v, d=0):
+    """Convert value to int with fallback default."""
     try:
         return int(v) if v not in (None, "") else d
     except Exception:
         return d
 
 def _safe_flt(v, d=0.0):
+    """Convert value to float with fallback default."""
     try:
         return float(v) if v not in (None, "") else d
     except Exception:
@@ -37,23 +42,31 @@ def _date_iso_from_epoch(ts: int | None) -> str:
         return frappe.utils.nowdate()
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
 
-def _insert_submit_with_retry(doc, max_tries=3):
-    """Hindari deadlock/lock wait saat insert/submit dokumen."""
-    tries = 0
-    while True:
-        tries += 1
+def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
+    """
+    Insert + submit dengan retry saat kena lock/deadlock.
+    Gunakan utk SO/DN/SI.
+    """
+    last_err = None
+    for i in range(max_tries):
         try:
             doc.insert(ignore_permissions=True)
+            # commit kecil setelah insert agar kunci cepat lepas
+            frappe.db.commit()
             doc.submit()
-            return
+            frappe.db.commit()
+            return doc
         except Exception as e:
             msg = str(e)
-            if tries < max_tries and ("Lock wait timeout" in msg or "Deadlock" in msg):
+            last_err = e
+            if any(k.lower() in msg.lower() for k in LOCK_ERRORS):
                 frappe.db.rollback()
-                frappe.logger().warning(f"Retry {tries}/{max_tries} insert/submit {doc.doctype}: {msg}")
-                time.sleep(1.2 * tries)
+                time.sleep(sleep_base * (i + 1))  # backoff
                 continue
+            # error lain: lempar
             raise
+    # kalau mentok retry, lempar error terakhir
+    raise last_err
 
 def _to_system_dt(ts: int | None):
     """Epoch detik -> datetime aware di system timezone (Frappe v15)."""
@@ -519,18 +532,6 @@ def _maybe_create_work_orders(so):
     except Exception as e:
         frappe.log_error(f"Auto WO failed for {so.name}: {e}", "Shopee Phase2 WO")
 
-def _safe_int(v, d=0):
-    try:
-        return int(v) if v not in (None, "") else d
-    except Exception:
-        return d
-
-def _safe_flt(v, d=0.0):
-    try:
-        return float(v) if v not in (None, "") else d
-    except Exception:
-        return d
-
 def _ts_to_date(ts):
     if not ts:
         return None
@@ -685,34 +686,6 @@ def _process_order_to_so(order_sn: str):
         )
         return {"status": "error", "message": str(e)}
            
-LOCK_ERRORS = ("Lock wait timeout exceeded", "deadlock found")
-
-def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
-    """
-    Insert + submit dengan retry saat kena lock/deadlock.
-    Gunakan utk SO/DN/SI.
-    """
-    last_err = None
-    for i in range(max_tries):
-        try:
-            doc.insert(ignore_permissions=True)
-            # commit kecil setelah insert agar kunci cepat lepas
-            frappe.db.commit()
-            doc.submit()
-            frappe.db.commit()
-            return doc
-        except Exception as e:
-            msg = str(e)
-            last_err = e
-            if any(k.lower() in msg.lower() for k in LOCK_ERRORS):
-                frappe.db.rollback()
-                time.sleep(sleep_base * (i + 1))  # backoff
-                continue
-            # error lain: lempar
-            raise
-    # kalau mentok retry, lempar error terakhir
-    raise last_err
-
 def _process_order_to_si(order_sn: str):
     """Jalur lama: langsung buat Sales Invoice. Ada fallback jika stok kurang."""
     s = _settings()
@@ -1230,6 +1203,11 @@ def _upsert_item(item_code: str,
                  meta: dict = None) -> str:
     """
     Buat/update Item master dengan fallback yang aman untuk semua field.
+    - item_code & item_name dipotong 140
+    - full name taruh di description (jika ada)
+    - mapping shopee ke custom fields:
+      custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
+    Return: item.name yang dipakai
     """
     meta = meta or {}
     code140 = _fit140(item_code)
@@ -1291,6 +1269,8 @@ def _upsert_item(item_code: str,
     item.item_group = item_group
     item.stock_uom = stock_uom
     item.is_stock_item = 1
+    item.is_sales_item = 1
+    item.maintain_stock = 1
     
     if meta.get("description"):
         item.description = meta["description"]
@@ -1382,20 +1362,19 @@ import time
 import frappe  # pyright: ignore[reportMissingImports]
 
 def _fit140(s: str) -> str:
+    """Truncate string to 140 characters."""
     return ((s or "").strip())[:140]
 
-def _compose_item_name(base_name: str, model_name: Optional[str]) -> str:
+def _compose_item_name(base_name: str, model_name: str = None) -> str:
+    """Compose item name from base and model names."""
     base = (base_name or "").strip()
-    mdl  = (model_name or "").strip()
+    mdl = (model_name or "").strip()
     if base and mdl:
         return f"{base} - {mdl}"
-    if base:
-        return base
-    if mdl:
-        return mdl
-    return ""
+    return base or mdl or ""
 
 def _normalize_rate(x) -> float:
+    """Normalize rate value, handling micro units."""
     try:
         v = float(x or 0)
         # Shopee kadang kirim micro units untuk sebagian region
@@ -1404,65 +1383,6 @@ def _normalize_rate(x) -> float:
         return v
     except Exception:
         return 0.0
-
-def _upsert_item(item_code: str,
-                 item_name: str,
-                 item_group: str,
-                 stock_uom: str,
-                 standard_rate: float = 0.0,
-                 meta: Optional[dict] = None) -> str:
-    """
-    Buat/update Item master:
-      - item_code & item_name dipotong 140
-      - full name taruh di description (jika ada)
-      - mapping shopee ke custom fields:
-        custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
-    Return: item.name yang dipakai
-    """
-    meta = meta or {}
-    code140 = _fit140(item_code)
-    name140 = _fit140(item_name)
-
-    if frappe.db.exists("Item", code140):
-        item = frappe.get_doc("Item", code140)
-        if name140 and item.item_name != name140:
-            item.item_name = name140
-        if meta.get("description"):
-            item.description = meta["description"]
-        if "custom_model_sku" in meta:
-            item.custom_model_sku = _fit140(meta.get("custom_model_sku") or "")
-        if "custom_shopee_item_id" in meta:
-            item.custom_shopee_item_id = str(meta.get("custom_shopee_item_id") or "")
-        if "custom_shopee_model_id" in meta:
-            item.custom_shopee_model_id = str(meta.get("custom_shopee_model_id") or "")
-        try:
-            if standard_rate and float(standard_rate) > 0:
-                item.standard_rate = float(standard_rate)
-        except Exception:
-            pass
-        item.save(ignore_permissions=True)
-        frappe.db.commit()
-        return item.name
-
-    item = frappe.new_doc("Item")
-    item.item_code = code140
-    item.item_name = name140
-    item.item_group = item_group or "Products"
-    item.stock_uom = stock_uom or "Nos"
-    item.is_stock_item = 1
-    if meta.get("description"):
-        item.description = meta["description"]
-    item.custom_model_sku = _fit140(meta.get("custom_model_sku", "")) if meta else ""
-    item.custom_shopee_item_id = str(meta.get("custom_shopee_item_id", "")) if meta else ""
-    item.custom_shopee_model_id = str(meta.get("custom_shopee_model_id", "")) if meta else ""
-    try:
-        if standard_rate and float(standard_rate) > 0:
-            item.standard_rate = float(standard_rate)
-    except Exception:
-        pass
-    item.insert(ignore_permissions=True)
-    frappe.db.commit()
-    return item.name
 
 def _upsert_price(item_code: str, price_list: str, currency: str, rate: float):
     """Buat/update Item Price pada price_list tertentu."""
@@ -1499,25 +1419,6 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
     - Mapping custom fields: custom_model_sku, custom_shopee_item_id, custom_shopee_model_id
     """
     import time
-
-    # ---- util lokal (hindari dependensi) ----
-    def _fit140_local(s: str) -> str:
-        return ((s or "").strip())[:140]
-
-    def _compose_local(base_name: str, model_name: str) -> str:
-        b = (base_name or "").strip()
-        m = (model_name or "").strip()
-        if b and m: return f"{b} - {m}"
-        return b or m or ""
-
-    def _norm_rate(x) -> float:
-        try:
-            v = float(x or 0)
-            if v > 1_000_000:  # sebagian region pakai micro units
-                v = v / 100000
-            return v
-        except Exception:
-            return 0.0
 
     s = _settings()
     defaults = _cfg_defaults()
@@ -1623,11 +1524,11 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
                     if not models:
                         sku = base_sku if base_sku else f"SHP-{item_id}"
                         full_name = base_name or ""
-                        name_140 = _fit140_local(full_name or base_name or "")
+                        name_140 = _fit140(full_name or base_name or "")
                         if not name_140:
-                            name_140 = _fit140_local(sku)
+                            name_140 = _fit140(sku)
 
-                        rate = _norm_rate(
+                        rate = _normalize_rate(
                             (lst[0].get("normal_price") if (isinstance(base_info, dict) and not base_info.get("error") and lst) else None)
                         )
 
@@ -1655,9 +1556,9 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
                             sku       = model_sku if model_sku else f"SHP-{item_id}-{model_id}"
 
                             model_name = (m.get("model_name") or "").strip()
-                            full_name  = _compose_local(base_name, model_name)
-                            name_140   = _fit140_local(full_name if full_name else sku)
-                            rate       = _norm_rate(m.get("price") or m.get("original_price"))
+                            full_name  = _compose_item_name(base_name, model_name)
+                            name_140   = _fit140(full_name if full_name else sku)
+                            rate       = _normalize_rate(m.get("price") or m.get("original_price"))
 
                             existed = bool(frappe.db.exists("Item", {"item_code": sku}))
                             used_code = _upsert_item(
