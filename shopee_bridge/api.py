@@ -1939,147 +1939,108 @@ def sync_recent_orders(hours: int = 24):
 
 @frappe.whitelist()
 def diagnose_order(order_sn: str, hours: int = 72):
-    """Diagnosa cepat: detail, escrow, dan cek kemunculan order di get_order_list."""
+    """Diagnosa cepat: detail, escrow, dan apakah order muncul di get_order_list dalam window waktu."""
     import time, json
-
+    now = int(time.time())
     s = _settings()
-    pid  = str(s.partner_id).strip()
-    pkey = s.partner_key
-    sid  = s.shop_id
-    atok = s.access_token
-    now_ts = int(time.time())
 
-    # init supaya aman dipakai di fallback
-    ct  = 0   # create_time
-    sbd = 0   # ship_by_date
-
-    # --- DETAIL ---
+    # detail
     detail = _call(
         "/api/v2/order/get_order_detail",
-        pid, pkey, sid, atok,
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
         {"order_sn_list": str(order_sn), "response_optional_fields": "item_list,recipient_address,buyer_info"}
     )
 
-    detail_error = None
-    summary = None
-
-    if isinstance(detail, dict) and not detail.get("error"):
-        lst = (detail.get("response") or {}).get("order_list", []) or []
-        if lst:
-            od = lst[0]
-
-            def _si(v):
-                try:
-                    return int(v or 0)
-                except Exception:
-                    return 0
-
-            ct  = _si(od.get("create_time"))
-            sbd = _si(od.get("ship_by_date"))
-            if not sbd:
-                dts = _si(od.get("days_to_ship"))
-                if dts and ct:
-                    sbd = ct + dts * 86400
-
-            items = []
-            for it in (od.get("item_list") or []):
-                items.append({
-                    "item_id":   it.get("item_id"),
-                    "model_id":  it.get("model_id"),
-                    "item_name": it.get("item_name"),
-                    "model_name": it.get("model_name"),
-                    "qty":  it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"),
-                    "price": it.get("model_discounted_price") or it.get("order_price") or it.get("item_price")
-                })
-
-            summary = {
-                "order_sn": order_sn,
-                "status": od.get("order_status"),
-                "create_time": ct,
-                "create_time_human": _hum_epoch(ct),
-                "ship_by": sbd,
-                "ship_by_human": _hum_epoch(sbd),
-                "buyer_username": od.get("buyer_username"),
-                "recipient_name": (od.get("recipient_address") or {}).get("name"),
-                "items": items
-            }
-    else:
-        detail_error = detail
-
-    # --- ESCROW ---
+    # escrow
     escrow = _call(
         "/api/v2/payment/get_escrow_detail",
-        pid, pkey, sid, atok,
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
         {"order_sn": str(order_sn)}
     )
-    escrow_error = None
-    esc = {}
-    if isinstance(escrow, dict) and not escrow.get("error"):
-        er = (escrow.get("response") or {}) or {}
-        def _f(x):
-            try: return float(x or 0)
-            except: return 0.0
-        esc = {
-            "net": _f(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
-            "commission": _f(er.get("seller_commission_fee") or er.get("commission_fee")),
-            "service": _f(er.get("seller_service_fee") or er.get("service_fee")),
-            "protection": _f(er.get("shipping_seller_protection_fee_amount")),
-            "shipdiff": _f(er.get("shipping_fee_difference")),
-            "voucher": _f(er.get("voucher_seller")) + _f(er.get("coin_cash_back")) + _f(er.get("voucher_code_seller")),
-        }
-    else:
-        escrow_error = escrow
 
-    # --- VISIBILITY DI LIST ---
-    visible_in_list = False
-    status_hits = []
-
-    # 1) cek by update_time (window hours)
+    # visibility di list
     ol = _call(
         "/api/v2/order/get_order_list",
-        pid, pkey, sid, atok,
+        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
         {
             "time_range_field": "update_time",
-            "time_from": now_ts - int(hours) * 3600,
-            "time_to": now_ts,
-            "page_size": 50, "offset": 0
+            "time_from": now - int(hours) * 3600,
+            "time_to": now,
+            "page_size": 50,
+            "offset": 0
         }
     )
+
+    visible_in_list = False
+    status_hits = []
     if isinstance(ol, dict) and not ol.get("error"):
         for o in (ol.get("response") or {}).get("order_list", []) or []:
             if o.get("order_sn") == order_sn:
                 visible_in_list = True
                 status_hits.append(o.get("order_status"))
-                break
 
-    # 2) fallback: cek by create_time (±2 hari sekitar create_time)
-    if not visible_in_list and ct:
-        ol2 = _call(
-            "/api/v2/order/get_order_list",
-            pid, pkey, sid, atok,
-            {
-                "time_range_field": "create_time",
-                "time_from": ct - 2 * 86400,
-                "time_to":   ct + 2 * 86400,
-                "page_size": 50, "offset": 0
+    # ringkas detail
+    summary = {}
+    if isinstance(detail, dict) and not detail.get("error"):
+        lst = (detail.get("response") or {}).get("order_list", []) or []
+        if lst:
+            od = lst[0]
+            # GUNAKAN fungsi utama _safe_int yang sudah ada
+            ct  = _safe_int(od.get("create_time"))
+            sbd = _safe_int(od.get("ship_by_date"))
+            dts = _safe_int(od.get("days_to_ship"))
+            if not sbd and ct and dts:
+                sbd = ct + dts * 86400
+
+            def _hum(ts):
+                try:
+                    return _hum_epoch(ts)
+                except: 
+                    return None
+
+            items = []
+            for it in (od.get("item_list") or []):
+                items.append({
+                    "item_id": it.get("item_id"),
+                    "model_id": it.get("model_id"),
+                    "item_name": it.get("item_name"),
+                    "model_name": it.get("model_name"),
+                    "qty": it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"),
+                    "price": it.get("model_discounted_price") or it.get("order_price") or it.get("item_price")
+                })
+
+            summary = {
+                "order_sn": od.get("order_sn"),
+                "status": od.get("order_status"),
+                "create_time": ct, "create_time_human": _hum(ct),
+                "ship_by": sbd,    "ship_by_human": _hum(sbd),
+                "buyer_username": od.get("buyer_username"),
+                "recipient_name": (od.get("recipient_address") or {}).get("name"),
+                "items": items
             }
-        )
-        if isinstance(ol2, dict) and not ol2.get("error"):
-            for o in (ol2.get("response") or {}).get("order_list", []) or []:
-                if o.get("order_sn") == order_sn:
-                    visible_in_list = True
-                    status_hits.append(o.get("order_status"))
-                    break
+
+    esc_summary = {}
+    if isinstance(escrow, dict) and not escrow.get("error"):
+        er = (escrow.get("response") or {}) or {}
+        # GUNAKAN fungsi utama _safe_flt yang sudah ada
+        esc_summary = {
+            "net": _safe_flt(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
+            "commission": _safe_flt(er.get("seller_commission_fee") or er.get("commission_fee")),
+            "service": _safe_flt(er.get("seller_service_fee") or er.get("service_fee")),
+            "protection": _safe_flt(er.get("shipping_seller_protection_fee_amount")),
+            "shipdiff": _safe_flt(er.get("shipping_fee_difference")),
+            "voucher": _safe_flt(er.get("voucher_seller")) + _safe_flt(er.get("coin_cash_back")) + _safe_flt(er.get("voucher_code_seller")),
+        }
 
     return {
         "ok": bool(summary),
         "order_sn": order_sn,
         "visible_in_list": visible_in_list,
         "visible_status_hits": status_hits,
-        "detail_error": detail_error,
-        "escrow_error": escrow_error,
-        "detail": summary,
-        "escrow": esc
+        "detail_error": detail if detail.get("error") else None,
+        "escrow_error": escrow if escrow.get("error") else None,
+        "detail": summary if summary else None,
+        "escrow": esc_summary if esc_summary else None,
     }
 
 @frappe.whitelist()
@@ -2403,9 +2364,7 @@ def diagnose_order(order_sn: str, hours: int = 72):
         lst = (detail.get("response") or {}).get("order_list", []) or []
         if lst:
             od = lst[0]
-            def _safe_int(v): 
-                try: return int(v or 0)
-                except: return 0
+            # GUNAKAN fungsi utama _safe_int yang sudah ada
             ct  = _safe_int(od.get("create_time"))
             sbd = _safe_int(od.get("ship_by_date"))
             dts = _safe_int(od.get("days_to_ship"))
@@ -2442,16 +2401,14 @@ def diagnose_order(order_sn: str, hours: int = 72):
     esc_summary = {}
     if isinstance(escrow, dict) and not escrow.get("error"):
         er = (escrow.get("response") or {}) or {}
-        def _f(x):
-            try: return float(x or 0)
-            except: return 0.0
+        # GUNAKAN fungsi utama _safe_flt yang sudah ada
         esc_summary = {
-            "net": _f(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
-            "commission": _f(er.get("seller_commission_fee") or er.get("commission_fee")),
-            "service": _f(er.get("seller_service_fee") or er.get("service_fee")),
-            "protection": _f(er.get("shipping_seller_protection_fee_amount")),
-            "shipdiff": _f(er.get("shipping_fee_difference")),
-            "voucher": _f(er.get("voucher_seller")) + _f(er.get("coin_cash_back")) + _f(er.get("voucher_code_seller")),
+            "net": _safe_flt(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
+            "commission": _safe_flt(er.get("seller_commission_fee") or er.get("commission_fee")),
+            "service": _safe_flt(er.get("seller_service_fee") or er.get("service_fee")),
+            "protection": _safe_flt(er.get("shipping_seller_protection_fee_amount")),
+            "shipdiff": _safe_flt(er.get("shipping_fee_difference")),
+            "voucher": _safe_flt(er.get("voucher_seller")) + _safe_flt(er.get("coin_cash_back")) + _safe_flt(er.get("voucher_code_seller")),
         }
 
     return {
