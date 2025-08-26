@@ -575,108 +575,116 @@ def _should_make_so(order_status: str) -> bool:
 # --- MAIN: buat Sales Order dari satu order_sn (phase 2) ---------------------
 @frappe.whitelist()
 def _process_order_to_so(order_sn: str):
-    """Fixed version that creates Sales Orders with proper field mapping."""
+    """Ambil detail order Shopee lalu buat Sales Order di ERPNext."""
     s = _settings()
-    
-    # Check if already processed
+
     if frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn}):
         return {"status": "already_exists"}
-    
-    # Get order details with all needed fields
-    det = _call("/api/v2/order/get_order_detail", str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token, {
-                    "order_sn_list": order_sn,
-                    "response_optional_fields": "buyer_user_id,buyer_username,recipient_address,item_list,create_time,ship_by_date,days_to_ship"
-                })
-    
+
+    det = _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(),
+        s.partner_key,
+        s.shop_id,
+        s.access_token,
+        {
+            "order_sn_list": order_sn,
+            "response_optional_fields": (
+                "buyer_user_id,buyer_username,recipient_address,"
+                "item_list,create_time,ship_by_date,days_to_ship,order_status"
+            ),
+        },
+    )
+
     if det.get("error"):
-        frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee Order Processing")
+        frappe.log_error(
+            f"Failed to get order detail for {order_sn}: {det.get('message')}",
+            "Shopee Order Processing",
+        )
         return {"status": "error", "message": det.get("message")}
-        
+
     order_list = det.get("response", {}).get("order_list", [])
     if not order_list:
         return {"status": "no_data"}
-    
+
     order_detail = order_list[0]
-    
-    # Extract customer info
-    customer = _create_or_get_customer(order_detail)
-    
-    # Extract dates
+
+    # Customer
+    customer = _create_or_get_customer(order_detail, order_sn)
+
+    # Dates
     transaction_date, delivery_date = _extract_dates_from_order(order_detail)
-    
-    # Create Sales Order
+
+    # Sales Order
     so = frappe.new_doc("Sales Order")
     so.customer = customer
+    so.order_type = "Sales"
     so.transaction_date = transaction_date
     so.delivery_date = delivery_date
-    so.po_no = order_sn  # Put Order SN in PO field for reference
-    so.custom_shopee_order_sn = order_sn  # Proper custom field
-    so.currency = "IDR"
-    
-    # Set company
+    so.po_no = order_sn
+    so.custom_shopee_order_sn = order_sn
+    so.currency = frappe.db.get_single_value("Global Defaults", "default_currency") or "IDR"
+
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     if company:
         so.company = company
-    
-    # Order status in remarks
+
+    default_price_list = frappe.db.get_single_value("Selling Settings", "selling_price_list")
+    if default_price_list:
+        so.selling_price_list = default_price_list
+
     order_status = order_detail.get("order_status", "UNKNOWN")
     so.remarks = f"Shopee Order {order_sn} | Status: {order_status}"
-    
-    # Process items
-    items = order_detail.get("item_list", [])
+
+    items = order_detail.get("item_list", []) or []
     if not items:
         return {"status": "no_items"}
-    
+
+    default_warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+
     for item_data in items:
-        # Extract item info
         sku = (item_data.get("model_sku") or "").strip() or \
               (item_data.get("item_sku") or "").strip() or \
-              f"SHP-{item_data.get('item_id', 'UNKNOWN')}-{item_data.get('model_id', '0')}"
-        
-        qty = int(item_data.get("model_quantity_purchased") or 
-                 item_data.get("variation_quantity_purchased") or 1)
-        
-        # Get price (try different fields)
-        rate = float(item_data.get("model_discounted_price") or 
+              f"SHP-{item_data.get('item_id','UNKNOWN')}-{item_data.get('model_id','0')}"
+
+        qty = int(item_data.get("model_quantity_purchased") or
+                  item_data.get("variation_quantity_purchased") or 1)
+
+        raw_rate = (item_data.get("model_discounted_price") or
                     item_data.get("model_original_price") or
                     item_data.get("order_price") or
-                    item_data.get("item_price") or 0)
-        
-        # Handle micro-currency (some regions use micro units)
-        if rate > 1000000:
-            rate = rate / 100000
-        
-        # Create item name
+                    item_data.get("item_price") or "0")
+
+        # di Shopee ID harga sudah pakai rupiah, jadi cukup cast ke float
+        rate = float(raw_rate)
+
         base_name = (item_data.get("item_name") or "").strip()
         model_name = (item_data.get("model_name") or "").strip()
-        item_name = f"{base_name} - {model_name}" if (base_name and model_name) else (base_name or model_name or sku)
-        
-        # Ensure item exists
+        item_name = (f"{base_name} - {model_name}".strip(" -") or sku)[:140]
+
         item_code = _ensure_item_exists(sku, item_data, rate)
-        
-        # Add to Sales Order
+
         row = so.append("items", {})
         row.item_code = item_code
-        row.item_name = item_name[:140]
+        row.item_name = item_name
         row.qty = qty
         row.rate = rate
         row.delivery_date = delivery_date
-        
-        # Set warehouse if available
-        default_warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
         if default_warehouse:
             row.warehouse = default_warehouse
-    
-    # Save and submit
+
     try:
         so.insert(ignore_permissions=True)
         so.submit()
         return {"status": "created", "sales_order": so.name}
     except Exception as e:
-        frappe.log_error(f"Failed to create Sales Order for {order_sn}: {e}", "Sales Order Creation")
+        frappe.log_error(
+            f"Failed to create Sales Order for {order_sn}: {e}\n"
+            f"Order detail: {frappe.as_json(order_detail)}",
+            "Sales Order Creation",
+        )
         return {"status": "error", "message": str(e)}
-        
+           
 LOCK_ERRORS = ("Lock wait timeout exceeded", "deadlock found")
 
 def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
@@ -838,38 +846,46 @@ def _process_order(order_sn: str):
     except Exception as e:
         _short_log(f"Failed to process order {order_sn}: {e}", "Shopee Order Processing")
         raise
-
 def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
+    """Create/get Customer dari detail order Shopee.
+    Prioritas nama: buyer_username (bukan '****') → recipient_name → buyer_user_id.
+    Suffix unik: 4 digit terakhir phone → 4 digit terakhir buyer_user_id → 6 char dari order_sn → "0000".
+    Bisa dipanggil _create_or_get_customer(order_detail) saja.
+    """
     order_sn = (order_sn or order_detail.get("order_sn") or "").strip()
 
     addr = order_detail.get("recipient_address") or {}
     recipient_name = (addr.get("name") or "").strip()
     phone = (addr.get("phone") or "").strip()
 
+    # username bisa dimasking "****", maka abaikan
     buyer_username = (order_detail.get("buyer_username") or "").strip()
-    # Saring masking Shopee
     if buyer_username == "****":
         buyer_username = ""
+
     buyer_user_id = str(order_detail.get("buyer_user_id") or "").strip()
 
-    # >>> Prioritas diubah: username -> recipient -> buyer_id
+    # Base name: username → recipient → buyer-id → fallback "buyer"
     base_name = buyer_username or recipient_name or (f"buyer-{buyer_user_id}" if buyer_user_id else "buyer")
-    clean_name = re.sub(r'[^A-Za-z0-9\- ]', '', base_name)[:20] or "buyer"
+    clean_name = re.sub(r"[^A-Za-z0-9\- ]", "", base_name)[:20] or "buyer"
 
-    phone_digits = re.sub(r'\D', '', phone)
+    # Suffix unik
+    phone_digits = re.sub(r"\D", "", phone)
     if phone_digits:
         suffix = phone_digits[-4:]
     elif buyer_user_id:
         suffix = buyer_user_id[-4:]
     else:
-        sn_clean = re.sub(r'[^A-Z0-9]', '', (order_sn or "").upper())
-        suffix = sn_clean[:6] if len(sn_clean) >= 6 else (sn_clean.ljust(6, '0') if sn_clean else "0000")
+        sn_clean = re.sub(r"[^A-Z0-9]", "", (order_sn or "").upper())
+        suffix = sn_clean[:6] if len(sn_clean) >= 6 else (sn_clean.ljust(6, "0") if sn_clean else "0000")
 
     customer_name = f"SHP-{clean_name}-{suffix}"
 
+    # Sudah ada? langsung pakai
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
         return customer_name
 
+    # Buat Customer baru
     customer = frappe.new_doc("Customer")
     customer.customer_name = customer_name
     customer.customer_group = "All Customer Groups"
@@ -877,6 +893,7 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
     customer.territory = "All Territories"
     customer.insert(ignore_permissions=True)
 
+    # Buat Address kalau ada
     if addr and (addr.get("full_address") or addr.get("city")):
         try:
             address = frappe.new_doc("Address")
@@ -890,9 +907,13 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
             address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
             address.insert(ignore_permissions=True)
         except Exception as e:
-            frappe.log_error(f"Failed to create address for {customer_name}: {e}", "Customer Address Creation")
+            frappe.log_error(
+                f"Failed to create address for {customer_name}: {e}",
+                "Customer Address Creation",
+            )
 
     return customer_name
+
     
 def _extract_dates_from_order(order_detail):
     """Extract and convert dates from Shopee order."""
@@ -1970,7 +1991,7 @@ def sync_recent_orders(hours: int = 24):
             order_sn = order.get("order_sn")
             if order_sn:
                 try:
-                    result = _process_order_fixed(order_sn)
+                    result = _process_order(order_sn)
                     if result.get("status") == "created":
                         processed += 1
                     
@@ -2573,106 +2594,3 @@ def force_cancel_shopee_orders(batch_size=250):
         "cancelled_orders": cancelled,
         "error_details": errors[:5]  # Show first 5 errors
     }
-
-def _process_order_fixed(order_sn: str):
-    """Fixed version that creates Sales Orders with proper field mapping."""
-    s = _settings()
-    
-    # Check if already processed
-    if frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn}):
-        return {"status": "already_exists"}
-    
-    # Get order details with all needed fields
-    det = _call("/api/v2/order/get_order_detail", str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token, {
-                    "order_sn_list": order_sn,
-                    "response_optional_fields": "buyer_user_id,buyer_username,recipient_address,item_list,create_time,ship_by_date,days_to_ship"
-                })
-    
-    if det.get("error"):
-        frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee Order Processing")
-        return {"status": "error", "message": det.get("message")}
-        
-    order_list = det.get("response", {}).get("order_list", [])
-    if not order_list:
-        return {"status": "no_data"}
-    
-    order_detail = order_list[0]
-    
-    # Extract customer info
-    customer = _create_or_get_customer(order_detail)
-    
-    # Extract dates
-    transaction_date, delivery_date = _extract_dates_from_order(order_detail)
-    
-    # Create Sales Order
-    so = frappe.new_doc("Sales Order")
-    so.customer = customer
-    so.transaction_date = transaction_date
-    so.delivery_date = delivery_date
-    so.po_no = order_sn  # Put Order SN in PO field for reference
-    so.custom_shopee_order_sn = order_sn  # Proper custom field
-    so.currency = "IDR"
-    
-    # Set company
-    company = frappe.db.get_single_value("Global Defaults", "default_company")
-    if company:
-        so.company = company
-    
-    # Order status in remarks
-    order_status = order_detail.get("order_status", "UNKNOWN")
-    so.remarks = f"Shopee Order {order_sn} | Status: {order_status}"
-    
-    # Process items
-    items = order_detail.get("item_list", [])
-    if not items:
-        return {"status": "no_items"}
-    
-    for item_data in items:
-        # Extract item info
-        sku = (item_data.get("model_sku") or "").strip() or \
-              (item_data.get("item_sku") or "").strip() or \
-              f"SHP-{item_data.get('item_id', 'UNKNOWN')}-{item_data.get('model_id', '0')}"
-        
-        qty = int(item_data.get("model_quantity_purchased") or 
-                 item_data.get("variation_quantity_purchased") or 1)
-        
-        # Get price (try different fields)
-        rate = float(item_data.get("model_discounted_price") or 
-                    item_data.get("model_original_price") or
-                    item_data.get("order_price") or
-                    item_data.get("item_price") or 0)
-        
-        # Handle micro-currency (some regions use micro units)
-        if rate > 1000000:
-            rate = rate / 100000
-        
-        # Create item name
-        base_name = (item_data.get("item_name") or "").strip()
-        model_name = (item_data.get("model_name") or "").strip()
-        item_name = f"{base_name} - {model_name}" if (base_name and model_name) else (base_name or model_name or sku)
-        
-        # Ensure item exists
-        item_code = _ensure_item_exists(sku, item_data, rate)
-        
-        # Add to Sales Order
-        row = so.append("items", {})
-        row.item_code = item_code
-        row.item_name = item_name[:140]
-        row.qty = qty
-        row.rate = rate
-        row.delivery_date = delivery_date
-        
-        # Set warehouse if available
-        default_warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-        if default_warehouse:
-            row.warehouse = default_warehouse
-    
-    # Save and submit
-    try:
-        so.insert(ignore_permissions=True)
-        so.submit()
-        return {"status": "created", "sales_order": so.name}
-    except Exception as e:
-        frappe.log_error(f"Failed to create Sales Order for {order_sn}: {e}", "Sales Order Creation")
-        return {"status": "error", "message": str(e)}
