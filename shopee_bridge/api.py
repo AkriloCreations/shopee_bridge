@@ -1,10 +1,18 @@
 import time, hmac, hashlib, requests, frappe, re  # pyright: ignore[reportMissingImports]
-from frappe.utils import get_url, nowdate, cint, add_days, now  # pyright: ignore[reportMissingImports]
-from datetime import datetime, timedelta
+from frappe.utils import get_url, nowdate, cint, add_days, now, convert_utc_to_user_timezone, format_datetime # pyright: ignore[reportMissingImports]
+from datetime import datetime, timedelta, timezone
 import json
 
 def _settings():
     return frappe.get_single("Shopee Settings")
+
+def _hum_epoch(ts: int | None):
+    """Epoch detik -> string waktu sesuai timezone user, atau None."""
+    if not ts:
+        return None
+    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    dt_user = convert_utc_to_user_timezone(dt_utc)
+    return format_datetime(dt_user)
 
 def _base():
     """Host Shopee sesuai Environment di Shopee Settings."""
@@ -1832,109 +1840,149 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
     }
 
 @frappe.whitelist()
-def diagnose_order(order_sn: str, lookback_days: int = 60, max_pages: int = 40):
-    """Diagnose why an order_sn cannot be fetched.
-    - Search get_order_list over a wider window (create_time & update_time) and all statuses.
-    - Try detail via shop_id, then fallback via merchant_id (if present).
-    """
+def diagnose_order(order_sn: str, hours: int = 72):
+    """Diagnosa cepat: detail, escrow, dan cek kemunculan order di get_order_list."""
+    import time, json
+
     s = _settings()
-    order_sn = (order_sn or "").strip()
-    if not order_sn:
-        return {"ok": False, "reason": "empty_order_sn"}
+    pid  = str(s.partner_id).strip()
+    pkey = s.partner_key
+    sid  = s.shop_id
+    atok = s.access_token
+    now_ts = int(time.time())
 
-    ctx = {
-        "env": getattr(s, "environment", "Test") or "Test",
-        "shop_id": s.shop_id,
-        "merchant_id": getattr(s, "merchant_id", None),
-        "partner_id": str(s.partner_id).strip(),
-    }
+    # init supaya aman dipakai di fallback
+    ct  = 0   # create_time
+    sbd = 0   # ship_by_date
 
-    statuses = ["UNPAID","READY_TO_SHIP","PROCESSED","SHIPPED","COMPLETED","CANCELLED","IN_CANCEL","INVOICE_PENDING"]
-    fields = ["update_time","create_time"]
-
-    now = int(time.time())
-    tf = now - int(lookback_days) * 24 * 3600
-    found = False
-    hits = []
-
-    # 1) Visibility scan (paged, broad)
-    try:
-        for field in fields:
-            for st in statuses:
-                offset = 0
-                pages = 0
-                while pages < int(max_pages):
-                    r = _call(
-                        "/api/v2/order/get_order_list",
-                        str(s.partner_id).strip(), s.partner_key,
-                        s.shop_id, s.access_token,
-                        {
-                            "time_range_field": field,
-                            "time_from": tf,
-                            "time_to": now,
-                            "page_size": 50,
-                            "order_status": st,
-                            "offset": offset,
-                        },
-                    )
-                    rows = (r.get("response") or {}).get("order_list") or []
-                    if any((o.get("order_sn") or "").strip() == order_sn for o in rows):
-                        found = True
-                        hits.append({"status": st, "field": field})
-                        break
-                    if not rows or not (r.get("response") or {}).get("has_next_page"):
-                        break
-                    offset = (r.get("response") or {}).get("next_offset", offset + 50)
-                    pages += 1
-            if found:
-                break
-    except Exception as e:
-        frappe.log_error(f"diagnose scan error: {e}", "Shopee Diagnose")
-
-    out = {
-        "ok": False,
-        "context": ctx,
-        "order_sn": order_sn,
-        "visible_in_list": bool(found),
-        "visible_status_hits": hits,
-    }
-
-    # 2) Detail via shop_id
-    det_shop = _call(
+    # --- DETAIL ---
+    detail = _call(
         "/api/v2/order/get_order_detail",
-        str(s.partner_id).strip(), s.partner_key,
-        s.shop_id, s.access_token,
-        {"order_sn_list": order_sn}
+        pid, pkey, sid, atok,
+        {"order_sn_list": str(order_sn), "response_optional_fields": "item_list,recipient_address,buyer_info"}
     )
-    out["detail_via_shop"] = {"error": det_shop.get("error"), "message": det_shop.get("message")}
-    shop_ok = not det_shop.get("error") and (det_shop.get("response") or {}).get("order_list")
 
-    # 3) Detail via merchant_id (jika ada & shop gagal)
-    merch_ok = False
-    det_merch = {}
-    mid = getattr(s, "merchant_id", None)
-    if not shop_ok and mid:
-        det_merch = _call(
-            "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(), s.partner_key,
-            None, s.access_token,
-            {"order_sn_list": order_sn, "merchant_id": int(mid)}
+    detail_error = None
+    summary = None
+
+    if isinstance(detail, dict) and not detail.get("error"):
+        lst = (detail.get("response") or {}).get("order_list", []) or []
+        if lst:
+            od = lst[0]
+
+            def _si(v):
+                try:
+                    return int(v or 0)
+                except Exception:
+                    return 0
+
+            ct  = _si(od.get("create_time"))
+            sbd = _si(od.get("ship_by_date"))
+            if not sbd:
+                dts = _si(od.get("days_to_ship"))
+                if dts and ct:
+                    sbd = ct + dts * 86400
+
+            items = []
+            for it in (od.get("item_list") or []):
+                items.append({
+                    "item_id":   it.get("item_id"),
+                    "model_id":  it.get("model_id"),
+                    "item_name": it.get("item_name"),
+                    "model_name": it.get("model_name"),
+                    "qty":  it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"),
+                    "price": it.get("model_discounted_price") or it.get("order_price") or it.get("item_price")
+                })
+
+            summary = {
+                "order_sn": order_sn,
+                "status": od.get("order_status"),
+                "create_time": ct,
+                "create_time_human": _hum_epoch(ct),
+                "ship_by": sbd,
+                "ship_by_human": _hum_epoch(sbd),
+                "buyer_username": od.get("buyer_username"),
+                "recipient_name": (od.get("recipient_address") or {}).get("name"),
+                "items": items
+            }
+    else:
+        detail_error = detail
+
+    # --- ESCROW ---
+    escrow = _call(
+        "/api/v2/payment/get_escrow_detail",
+        pid, pkey, sid, atok,
+        {"order_sn": str(order_sn)}
+    )
+    escrow_error = None
+    esc = {}
+    if isinstance(escrow, dict) and not escrow.get("error"):
+        er = (escrow.get("response") or {}) or {}
+        def _f(x):
+            try: return float(x or 0)
+            except: return 0.0
+        esc = {
+            "net": _f(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
+            "commission": _f(er.get("seller_commission_fee") or er.get("commission_fee")),
+            "service": _f(er.get("seller_service_fee") or er.get("service_fee")),
+            "protection": _f(er.get("shipping_seller_protection_fee_amount")),
+            "shipdiff": _f(er.get("shipping_fee_difference")),
+            "voucher": _f(er.get("voucher_seller")) + _f(er.get("coin_cash_back")) + _f(er.get("voucher_code_seller")),
+        }
+    else:
+        escrow_error = escrow
+
+    # --- VISIBILITY DI LIST ---
+    visible_in_list = False
+    status_hits = []
+
+    # 1) cek by update_time (window hours)
+    ol = _call(
+        "/api/v2/order/get_order_list",
+        pid, pkey, sid, atok,
+        {
+            "time_range_field": "update_time",
+            "time_from": now_ts - int(hours) * 3600,
+            "time_to": now_ts,
+            "page_size": 50, "offset": 0
+        }
+    )
+    if isinstance(ol, dict) and not ol.get("error"):
+        for o in (ol.get("response") or {}).get("order_list", []) or []:
+            if o.get("order_sn") == order_sn:
+                visible_in_list = True
+                status_hits.append(o.get("order_status"))
+                break
+
+    # 2) fallback: cek by create_time (±2 hari sekitar create_time)
+    if not visible_in_list and ct:
+        ol2 = _call(
+            "/api/v2/order/get_order_list",
+            pid, pkey, sid, atok,
+            {
+                "time_range_field": "create_time",
+                "time_from": ct - 2 * 86400,
+                "time_to":   ct + 2 * 86400,
+                "page_size": 50, "offset": 0
+            }
         )
-        out["detail_via_merchant"] = {"error": det_merch.get("error"), "message": det_merch.get("message")}
-        merch_ok = not det_merch.get("error") and (det_merch.get("response") or {}).get("order_list")
+        if isinstance(ol2, dict) and not ol2.get("error"):
+            for o in (ol2.get("response") or {}).get("order_list", []) or []:
+                if o.get("order_sn") == order_sn:
+                    visible_in_list = True
+                    status_hits.append(o.get("order_status"))
+                    break
 
-    advice = []
-    if not found:
-        advice.append(f"Order tidak terlihat di get_order_list {lookback_days} hari terakhir (create/update). "
-                      "Cek ENV/Shop ID/region. Coba perpanjang lookback_days.")
-    if not shop_ok and mid and merch_ok:
-        advice.append("Gunakan merchant_id untuk get_order_detail (token merchant-level).")
-    if not shop_ok and not merch_ok:
-        advice.append("Detail tetap tidak ditemukan. Kemungkinan ENV/Shop mismatch, region beda, atau order di luar retensi.")
-
-    out["advice"] = advice
-    out["ok"] = bool(found and (shop_ok or merch_ok))
-    return out
+    return {
+        "ok": bool(summary),
+        "order_sn": order_sn,
+        "visible_in_list": visible_in_list,
+        "visible_status_hits": status_hits,
+        "detail_error": detail_error,
+        "escrow_error": escrow_error,
+        "detail": summary,
+        "escrow": esc
+    }
 
 @frappe.whitelist()
 def backfill_mapping_from_legacy_codes(dry_run: int = 1):
