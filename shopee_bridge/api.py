@@ -304,7 +304,7 @@ def sync_recent_orders(hours: int = 24):
     except Exception as e:
         frappe.log_error(f"Sync failed: {str(e)}", "Shopee Sync Critical Error")
         raise
-    
+
 @frappe.whitelist()
 def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
     """
@@ -497,8 +497,8 @@ def _match_or_create_item(it: dict, rate: float) -> str:
     itname = (it.get("item_name") or it.get("model_name") or code)[:140]
 
     item = frappe.new_doc("Item")
-    item.item_code = code
-    item.item_name = itname
+    item.item_code =  _fit140(code)
+    item.item_name = _fit140(itname)  
     item.item_group = frappe.db.get_single_value("Stock Settings", "default_item_group") or "All Item Groups"
     item.stock_uom = "Nos"
     item.is_stock_item = 1
@@ -1151,6 +1151,9 @@ def _get_item_base_info(item_id: int):
     lst = (res.get("response") or {}).get("item_list", []) or []
     return lst[0] if lst and isinstance(lst, list) else {}
 
+def _fit140(s: str) -> str:
+    return ((s or "").strip())[:140]
+
 @frappe.whitelist()
 def sync_items(hours: int = 720, status: str = "NORMAL"):
     """
@@ -1779,8 +1782,8 @@ def _match_or_create_item(it: dict, rate: float) -> str:
     nice_name = _clean_title(it.get("model_name") or it.get("item_name") or code)[:140]
 
     item = frappe.new_doc("Item")
-    item.item_code = code
-    item.item_name = nice_name          # << ini yang diperbaiki
+    item.item_code = _fit140(code)
+    item.item_name = _fit140(nice_name)          # << ini yang diperbaiki
     item.item_group = frappe.db.get_single_value("Stock Settings", "default_item_group") or "All Item Groups"
     item.stock_uom = "Nos"
     item.is_stock_item = 1
