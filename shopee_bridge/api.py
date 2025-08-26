@@ -1,5 +1,5 @@
 import time, hmac, hashlib, requests, frappe
-from frappe.utils import get_url, nowdate, cint
+from frappe.utils import get_url, nowdate, cint, add_days
 from datetime import datetime, timedelta
 import json
 
@@ -510,26 +510,38 @@ def _short_log(message: str, title: str = "Shopee"):
     t = (title or "Shopee")[:140]
     m = (message or "")[:4000]
     frappe.log_error(m, t)
-
+    
 def _process_order_to_so(order_sn: str):
     """Phase 2: buat Sales Order (SO). DN + SI dibuat terpisah saat barang siap."""
     s = _settings()
 
-    # Skip jika sudah ada SO/SI
+    # Skip kalau sudah pernah dibuat
     if (frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
         or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})):
         frappe.logger().info(f"[SO] Order {order_sn} already processed, skipping")
         return
 
     try:
-        # --- Order detail ---
+        # (opsional) segarkan token dulu
+        try:
+            refresh_if_needed(force=False)
+        except Exception:
+            pass
+
+        # --- Ambil detail order dari Shopee ---
         det = _call(
             "/api/v2/order/get_order_detail",
             str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,buyer_info"}
+            {
+                "order_sn_list": order_sn,
+                "response_optional_fields": "item_list,recipient_address,buyer_info"
+            }
         )
         if det.get("error"):
-            _short_log(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee Phase2")
+            _short_log(
+                f"Failed to get order detail for {order_sn}: {det.get('message')}",
+                "Shopee Phase2"
+            )
             return
 
         orders = (det.get("response") or {}).get("order_list", []) or []
@@ -540,7 +552,7 @@ def _process_order_to_so(order_sn: str):
 
         # --- Customer & Company ---
         customer = _create_or_get_customer(od)
-        company  = frappe.db.get_single_value("Global Defaults", "default_company")
+        company = frappe.db.get_single_value("Global Defaults", "default_company")
 
         # --- Siapkan items ---
         items = []
@@ -550,16 +562,27 @@ def _process_order_to_so(order_sn: str):
                   f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
             if not sku:
                 sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
-            qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-            rate = float(it.get("model_original_price") or it.get("model_discounted_price")
-                         or it.get("order_price") or it.get("item_price") or 0)
+
+            qty = int(it.get("model_quantity_purchased") or
+                      it.get("variation_quantity_purchased") or 1)
+
+            rate = float(
+                it.get("model_original_price") or
+                it.get("model_discounted_price") or
+                it.get("order_price") or
+                it.get("item_price") or 0
+            )
+            # guard kalau harga dari Shopee pakai micro unit
             if rate > 1_000_000:
                 rate = rate / 100000
 
             item_code = _ensure_item_exists(sku, it, rate)
-            items.append({"item_code": item_code,
-                          "item_name": it.get("item_name") or it.get("model_name"),
-                          "qty": qty, "rate": rate})
+            items.append({
+                "item_code": item_code,
+                "item_name": it.get("item_name") or it.get("model_name"),
+                "qty": qty,
+                "rate": rate
+            })
 
         if not items:
             _short_log(f"No valid items for {order_sn}", "Shopee Phase2")
@@ -569,7 +592,16 @@ def _process_order_to_so(order_sn: str):
         so = frappe.new_doc("Sales Order")
         so.customer = customer
         so.company = company
+
+        # Tanggal transaksi = hari ini
         so.transaction_date = nowdate()
+
+        # DELIVERY DATE WAJIB:
+        # pakai lead time dari settings kalau ada, default 0 hari (hari ini)
+        lead_days = cint(getattr(s, "delivery_lead_days", 0) or 0)
+        delivery_date = add_days(nowdate(), lead_days)
+        so.delivery_date = delivery_date
+
         so.custom_shopee_order_sn = order_sn
         so.remarks = f"Shopee order SN {order_sn}"
 
@@ -579,6 +611,8 @@ def _process_order_to_so(order_sn: str):
             r.item_name = it.get("item_name")
             r.qty = it["qty"]
             r.rate = it["rate"]
+            # penting: row-level delivery date juga harus diisi
+            r.delivery_date = delivery_date
 
         so.insert(ignore_permissions=True)
         so.submit()
@@ -589,6 +623,7 @@ def _process_order_to_so(order_sn: str):
     except Exception as e:
         _short_log(f"Failed to create SO for {order_sn}: {e}", "Shopee Phase2")
         raise
+
 
 def _process_order_to_si(order_sn: str):
     """Jalur lama: langsung buat Sales Invoice. Ada fallback jika stok kurang."""
