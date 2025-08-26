@@ -1621,7 +1621,8 @@ def test_connection():
         
         # FIX: Add better error handling and logging
         if result.get("error"):
-            frappe.log_error(f"Shopee connection test failed: {result.get('error')} - {result.get('message')}", "Shopee Connection Test")
+            # FIX: Gunakan title yang pendek untuk log
+            frappe.log_error(f"Connection test failed: {result.get('error')} - {result.get('message')}", "Shopee Test")
             
             # Try to refresh token if expired
             if "access token expired" in str(result.get("message", "")).lower():
@@ -1642,7 +1643,8 @@ def test_connection():
         
         # FIX: Check if we actually got shop data
         if not shop_info or not shop_info.get("shop_name"):
-            frappe.log_error(f"Shopee API returned empty shop info: {result}", "Shopee Connection Test")
+            # FIX: Log dengan title pendek
+            frappe.log_error(f"Empty shop info returned", "Shopee Test")
             return {"success": False, "error": "No shop information returned", "message": "API call succeeded but returned empty data"}
         
         return {
@@ -1654,7 +1656,8 @@ def test_connection():
         }
         
     except Exception as e:
-        frappe.log_error(f"Shopee connection test exception: {str(e)}", "Shopee Connection Test")
+        # FIX: Log exception dengan title pendek
+        frappe.log_error(f"Connection test exception: {str(e)}", "Shopee Test")
         return {"success": False, "error": "exception", "message": str(e)}
 
 @frappe.whitelist()
