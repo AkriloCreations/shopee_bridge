@@ -77,7 +77,8 @@
             frappe.show_progress(__('Connecting to Shopee...'), 30, 100, 'Processing authorization...');
             
             frappe.call({
-                method: 'shopee_bridge.shopee_bridge.doctype.shopee_settings.api.exchange_code',
+                // PERBAIKAN: Gunakan path yang konsisten
+                method: 'shopee_bridge.api.exchange_code',  // ← Perbaiki ini
                 args: {
                     code: code,
                     shop_id: shop_id
@@ -173,7 +174,7 @@
             frappe.show_progress(__('Testing Connection...'), 20, 100, 'Please wait...');
             
             frappe.call({
-                method: 'shopee_bridge.shopee_bridge.doctype.shopee_settings.api.test_connection',
+                method: 'shopee_bridge.api.test_connection',
                 callback: function(r) {
                     frappe.hide_progress();
                     
@@ -234,7 +235,7 @@
             frappe.show_progress(__('Syncing Orders...'), 10, 100, 'This may take a while...');
             
             frappe.call({
-                method: 'shopee_bridge.shopee_bridge.doctype.shopee_settings.api.sync_recent_orders',
+                method: 'shopee_bridge.api.sync_recent_orders',
                 args: { hours: parseInt(hoursInput) },
                 callback: function(r) {
                     frappe.hide_progress();
