@@ -840,24 +840,22 @@ def _process_order(order_sn: str):
         raise
 
 def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
-    """Create/get Customer dari detail order Shopee.
-    Bisa dipanggil _create_or_get_customer(order_detail) saja.
-    """
-    # Ambil order_sn jika tidak dipassing
     order_sn = (order_sn or order_detail.get("order_sn") or "").strip()
 
-    # Sumber identitas
     addr = order_detail.get("recipient_address") or {}
-    buyer_username = (order_detail.get("buyer_username") or "").strip()
-    buyer_user_id = str(order_detail.get("buyer_user_id") or "").strip()
     recipient_name = (addr.get("name") or "").strip()
     phone = (addr.get("phone") or "").strip()
 
-    # Base name: recipient → username → buyer-id
-    base_name = recipient_name or buyer_username or (f"buyer-{buyer_user_id}" if buyer_user_id else "buyer")
+    buyer_username = (order_detail.get("buyer_username") or "").strip()
+    # Saring masking Shopee
+    if buyer_username == "****":
+        buyer_username = ""
+    buyer_user_id = str(order_detail.get("buyer_user_id") or "").strip()
+
+    # >>> Prioritas diubah: username -> recipient -> buyer_id
+    base_name = buyer_username or recipient_name or (f"buyer-{buyer_user_id}" if buyer_user_id else "buyer")
     clean_name = re.sub(r'[^A-Za-z0-9\- ]', '', base_name)[:20] or "buyer"
 
-    # Suffix unik: last4 phone → last4 buyer_user_id → 6 char dari order_sn → "0000"
     phone_digits = re.sub(r'\D', '', phone)
     if phone_digits:
         suffix = phone_digits[-4:]
@@ -869,11 +867,9 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
 
     customer_name = f"SHP-{clean_name}-{suffix}"
 
-    # Sudah ada? langsung pakai
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
         return customer_name
 
-    # Buat Customer
     customer = frappe.new_doc("Customer")
     customer.customer_name = customer_name
     customer.customer_group = "All Customer Groups"
@@ -881,7 +877,6 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
     customer.territory = "All Territories"
     customer.insert(ignore_permissions=True)
 
-    # Buat Address jika ada data
     if addr and (addr.get("full_address") or addr.get("city")):
         try:
             address = frappe.new_doc("Address")
@@ -895,13 +890,10 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
             address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
             address.insert(ignore_permissions=True)
         except Exception as e:
-            frappe.log_error(
-                f"Failed to create address for {customer_name}: {e}",
-                "Customer Address Creation"
-            )
+            frappe.log_error(f"Failed to create address for {customer_name}: {e}", "Customer Address Creation")
 
     return customer_name
-
+    
 def _extract_dates_from_order(order_detail):
     """Extract and convert dates from Shopee order."""
     from datetime import datetime, timezone
