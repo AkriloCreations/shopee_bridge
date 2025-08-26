@@ -218,44 +218,20 @@ def refresh_if_needed():
 
 def _default_item_group() -> str:
     """
-    Resolusi Item Group yang kompatibel dengan berbagai versi ERPNext:
-    1) Shopee Settings.default_item_group (kalau field itu ada)
-    2) Selling Settings.default_item_group (versi lama ERPNext)
-    3) Stock Settings.default_item_group (versi baru ERPNext, jika ada)
-    4) 'Products' (fallback), atau item group non-group lainnya
+    Resolusi Item Group untuk sistem yang tidak punya default_item_group field.
+    Fallback ke item group yang ada.
     """
-    # 1) dari Shopee Settings (jika kamu sudah tambah field custom)
-    try:
-        ig = frappe.db.get_value("Shopee Settings", None, "default_item_group")
-        if ig:
-            return ig
-    except Exception:
-        pass
-
-    # 2) dari Selling Settings (lebih umum tersedia)
-    try:
-        ig = frappe.db.get_single_value("Selling Settings", "default_item_group")
-        if ig:
-            return ig
-    except Exception:
-        pass
-
-    # 3) dari Stock Settings (hanya jika field ada)
-    try:
-        ig = frappe.db.get_single_value("Stock Settings", "default_item_group")
-        if ig:
-            return ig
-    except Exception:
-        pass
-
-    # 4) fallback
+    # Langsung fallback ke "Products" atau item group pertama
     if frappe.db.exists("Item Group", "Products"):
         return "Products"
     
-    # Cari item group yang bukan group (leaf node)
+    # Cari item group yang bukan group (leaf node) - ambil yang pertama
     names = frappe.db.get_list("Item Group", filters={"is_group": 0}, pluck="name", limit=1)
-    return names[0] if names else "All Item Groups"
-
+    if names:
+        return names[0]
+    
+    # Ultimate fallback
+    return "All Item Groups"
 
 
 @frappe.whitelist()
@@ -286,7 +262,9 @@ def fix_item_codes_from_shopee(limit: int = 500, dry_run: int = 1):
     return {"preview": dry_run == 1, "changes": changed}
 
 def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
-    """Pastikan Item ada; kalau belum, buat pakai Item Group yang aman."""
+    """
+    Pastikan Item ada tanpa mengubah UOM item yang sudah ada.
+    """
     sku = (sku or "").strip()
     if not sku:
         sku = f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
@@ -295,43 +273,43 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
     var  = (it.get("model_name") or "").strip()
     item_name = (f"{base} | {var}" if var else base)[:140] or sku
 
-    # Gunakan fungsi yang aman
-    item_group = _default_item_group()
-    
-    # Stock UOM yang aman
-    stock_uom = "Nos"  # Default fallback
-    try:
-        stock_uom = frappe.db.get_single_value("Stock Settings", "stock_uom") or stock_uom
-    except Exception:
-        try:
-            stock_uom = frappe.db.get_single_value("Stock Settings", "default_uom") or stock_uom
-        except Exception:
-            pass
-
-    # update bila sudah ada
+    # Cek apakah item sudah ada
     if frappe.db.exists("Item", {"item_code": sku}):
+        # Jangan ubah UOM item yang sudah ada - hanya update nama jika perlu
         doc = frappe.get_doc("Item", sku)
-        # Perbarui nama bila kosong/berbeda (opsional)
-        if item_name and doc.item_name != item_name:
-            doc.item_name = item_name
-        if doc.item_group != item_group:
-            doc.item_group = item_group
-        if doc.stock_uom != stock_uom:
-            doc.stock_uom = stock_uom
-        doc.save(ignore_permissions=True)
+        if item_name and item_name != doc.item_name:
+            try:
+                doc.item_name = item_name
+                doc.save(ignore_permissions=True)
+            except Exception as e:
+                # Log error tapi jangan crash
+                frappe.log_error(f"Failed to update item name for {sku}: {e}", "Item Update")
         return doc.name
 
-    # create baru
+    # Buat item baru
+    defaults = _cfg_defaults()
+    
     doc = frappe.new_doc("Item")
-    doc.item_code   = sku
-    doc.item_name   = item_name
-    doc.item_group  = item_group
-    doc.stock_uom   = stock_uom
+    doc.item_code = sku
+    doc.item_name = item_name
+    doc.item_group = defaults["item_group"]
+    doc.stock_uom = defaults["stock_uom"]
     doc.is_stock_item = 1
+    
+    # Set custom fields jika ada
+    for field_name, field_value in [
+        ("custom_model_sku", it.get("model_sku", "")),
+        ("custom_shopee_item_id", str(it.get("item_id", ""))),
+        ("custom_shopee_model_id", str(it.get("model_id", "0")))
+    ]:
+        try:
+            if hasattr(doc, field_name):
+                setattr(doc, field_name, field_value)
+        except Exception:
+            pass
+    
     doc.insert(ignore_permissions=True)
     return doc.name
-
-
 
 
 def _get_item_group():
@@ -467,9 +445,16 @@ def _match_or_create_item(it: dict, rate: float) -> str:
     return item.name
 
 def _short_log(message: str, title: str = "Shopee"):
-    t = (title or "Shopee")[:140]
-    m = (message or "")[:4000]
-    frappe.log_error(m, t)
+    """Log error dengan title yang tidak terlalu panjang."""
+    # Potong title maksimal 100 karakter untuk menghindari truncation warning
+    clean_title = (title or "Shopee")[:100]
+    clean_message = (message or "")[:3000]  # Potong message juga
+    
+    try:
+        frappe.log_error(clean_message, clean_title)
+    except Exception:
+        # Kalau masih error, pakai title yang lebih pendek
+        frappe.log_error(clean_message, "Shopee Error")
 
 def _safe_set(doc, fieldname, value):
     """Set field only if it exists on the DocType (hindari exception)."""
@@ -1101,90 +1086,33 @@ def exchange_code(code: str, shop_id: str | None = None):
     }
 
 def _cfg_defaults():
-    """Ambil default yg aman lintas versi ERPNext."""
+    """Ambil default tanpa bergantung pada field yang mungkin tidak ada."""
     
-    # Stock UOM: coba berbagai sumber dengan prioritas
-    stock_uom = None
+    # Item Group - simple fallback
+    item_group = _default_item_group()
     
-    # 1. Stock Settings stock_uom
-    try:
-        stock_uom = frappe.db.get_single_value("Stock Settings", "stock_uom")
-        if stock_uom and frappe.db.exists("UOM", stock_uom):
-            pass  # Found valid UOM
-        else:
-            stock_uom = None
-    except:
-        pass
+    # Stock UOM - ambil yang paling umum
+    stock_uom = "Nos"  # Default fallback
+    common_uoms = ["Pcs", "Nos", "Unit"]
+    for uom in common_uoms:
+        if frappe.db.exists("UOM", uom):
+            stock_uom = uom
+            break
     
-    # 2. Stock Settings default_uom
-    if not stock_uom:
-        try:
-            stock_uom = frappe.db.get_single_value("Stock Settings", "default_uom") 
-            if not (stock_uom and frappe.db.exists("UOM", stock_uom)):
-                stock_uom = None
-        except:
-            pass
-    
-    # 3. Common UOMs in order of preference
-    if not stock_uom:
-        preferred_uoms = ["Pcs", "Nos", "Unit", "Each"]
-        for uom in preferred_uoms:
-            if frappe.db.exists("UOM", uom):
-                stock_uom = uom
-                break
-    
-    # 4. Ultimate fallback - first enabled UOM
-    if not stock_uom:
-        stock_uom = frappe.db.get_value("UOM", {"enabled": 1}, "name") or "Nos"
-
-    # Item Group with better fallback
-    item_group = None
-    try:
-        item_group = frappe.db.get_single_value("Selling Settings", "default_item_group")
-    except:
-        pass
-    
-    if not item_group:
-        try:
-            item_group = frappe.db.get_single_value("Stock Settings", "default_item_group")
-        except:
-            pass
-    
-    if not item_group:
-        if frappe.db.exists("Item Group", "Products"):
-            item_group = "Products"
-        else:
-            non_group_ig = frappe.db.get_value("Item Group", {"is_group": 0}, "name")
-            item_group = non_group_ig or "All Item Groups"
-
-    # Price List
+    # Price List - cari yang selling=1
     price_list = None
-    try:
-        price_list = frappe.db.get_single_value("Selling Settings", "selling_price_list")
-    except:
-        pass
+    if frappe.db.exists("Price List", "Standard Selling"):
+        price_list = "Standard Selling"
+    else:
+        price_lists = frappe.db.get_list("Price List", 
+            filters={"selling": 1, "enabled": 1}, 
+            pluck="name", limit=1)
+        price_list = price_lists[0] if price_lists else None
     
-    if not price_list:
-        if frappe.db.exists("Price List", "Standard Selling"):
-            price_list = "Standard Selling"
-        else:
-            price_lists = frappe.db.get_list("Price List", 
-                filters={"selling": 1, "enabled": 1}, pluck="name", limit=1)
-            price_list = price_lists[0] if price_lists else None
-
-    # Other defaults
-    default_wh = None
-    try:
-        default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-    except:
-        pass
+    # Warehouse & Company
+    default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
     
-    company = None
-    try:
-        company = frappe.db.get_single_value("Global Defaults", "default_company")
-    except:
-        pass
-
     return {
         "item_group": item_group,
         "stock_uom": stock_uom,
@@ -1192,7 +1120,7 @@ def _cfg_defaults():
         "default_warehouse": default_wh,
         "company": company,
     }
-    
+
 def _get_or_create_price_list(pl_name: str):
     """Get or create price list."""
     if not frappe.db.exists("Price List", {"price_list_name": pl_name}):
@@ -2273,55 +2201,116 @@ def _ensure_mapping_fields(item_name: str, model_sku: str, item_id: str, model_i
         updates["custom_shopee_model_id"] = str(model_id)
     if updates:
         frappe.db.set_value("Item", item_name, updates)
-
 def _match_or_create_item(it: dict, rate: float) -> str:
+    """
+    Cari atau buat item tanpa mengubah UOM item yang sudah ada.
+    """
     model_sku = (it.get("model_sku") or "").strip()
-    item_id   = str(it.get("item_id") or "")
-    model_id  = str(it.get("model_id") or "0")
+    item_id = str(it.get("item_id") or "")
+    model_id = str(it.get("model_id") or "0")
 
-    # 1) sudah ada by SKU (item_code/custom field)
+    # 1) Cari berdasarkan SKU
     if model_sku:
-        name = (frappe.db.get_value("Item", {"item_code": model_sku}, "name")
-                or frappe.db.get_value("Item", {"custom_model_sku": model_sku}, "name"))
-        if name:
-            _ensure_mapping_fields(name, model_sku, item_id, model_id)
-            return name
+        existing = (frappe.db.get_value("Item", {"item_code": model_sku}, "name") or
+                   frappe.db.get_value("Item", {"custom_model_sku": model_sku}, "name"))
+        if existing:
+            # Update mapping fields tanpa mengubah UOM
+            _ensure_mapping_fields_safe(existing, model_sku, item_id, model_id)
+            return existing
 
-    # 2) mapping by IDs
-    name = frappe.db.get_value("Item",
-                               {"custom_shopee_item_id": item_id, "custom_shopee_model_id": model_id},
-                               "name")
-    if name:
-        _ensure_mapping_fields(name, model_sku, item_id, model_id)
-        return name
+    # 2) Cari berdasarkan custom fields
+    existing = frappe.db.get_value("Item", {
+        "custom_shopee_item_id": item_id, 
+        "custom_shopee_model_id": model_id
+    }, "name")
+    if existing:
+        _ensure_mapping_fields_safe(existing, model_sku, item_id, model_id)
+        return existing
 
-    # 3) legacy pola item_code berbasis ID
-    for c in (f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"):
-        name = frappe.db.get_value("Item", {"item_code": c}, "name")
-        if name:
-            _ensure_mapping_fields(name, model_sku, item_id, model_id)
-            return name
+    # 3) Cari berdasarkan pola lama
+    legacy_codes = [f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"]
+    for code in legacy_codes:
+        existing = frappe.db.get_value("Item", {"item_code": code}, "name")
+        if existing:
+            _ensure_mapping_fields_safe(existing, model_sku, item_id, model_id)
+            return existing
 
-    # 4) Buat baru → NAMA jangan pakai ID; pakai nama dari Shopee & dibersihkan
-    code = model_sku or f"{item_id}-{model_id}"      # item_code boleh pakai SKU/ID
+    # 4) Buat item baru
+    code = model_sku or f"{item_id}-{model_id}"
     nice_name = _clean_title(it.get("model_name") or it.get("item_name") or code)[:140]
-
+    
+    defaults = _cfg_defaults()
+    
     item = frappe.new_doc("Item")
     item.item_code = _fit140(code)
-    item.item_name = _fit140(nice_name)          # << ini yang diperbaiki
-    item.item_group = frappe.db.get_single_value("Stock Settings", "default_item_group") or "All Item Groups"
-    item.stock_uom = "Nos"
+    item.item_name = _fit140(nice_name)
+    item.item_group = defaults["item_group"]
+    item.stock_uom = defaults["stock_uom"]
     item.is_stock_item = 1
     item.maintain_stock = 1
-    item.custom_model_sku = model_sku or ""
-    item.custom_shopee_item_id = item_id
-    item.custom_shopee_model_id = model_id
-    wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-    if wh:
-        item.append("item_defaults", {"default_warehouse": wh})
+    
+    # Set custom fields
+    for field_name, field_value in [
+        ("custom_model_sku", model_sku),
+        ("custom_shopee_item_id", item_id),
+        ("custom_shopee_model_id", model_id)
+    ]:
+        try:
+            if hasattr(item, field_name):
+                setattr(item, field_name, field_value)
+        except Exception:
+            pass
+    
+    # Set default warehouse
+    if defaults["default_warehouse"]:
+        try:
+            item.append("item_defaults", {"default_warehouse": defaults["default_warehouse"]})
+        except Exception:
+            pass
+    
     item.insert(ignore_permissions=True)
     frappe.db.commit()
     return item.name
+
+def _ensure_mapping_fields_safe(item_name: str, model_sku: str, item_id: str, model_id: str):
+    """Update mapping fields tanpa mengubah hal lain."""
+    updates = {}
+    
+    # Hanya update field yang kosong
+    current = frappe.db.get_value("Item", item_name, 
+        ["custom_model_sku", "custom_shopee_item_id", "custom_shopee_model_id"], 
+        as_dict=True)
+    
+    if not current:
+        return
+    
+    if model_sku and not current.get("custom_model_sku"):
+        updates["custom_model_sku"] = model_sku
+    if item_id and not current.get("custom_shopee_item_id"):
+        updates["custom_shopee_item_id"] = str(item_id)
+    if model_id and not current.get("custom_shopee_model_id"):
+        updates["custom_shopee_model_id"] = str(model_id)
+    
+    if updates:
+        try:
+            frappe.db.set_value("Item", item_name, updates)
+        except Exception as e:
+            frappe.log_error(f"Failed to update mapping for {item_name}: {e}", "Mapping Update")
+
+
+def _clean_title(s: str) -> str:
+    """Clean up item names."""
+    if not s:
+        return ""
+    s = s.strip()
+    # Hapus pola ID yang suka nempel
+    import re
+    s = re.sub(r"SHP-\d+-\d+", "", s)
+    s = re.sub(r"\b\d{6,}\b", "", s)      # token angka panjang
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
 
 @frappe.whitelist()
 def fix_item_names_from_shopee(update: int = 0, limit_pages: int = 999):
