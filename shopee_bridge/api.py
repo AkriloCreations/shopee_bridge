@@ -222,7 +222,7 @@ def refresh_if_needed():
     # FIX: Gunakan endpoint yang benar sesuai dokumentasi Shopee
     partner_id = str(s.partner_id).strip()
     partner_key = (s.partner_key or "").strip()
-    path = "/api/v2/public/refresh_access_token"
+    path = "/api/v2/auth/access_token/get"
     ts = int(time.time())
     
     # FIX: Signature untuk refresh token: partner_id + path + timestamp (NO access_token/shop_id)
