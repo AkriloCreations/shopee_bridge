@@ -209,71 +209,83 @@ def oauth_callback(code=None, shop_id=None, **kw):
         frappe.throw(f"OAuth callback failed: {str(e)}")
 
 @frappe.whitelist()
-def refresh_if_needed():
-    """Refresh token jika mau habis. Dipanggil scheduler."""
+def refresh_if_needed(force: int = 0):
+    """
+    Refresh Shopee access_token when close to expiry or on demand.
+    - force=1 → always try refresh (e.g., 'Refresh Now' button).
+    """
+    import time, requests
     s = _settings()
     if not s.refresh_token:
         return {"status": "no_refresh_token"}
-        
-    now = int(time.time())
-    if s.token_expire_at and (int(s.token_expire_at) - now) > 300:
-        return {"status": "token_still_valid"}
-    
-    # FIX: Gunakan endpoint yang benar sesuai dokumentasi Shopee
-    partner_id = str(s.partner_id).strip()
+
+    # refresh safety window (seconds)
+    safety = int(getattr(s, "overlap_seconds", 600) or 300)
+    now_ts = int(time.time())
+
+    if not force and s.token_expire_at and (int(s.token_expire_at) - now_ts) > safety:
+        return {"status": "token_still_valid", "expires_in": int(s.token_expire_at) - now_ts}
+
+    partner_id  = str(s.partner_id).strip()
     partner_key = (s.partner_key or "").strip()
+
+    # --- Shopee v2 refresh endpoint (correct) ---
     path = "/api/v2/auth/access_token/get"
-    ts = int(time.time())
-    
-    # FIX: Signature untuk refresh token: partner_id + path + timestamp (NO access_token/shop_id)
+    ts   = int(time.time())
+
+    # Signature: HMAC_SHA256(partner_key, partner_id + path + timestamp) → hex lowercase
     base_string = f"{partner_id}{path}{ts}"
     sign = _sign(partner_key, base_string)
-    
-    # FIX: Gunakan POST dengan body JSON sesuai dokumentasi
-    url = f"{_base()}{path}?partner_id={partner_id}&timestamp={ts}&sig n={sign}"
+
+    url = f"{_base()}{path}?partner_id={partner_id}&timestamp={ts}&sign={sign}"
+
+    # Body must include refresh_token and partner_id, and EITHER shop_id OR merchant_id
     body = {
+        "partner_id": int(partner_id),
         "refresh_token": s.refresh_token,
-        "partner_id": int(partner_id)
     }
-    
-    # FIX: Tambahkan shop_id jika ada (opsional menurut dokumentasi)
     if s.shop_id:
         body["shop_id"] = int(s.shop_id)
-    
+    elif getattr(s, "merchant_id", None):
+        body["merchant_id"] = int(s.merchant_id)
+
     try:
         r = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=30)
-        
-        if r.headers.get("content-type", "").startswith("application/json"):
-            data = r.json()
-        else:
-            frappe.log_error(f"Invalid response from Shopee refresh: {r.text}", "Shopee Token Refresh")
-            return {"status": "error", "message": f"Invalid response: {r.text}"}
-            
+        if "application/json" not in (r.headers.get("content-type") or ""):
+            frappe.log_error(f"Invalid content-type {r.headers.get('content-type')} | body: {r.text}", "Shopee Token Refresh")
+            return {"status": "error", "message": "Invalid response content-type"}
+        data = r.json()
     except requests.exceptions.RequestException as e:
-        frappe.log_error(f"Token refresh request failed: {str(e)}", "Shopee Token Refresh")
-        return {"status": "error", "message": f"Request failed: {str(e)}"}
-    
-    # FIX: Check for API errors
+        frappe.log_error(f"Token refresh request failed: {e}", "Shopee Token Refresh")
+        return {"status": "error", "message": f"Request failed: {e}"}
+
+    # API error handling
     if data.get("error"):
-        error_msg = data.get("message", "Unknown error")
-        frappe.log_error(f"Token refresh API error: {data.get('error')} - {error_msg}", "Shopee Token Refresh")
-        return {"status": "error", "message": error_msg}
-    
-    # FIX: Extract response data (bisa nested atau langsung)
-    response_data = data.get("response", data)
-    
-    if response_data.get("access_token"):
-        s.access_token = response_data["access_token"]
-        s.refresh_token = response_data.get("refresh_token", s.refresh_token)
-        s.token_expire_at = now + int(response_data.get("expire_in", 0))
-        s.save(ignore_permissions=True)
-        frappe.db.commit()
-        
-        frappe.logger().info("Token refreshed successfully")
-        return {"status": "refreshed"}
-    
-    frappe.log_error(f"No access token in refresh response: {response_data}", "Shopee Token Refresh")
-    return {"status": "no_new_token"}
+        msg = data.get("message") or "Unknown error"
+        frappe.log_error(f"Token refresh API error: {data.get('error')} - {msg}", "Shopee Token Refresh")
+        return {"status": "error", "message": msg, "request_id": data.get("request_id")}
+
+    # Success payload is top-level (not nested)
+    new_access   = data.get("access_token")
+    new_refresh  = data.get("refresh_token")  # IMPORTANT: refresh_token is single-use; store the NEW one
+    expire_in    = int(data.get("expire_in") or 0)
+    request_id   = data.get("request_id")
+
+    if not new_access or not expire_in:
+        frappe.log_error(f"No access_token/expire_in in response: {data}", "Shopee Token Refresh")
+        return {"status": "no_new_token", "request_id": request_id}
+
+    # Use 'ts' used for signature to anchor expiry (avoids small clock drift)
+    s.access_token     = new_access
+    s.refresh_token    = new_refresh or s.refresh_token
+    s.token_expire_at  = ts + expire_in
+    s.last_success_update_time = now_ts
+    s.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    frappe.logger().info(f"[Shopee] Token refreshed OK (expires in {expire_in}s) req={request_id}")
+    return {"status": "refreshed", "expires_in": expire_in, "request_id": request_id}
+
 
 def _default_item_group() -> str:
     """
