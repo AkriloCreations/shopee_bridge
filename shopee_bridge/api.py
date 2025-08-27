@@ -2710,3 +2710,410 @@ def get_token_status():
             "status": "error",
             "message": str(e)
         }
+
+# ===== HISTORICAL MIGRATION FUNCTIONS - PASTE KE api.py =====
+
+@frappe.whitelist()
+def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-08-31"):
+    """Preview berapa completed orders yang akan di-migrate. WAJIB jalankan dulu sebelum migrate."""
+    from datetime import datetime
+    
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
+        
+        s = _settings()
+        
+        if not s.access_token:
+            return {"error": "No access token. Please authenticate first."}
+        
+        # Refresh token if needed
+        try:
+            refresh_if_needed()
+        except:
+            pass
+        
+        # Sample check - ambil page pertama saja untuk estimasi
+        ol = _call("/api/v2/order/get_order_list",
+                   str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                   {
+                       "time_range_field": "create_time",
+                       "time_from": int(start.timestamp()),
+                       "time_to": int(end.timestamp()),
+                       "page_size": 100,
+                       "order_status": "COMPLETED",
+                       "offset": 0
+                   })
+        
+        if ol.get("error"):
+            return {
+                "error": f"API Error: {ol.get('error')} - {ol.get('message')}",
+                "suggestion": "Check your token or try refresh_if_needed()"
+            }
+        
+        response = ol.get("response", {})
+        orders = response.get("order_list", [])
+        has_more = response.get("has_next_page", False)
+        
+        # Check sudah ada berapa yang ter-migrate
+        existing_count = frappe.db.count("Sales Invoice", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "posting_date": ["between", [start_date, end_date]]
+        })
+        
+        existing_so_count = frappe.db.count("Sales Order", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "transaction_date": ["between", [start_date, end_date]]
+        })
+        
+        return {
+            "success": True,
+            "period": f"{start_date} to {end_date}",
+            "sample_orders_found": len(orders),
+            "has_more_pages": has_more,
+            "estimated_total": "1000+" if has_more else len(orders),
+            "already_migrated_si": existing_count,
+            "already_migrated_so": existing_so_count,
+            "sample_orders": [
+                {
+                    "order_sn": o.get("order_sn"),
+                    "status": o.get("order_status"),
+                    "create_time": _hum_epoch(o.get("create_time"))
+                } for o in orders[:5]
+            ],
+            "next_step": "Run migrate_completed_orders_execute() if looks good"
+        }
+        
+    except Exception as e:
+        frappe.log_error(f"Migration preview failed: {str(e)}", "Migration Preview")
+        return {"error": str(e)}
+
+
+@frappe.whitelist()
+def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-31", 
+                                   batch_size=50, max_batches=0, skip_existing=1):
+    """
+    Execute migration untuk completed orders. 
+    
+    Args:
+        start_date: Format YYYY-MM-DD
+        end_date: Format YYYY-MM-DD  
+        batch_size: Orders per batch (50-100 recommended)
+        max_batches: Max batches to process (0 = unlimited, 10 = first 10 batches)
+        skip_existing: 1 = skip yang sudah ada SI/SO, 0 = process semua
+    """
+    from datetime import datetime
+    import time
+    
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
+        
+        s = _settings()
+        
+        if not s.access_token:
+            frappe.throw("No access token. Please authenticate with Shopee first.")
+        
+        # Force SI flow untuk historical data (completed orders)
+        original_flow = getattr(s, "use_sales_order_flow", 0)
+        s.use_sales_order_flow = 0  # Force Sales Invoice flow
+        s.save(ignore_permissions=True)
+        
+        try:
+            refresh_if_needed()
+        except:
+            pass
+        
+        offset = 0
+        batch_count = 0
+        total_processed = 0
+        total_errors = 0
+        total_skipped = 0
+        batches_detail = []
+        
+        frappe.logger().info(f"Starting migration: {start_date} to {end_date}")
+        
+        while True:
+            batch_count += 1
+            
+            # Check max batches limit
+            if max_batches > 0 and batch_count > max_batches:
+                frappe.logger().info(f"Reached max batches limit: {max_batches}")
+                break
+            
+            frappe.logger().info(f"Processing batch {batch_count}, offset {offset}")
+            
+            # Get orders batch
+            ol = _call("/api/v2/order/get_order_list",
+                       str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                       {
+                           "time_range_field": "create_time",
+                           "time_from": int(start.timestamp()),
+                           "time_to": int(end.timestamp()),
+                           "page_size": int(batch_size),
+                           "order_status": "COMPLETED",
+                           "offset": offset
+                       })
+            
+            if ol.get("error"):
+                error_msg = f"Batch {batch_count} failed: {ol.get('error')} - {ol.get('message')}"
+                frappe.log_error(error_msg, "Migration Execute")
+                
+                # Try token refresh once
+                if "access token" in str(ol.get("message", "")).lower():
+                    try:
+                        refresh_result = refresh_if_needed()
+                        if refresh_result.get("status") == "refreshed":
+                            frappe.logger().info("Token refreshed, continuing...")
+                            continue
+                    except:
+                        pass
+                
+                # Skip this batch if error persists
+                batches_detail.append({
+                    "batch": batch_count,
+                    "status": "error",
+                    "error": error_msg,
+                    "processed": 0,
+                    "skipped": 0,
+                    "errors": 1
+                })
+                total_errors += 1
+                break
+            
+            response = ol.get("response", {})
+            orders = response.get("order_list", [])
+            
+            if not orders:
+                frappe.logger().info("No more orders found")
+                break
+            
+            batch_processed = 0
+            batch_skipped = 0 
+            batch_errors = 0
+            
+            # Process each order in batch
+            for order in orders:
+                order_sn = order.get("order_sn")
+                if not order_sn:
+                    continue
+                
+                try:
+                    # Skip if already exists
+                    if int(skip_existing):
+                        if (frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}) or
+                            frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})):
+                            batch_skipped += 1
+                            continue
+                    
+                    # Process order (will create Sales Invoice because we set use_sales_order_flow=0)
+                    result = _process_order_to_si(order_sn)
+                    
+                    if result and result.get("ok"):
+                        batch_processed += 1
+                        frappe.logger().info(f"✓ Processed {order_sn}")
+                    
+                except Exception as e:
+                    batch_errors += 1
+                    frappe.log_error(f"Failed to process order {order_sn}: {str(e)}", "Migration Order Process")
+                    frappe.logger().warning(f"✗ Failed {order_sn}: {str(e)}")
+                
+                # Throttle to avoid API limits
+                time.sleep(0.1)
+            
+            batches_detail.append({
+                "batch": batch_count,
+                "status": "completed",
+                "orders_in_batch": len(orders),
+                "processed": batch_processed,
+                "skipped": batch_skipped,
+                "errors": batch_errors,
+                "offset": offset
+            })
+            
+            total_processed += batch_processed
+            total_skipped += batch_skipped
+            total_errors += batch_errors
+            
+            frappe.logger().info(f"Batch {batch_count}: {batch_processed} processed, {batch_skipped} skipped, {batch_errors} errors")
+            
+            # Check if has more pages
+            if not response.get("has_next_page"):
+                frappe.logger().info("No more pages")
+                break
+                
+            offset = response.get("next_offset", offset + batch_size)
+            
+            # Sleep between batches to be nice to API
+            time.sleep(1)
+        
+        # Restore original setting
+        s.use_sales_order_flow = original_flow
+        s.save(ignore_permissions=True)
+        
+        result = {
+            "success": True,
+            "migration_completed": True,
+            "period": f"{start_date} to {end_date}",
+            "total_batches": batch_count,
+            "total_processed": total_processed,
+            "total_skipped": total_skipped,
+            "total_errors": total_errors,
+            "batch_details": batches_detail,
+            "settings": {
+                "batch_size": batch_size,
+                "max_batches": max_batches,
+                "skip_existing": bool(int(skip_existing))
+            }
+        }
+        
+        frappe.logger().info(f"Migration completed: {total_processed} processed, {total_errors} errors")
+        return result
+        
+    except Exception as e:
+        # Restore setting on error
+        try:
+            s.use_sales_order_flow = original_flow
+            s.save(ignore_permissions=True)
+        except:
+            pass
+            
+        frappe.log_error(f"Migration execute failed: {str(e)}", "Migration Execute")
+        return {"error": str(e), "success": False}
+
+
+@frappe.whitelist()
+def migrate_completed_orders_monthly(year=2024, start_month=1, end_month=8, batch_size=50):
+    """
+    Migrate completed orders bulan per bulan untuk handle volume besar.
+    Lebih aman untuk data banyak karena per bulan.
+    """
+    from datetime import datetime, timedelta
+    import calendar
+    
+    try:
+        s = _settings()
+        if not s.access_token:
+            frappe.throw("No access token. Please authenticate first.")
+        
+        # Force SI flow
+        original_flow = getattr(s, "use_sales_order_flow", 0)  
+        s.use_sales_order_flow = 0
+        s.save(ignore_permissions=True)
+        
+        monthly_results = []
+        total_processed = 0
+        total_errors = 0
+        
+        for month in range(int(start_month), int(end_month) + 1):
+            # Get month boundaries
+            start_date = datetime(int(year), month, 1)
+            last_day = calendar.monthrange(int(year), month)[1]
+            end_date = datetime(int(year), month, last_day, 23, 59, 59)
+            
+            month_str = start_date.strftime("%B %Y")
+            frappe.logger().info(f"Processing month: {month_str}")
+            
+            # Execute migration for this month
+            result = migrate_completed_orders_execute(
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+                batch_size=batch_size,
+                max_batches=0,  # No limit for monthly
+                skip_existing=1
+            )
+            
+            if result.get("success"):
+                monthly_results.append({
+                    "month": month_str,
+                    "processed": result.get("total_processed", 0),
+                    "errors": result.get("total_errors", 0),
+                    "batches": result.get("total_batches", 0)
+                })
+                total_processed += result.get("total_processed", 0)
+                total_errors += result.get("total_errors", 0)
+            else:
+                monthly_results.append({
+                    "month": month_str,
+                    "error": result.get("error", "Unknown error"),
+                    "processed": 0,
+                    "errors": 1
+                })
+                total_errors += 1
+            
+            frappe.logger().info(f"Completed {month_str}: {result.get('total_processed', 0)} orders")
+            
+            # Sleep between months
+            import time
+            time.sleep(2)
+        
+        # Restore setting
+        s.use_sales_order_flow = original_flow
+        s.save(ignore_permissions=True)
+        
+        return {
+            "success": True,
+            "migration_type": "monthly",
+            "period": f"{start_month}/{year} - {end_month}/{year}", 
+            "total_processed": total_processed,
+            "total_errors": total_errors,
+            "monthly_results": monthly_results
+        }
+        
+    except Exception as e:
+        # Restore setting
+        try:
+            s.use_sales_order_flow = original_flow
+            s.save(ignore_permissions=True)
+        except:
+            pass
+        
+        frappe.log_error(f"Monthly migration failed: {str(e)}", "Monthly Migration")
+        return {"error": str(e), "success": False}
+
+
+@frappe.whitelist()  
+def check_migration_status(start_date="2024-01-01", end_date="2024-08-31"):
+    """Check status migrasi - berapa yang sudah ter-migrate"""
+    from datetime import datetime
+    
+    try:
+        # Count migrated Sales Invoices
+        si_count = frappe.db.count("Sales Invoice", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "posting_date": ["between", [start_date, end_date]]
+        })
+        
+        # Count migrated Sales Orders  
+        so_count = frappe.db.count("Sales Order", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "transaction_date": ["between", [start_date, end_date]]
+        })
+        
+        # Sample recent migrated
+        recent_si = frappe.get_list("Sales Invoice", 
+            filters={
+                "custom_shopee_order_sn": ["!=", ""],
+                "posting_date": ["between", [start_date, end_date]]
+            },
+            fields=["name", "custom_shopee_order_sn", "posting_date", "grand_total"],
+            order_by="creation desc",
+            limit=10
+        )
+        
+        # Get Shopee settings
+        s = _settings()
+        
+        return {
+            "success": True,
+            "period": f"{start_date} to {end_date}",
+            "migrated_sales_invoices": si_count,
+            "migrated_sales_orders": so_count,
+            "total_migrated": si_count + so_count,
+            "current_flow": "Sales Order" if getattr(s, "use_sales_order_flow", 0) else "Sales Invoice",
+            "token_status": "Valid" if s.access_token else "Missing",
+            "recent_migrations": recent_si
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "success": False}
