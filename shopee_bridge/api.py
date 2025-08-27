@@ -886,8 +886,16 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
     buyer_user_id = str(order_detail.get("buyer_user_id") or "").strip()
 
     # Base name: username → recipient → buyer-id → fallback "buyer"
-    base_name = buyer_username or recipient_name or (f"buyer-{buyer_user_id}" if buyer_user_id else "buyer")
-    clean_name = re.sub(r"[^A-Za-z0-9\- ]", "", base_name)[:20] or "buyer"
+    raw_name = recipient_name or (buyer_username or f"buyer-{buyer_user_id}")
+    clean_name = re.sub(r"[^A-Za-z0-9\- ]", "", raw_name)[:20]
+    if not clean_name:
+        clean_name = "buyer"
+    import unicodedata
+    raw_name = recipient_name or (buyer_username or f"buyer-{buyer_user_id}")
+    clean_name = "".join(
+        c for c in raw_name
+        if unicodedata.category(c)[0] not in ("C", "Z")
+    )[:20] or "buyer"
 
     # Suffix unik
     phone_digits = re.sub(r"\D", "", phone)
@@ -899,7 +907,7 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
         sn_clean = re.sub(r"[^A-Z0-9]", "", (order_sn or "").upper())
         suffix = sn_clean[:6] if len(sn_clean) >= 6 else (sn_clean.ljust(6, "0") if sn_clean else "0000")
 
-    customer_name = f"SHP-{clean_name}-{suffix}"
+    customer_name = f"SHP-{raw_name}-{suffix}"
 
     # Sudah ada? langsung pakai
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
@@ -1039,6 +1047,7 @@ def _create_payment_entry(si, esc, net, order_sn):
         frappe.log_error(f"Failed to create payment entry for {order_sn}: {str(e)}", "Shopee Payment Entry Creation")
 
 def _get_or_create_account(account_name, account_type):
+    """Get or create account."""
     """Get or create account."""
     if frappe.db.exists("Account", {"account_name": account_name}):
         return account_name
