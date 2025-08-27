@@ -734,39 +734,29 @@ def _process_order_to_so(order_sn: str):
         return {"status": "error", "message": str(e)}
            
 def _process_order_to_si(order_sn: str):
-    """Jalur lama: langsung buat Sales Invoice. Ada fallback jika stok kurang."""
+    """Jalur lama: langsung buat Sales Invoice. Fixed untuk stock issue."""
     s = _settings()
 
     # Skip jika sudah pernah dibuat
     if frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
         frappe.logger().info(f"[SI] Order {order_sn} already processed, skipping")
-        return
+        return {"ok": True, "status": "already_exists"}
 
     try:
-        # --- Order detail (minta item_list eksplisit kalau perlu) ---
+        # --- Order detail ---
         det = _call(
             "/api/v2/order/get_order_detail",
             str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
             {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info"}
         )
         if det.get("error"):
-            _short_log(f"Failed to get order detail for {order_sn}: {det.get('message')}", "Shopee SI Flow")
-            return
+            _short_log(f"Order detail fail {order_sn}: {det.get('message')}", f"Shopee {order_sn[:8]}")
+            return {"ok": False, "error": det.get("message")}
 
         orders = (det.get("response") or {}).get("order_list", []) or []
         if not orders:
-            _short_log(f"No order data found for {order_sn}", "Shopee SI Flow")
-            return
+            return {"ok": False, "error": "No order data"}
         od = orders[0]
-
-        # --- Escrow (opsional) ---
-        esc = _call("/api/v2/payment/get_escrow_detail",
-                    str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-                    {"order_sn": order_sn})
-        if esc.get("error"):
-            _short_log(f"Escrow fail {order_sn}: {esc.get('message')}", "Shopee SI Flow")
-            esc = {"response": {}}
-        esc = esc.get("response", {}) or {}
 
         # --- Customer ---
         customer = _create_or_get_customer(od)
@@ -776,7 +766,7 @@ def _process_order_to_si(order_sn: str):
         si.customer = customer
         si.posting_date = nowdate()
         si.set_posting_time = 1
-        si.update_stock = 1  # default: gerakkan stok; akan fallback ke 0 jika error stok
+        si.update_stock = 0  # PERBAIKAN: Set 0 karena stok belum ada
         si.currency = "IDR"
         si.custom_shopee_order_sn = order_sn
         si.remarks = f"Shopee order SN {order_sn}"
@@ -788,25 +778,67 @@ def _process_order_to_si(order_sn: str):
         # --- Items ---
         items = od.get("item_list") or od.get("items") or []
         if not items:
-            _short_log(f"No items from Shopee for {order_sn}", "Shopee SI Flow")
-            return
+            return {"ok": False, "error": "No items"}
 
         default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
 
         for it in items:
-            sku = (it.get("model_sku") or "").strip() or \
-                  (it.get("item_sku") or "").strip() or \
-                  f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
-            if not sku:
-                sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
+            # PERBAIKAN: Gunakan model_sku sebagai item_code utama
+            model_sku = (it.get("model_sku") or "").strip()
+            
+            if model_sku:
+                item_code = model_sku
+            else:
+                # Fallback kalau tidak ada model_sku
+                item_code = f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
 
             qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
             rate = float(it.get("model_original_price") or it.get("model_discounted_price")
                          or it.get("order_price") or it.get("item_price") or 0)
-            if rate > 1_000_000:   # micro-unit guard
+            if rate > 1_000_000:
                 rate = rate / 100000
 
-            item_code = _ensure_item_exists(sku, it, rate)
+            # Buat item kalau belum ada
+            if not frappe.db.exists("Item", item_code):
+                # PERBAIKAN: Nama item yang lebih pendek
+                base_name = (it.get("item_name") or "")[:50]
+                model_name = (it.get("model_name") or "")[:30]
+                
+                if base_name and model_name:
+                    item_name = f"{base_name} - {model_name}"
+                else:
+                    item_name = base_name or model_name or item_code
+                
+                item_name = item_name[:140]  # ERPNext limit
+
+                try:
+                    item = frappe.new_doc("Item")
+                    item.item_code = item_code
+                    item.item_name = item_name
+                    item.item_group = "All Item Groups"
+                    item.stock_uom = _get_default_stock_uom()
+                    item.is_stock_item = 1
+                    item.is_sales_item = 1
+                    item.maintain_stock = 1
+                    
+                    if rate > 0:
+                        item.standard_rate = rate
+                    
+                    # Set custom fields kalau ada
+                    if hasattr(item, 'custom_model_sku'):
+                        item.custom_model_sku = model_sku
+                    if hasattr(item, 'custom_shopee_item_id'):
+                        item.custom_shopee_item_id = str(it.get("item_id", ""))
+                    if hasattr(item, 'custom_shopee_model_id'):
+                        item.custom_shopee_model_id = str(it.get("model_id", ""))
+                    
+                    item.insert(ignore_permissions=True)
+                    
+                except Exception as e:
+                    # Log dengan title pendek
+                    frappe.log_error(f"Item create fail {item_code}: {str(e)[:80]}", f"Item {order_sn[:8]}")
+                    # Skip item ini, lanjut ke next
+                    continue
 
             row = si.append("items", {})
             row.item_code = item_code
@@ -817,39 +849,20 @@ def _process_order_to_si(order_sn: str):
                 row.warehouse = default_wh
 
         if not si.items:
-            _short_log(f"No valid items for {order_sn}", "Shopee SI Flow")
-            return
+            return {"ok": False, "error": "No valid items"}
 
-        # --- Insert + submit dengan fallback stok kurang ---
+        # --- Insert + submit ---
         si.insert(ignore_permissions=True)
-        try:
-            si.submit()
-        except Exception as e:
-            msg = str(e)
-            if "needed in Warehouse" in msg or "negative stock" in msg.lower():
-                si.reload()
-                si.update_stock = 0
-                si.save()
-                si.submit()
-                si.add_comment("Comment",
-                    text=f"Auto-submitted with update_stock=0 (stock shortage). Original: {msg}")
-                frappe.logger().warning(f"Submitted SI {si.name} without stock movement (order {order_sn}).")
-            else:
-                raise
+        si.submit()  # Should work karena update_stock=0
 
         frappe.logger().info(f"Created Sales Invoice {si.name} for order {order_sn}")
-
-        # --- Payment Entry (opsional) ---
-        net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
-        if net > 0:
-            _create_payment_entry(si, esc, net, order_sn)
-
         return {"ok": True, "sales_invoice": si.name}
 
     except Exception as e:
-        _short_log(f"Failed to process order {order_sn}: {e}", "Shopee SI Flow")
-        raise
-
+        # PERBAIKAN: Error log dengan title pendek
+        error_msg = str(e)[:100]
+        frappe.log_error(f"Process order fail {order_sn}: {error_msg}", f"Migration {order_sn[:10]}")
+        return {"ok": False, "error": error_msg}
 
 def _process_order(order_sn: str):
     """
