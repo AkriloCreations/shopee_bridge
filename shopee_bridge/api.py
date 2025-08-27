@@ -230,7 +230,7 @@ def refresh_if_needed():
     sign = _sign(partner_key, base_string)
     
     # FIX: Gunakan POST dengan body JSON sesuai dokumentasi
-    url = f"{_base()}{path}?partner_id={partner_id}&timestamp={ts}&sign={sign}"
+    url = f"{_base()}{path}?partner_id={partner_id}&timestamp={ts}&sig n={sign}"
     body = {
         "refresh_token": s.refresh_token,
         "partner_id": int(partner_id)
@@ -1113,6 +1113,7 @@ def exchange_code(code: str, shop_id: str | None = None):
         frappe.throw("Authorization code is required")
         
     s = _settings()
+    
     partner_id = str(s.partner_id).strip()
     partner_key = (s.partner_key or "").strip()
     
@@ -1120,14 +1121,16 @@ def exchange_code(code: str, shop_id: str | None = None):
         frappe.throw("Partner ID and Partner Key must be configured in Shopee Settings")
 
     ts = int(time.time())
-    path = "/api/v2/auth/token/get"
-    
-    # FIX: For token exchange, signature is: partner_id + path + timestamp (NO access_token/shop_id)
+    # Ganti endpoint sesuai dokumentasi Shopee
+    path = "/api/v2/auth/access_token/get"  # ← Perubahan utama
     base_string = f"{partner_id}{path}{ts}"
     sign = _sign(partner_key, base_string)
 
     url = f"{_base()}{path}?partner_id={partner_id}&timestamp={ts}&sign={sign}"
-    body = {"code": code, "partner_id": int(partner_id)}
+    body = {
+        "code": code,
+        "partner_id": int(partner_id)
+    }
     
     if shop_id:
         body["shop_id"] = int(shop_id)
@@ -1148,16 +1151,16 @@ def exchange_code(code: str, shop_id: str | None = None):
         error_msg = data.get("message", "Unknown error")
         frappe.throw(f"Shopee API error: {data.get('error')} - {error_msg}")
 
-    # Extract response data
-    response_data = data.get("response", data)  # Some responses have nested "response"
+    # Extract response data (bisa nested atau langsung)
+    response_data = data.get("response", data)
     
     if not response_data.get("access_token"):
         frappe.throw("No access token received from Shopee")
 
-    # Save tokens to settings
+    # Update settings with new tokens
     s.access_token = response_data.get("access_token")
     s.refresh_token = response_data.get("refresh_token")
-    s.token_expire_at = int(time.time()) + int(response_data.get("expire_in", 0))
+    s.token_expire_at = ts + int(response_data.get("expire_in", 0))
     
     if shop_id:
         s.shop_id = shop_id
@@ -1566,7 +1569,7 @@ def sync_items(hours: int = 720, status: str = "NORMAL"):
                     if not models:
                         sku = base_sku if base_sku else f"SHP-{item_id}"
                         full_name = base_name or ""
-                        name_140 = _fit140(full_name or base_name or "")
+                        name_140 = _fit140(full_name or base_name or sku)
                         if not name_140:
                             name_140 = _fit140(sku)
 
@@ -2139,87 +2142,84 @@ def diagnose_order(order_sn: str, hours: int = 72):
     }
 
 @frappe.whitelist()
-def backfill_mapping_from_legacy_codes(dry_run: int = 1):
-    import re
-    pats = [r"^SHP-(\d+)-(\d+)$", r"^(\d+)-(\d+)$", r"^(\d+)_(\d+)$"]
-    rows = frappe.get_all("Item", fields=["name","item_code"])
-    matched = 0
-    for r in rows:
-        for p in pats:
-            m = re.match(p, r.item_code or "")
-            if m:
-                item_id, model_id = m.group(1), m.group(2)
-                matched += 1
-                if not int(dry_run):
-                    frappe.db.set_value("Item", r.name, {
-                        "custom_shopee_item_id": item_id,
-                        "custom_shopee_model_id": model_id
-                    })
-                break
-    if not int(dry_run): frappe.db.commit()
-    return {"matched": matched, "updated": int(not dry_run)}
+def force_cancel_shopee_orders(batch_size=250):
+    """Force cancel Shopee orders without using bulk operations."""
+    orders = frappe.get_all("Sales Order", 
+        filters={
+            "custom_shopee_order_sn": ["!=", ""], 
+            "docstatus": 1
+        }, 
+        fields=["name", "custom_shopee_order_sn"],
+        limit=int(batch_size))
+    
+    cancelled = []
+    errors = []
+    
+    for order in orders:
+        try:
+            # Check for linked documents
+            linked_si = frappe.db.exists("Sales Invoice", 
+                {"custom_shopee_order_sn": order.custom_shopee_order_sn})
+            linked_dn = frappe.db.exists("Delivery Note", 
+                {"custom_shopee_order_sn": order.custom_shopee_order_sn})
+            
+            if linked_si or linked_dn:
+                errors.append(f"{order.name}: Has linked documents")
+                continue
+                
+            so = frappe.get_doc("Sales Order", order.name)
+            so.flags.ignore_permissions = True
+            so.flags.ignore_mandatory = True
+            so.cancel()
+            cancelled.append(order.name)
+            
+        except Exception as e:
+            errors.append(f"{order.name}: {str(e)}")
+        
+        # Commit every record to avoid transaction locks
+        frappe.db.commit()
+    
+    return {
+        "cancelled": len(cancelled),
+        "errors": len(errors),
+        "cancelled_orders": cancelled,
+        "error_details": errors[:5]  # Show first 5 errors
+    }
 
-@frappe.whitelist()
-def backfill_mapping_from_shopee(limit_pages: int = 999):
-    s = _settings()
-    updated = 0
-    offset, page_size, pages = 0, 50, 0
-    while pages < limit_pages:
-        lst = _call("/api/v2/product/get_item_list",
-                    str(s.partner_id).strip(), s.partner_key,
-                    s.shop_id, s.access_token,
-                    {"offset": offset, "page_size": page_size})
-        resp = lst.get("response") or {}
-        for it in resp.get("item", []) + resp.get("items", []):
-            item_id = str(it.get("item_id") or "")
-            md = _call("/api/v2/product/get_model_list",
-                       str(s.partner_id).strip(), s.partner_key,
-                       s.shop_id, s.access_token,
-                       {"item_id": int(item_id)})
-            for m in (md.get("response") or {}).get("model", []) + (md.get("response") or {}).get("model_list", []):
-                model_id = str(m.get("model_id") or "")
-                model_sku = (m.get("model_sku") or "").strip()
-                # cari item existing by legacy code / custom id / sku
-                candidates = [f"SHP-{item_id}-{model_id}", f"{item_id}-{model_id}", f"{item_id}_{model_id}"]
-                name = (frappe.db.get_value("Item", {"custom_shopee_item_id": item_id, "custom_shopee_model_id": model_id}, "name")
-                        or (frappe.db.get_value("Item", {"item_code": model_sku}, "name") if model_sku else None))
-                if not name:
-                    for c in candidates:
-                        name = frappe.db.get_value("Item", {"item_code": c}, "name")
-                        if name: break
-                if name:
-                    updates = {
-                        "custom_shopee_item_id": item_id,
-                        "custom_shopee_model_id": model_id
-                    }
-                    if model_sku: updates["custom_model_sku"] = model_sku
-                    frappe.db.set_value("Item", name, updates)
-                    updated += 1
-        if not resp.get("has_next_page"): break
-        offset = resp.get("next_offset", offset + page_size); pages += 1
-    frappe.db.commit()
-    return {"updated": updated}
+def scheduled_hourly_sync():
+    """Scheduled function to sync orders hourly (backup)."""
+    try:
+        frappe.logger().info("Starting hourly order sync")
+        result = sync_recent_orders(hours=1)  # Sync last hour
+        
+        if result.get("errors", 0) > 0:
+            frappe.logger().warning(f"Hourly sync completed with {result.get('errors')} errors")
+        else:
+            frappe.logger().info(f"Hourly sync completed successfully: {result.get('processed_orders')} orders processed")
+            
+    except Exception as e:
+        frappe.log_error(f"Hourly order sync failed: {str(e)}", "Hourly Order Sync")
 
-def _clean_title(s: str) -> str:
-    if not s: return ""
-    s = s.strip()
-    # hapus pola ID yang suka nempel
-    import re
-    s = re.sub(r"SHP-\d+-\d+", "", s)
-    s = re.sub(r"\b\d{6,}\b", "", s)      # token angka panjang
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
+def scheduled_cleanup():
+    """Scheduled function to cleanup old data."""
+    try:
+        frappe.logger().info("Starting scheduled cleanup")
+        # Add cleanup logic here if needed
+        frappe.logger().info("Cleanup completed successfully")
+    except Exception as e:
+        frappe.log_error(f"Scheduled cleanup failed: {str(e)}", "Scheduled Cleanup")
 
-def _ensure_mapping_fields(item_name: str, model_sku: str, item_id: str, model_id: str):
-    updates = {}
-    if model_sku and not frappe.db.get_value("Item", item_name, "custom_model_sku"):
-        updates["custom_model_sku"] = model_sku
-    if item_id and not frappe.db.get_value("Item", item_name, "custom_shopee_item_id"):
-        updates["custom_shopee_item_id"] = str(item_id)
-    if model_id and not frappe.db.get_value("Item", item_name, "custom_shopee_model_id"):
-        updates["custom_shopee_model_id"] = str(model_id)
-    if updates:
-        frappe.db.set_value("Item", item_name, updates)
+def _get_default_stock_uom() -> str:
+    """Get default stock UOM, prefer Pcs over Nos."""
+    # Priority order: Pcs > Unit > Nos > fallback
+    preferred_uoms = ["Pcs", "Unit", "Nos"]
+    
+    for uom in preferred_uoms:
+        if frappe.db.exists("UOM", uom):
+            return uom
+    
+    # Ultimate fallback
+    return "Nos"
 def _match_or_create_item(it: dict, rate: float) -> str:
     """
     Cari atau buat item tanpa mengubah UOM item yang sudah ada.
