@@ -2714,8 +2714,10 @@ def get_token_status():
 # ===== HISTORICAL MIGRATION FUNCTIONS - PASTE KE api.py =====
 
 @frappe.whitelist()
-def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-08-31"):
-    """Preview berapa completed orders yang akan di-migrate. WAJIB jalankan dulu sebelum migrate."""
+def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-01-15"):
+    """
+    Preview dengan proper type handling.
+    """
     from datetime import datetime
     
     try:
@@ -2737,7 +2739,7 @@ def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-08-
         ol = _call("/api/v2/order/get_order_list",
                    str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
                    {
-                       "time_range_field": "create_time",
+                       "time_range_field": "create_time",  # FIX: use create_time for historical
                        "time_from": int(start.timestamp()),
                        "time_to": int(end.timestamp()),
                        "page_size": 100,
@@ -2755,20 +2757,20 @@ def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-08-
         orders = response.get("order_list", [])
         has_more = response.get("has_next_page", False)
         
-        # Check sudah ada berapa yang ter-migrate
+        # Check sudah ada berapa yang ter-migrate - FIX: proper date comparison
         existing_count = frappe.db.count("Sales Invoice", {
             "custom_shopee_order_sn": ["!=", ""],
-            "posting_date": ["between", [start_date, end_date]]
+            "posting_date": ["between", [start_date, end_date.split()[0]]]  # Remove time part
         })
         
         existing_so_count = frappe.db.count("Sales Order", {
             "custom_shopee_order_sn": ["!=", ""],
-            "transaction_date": ["between", [start_date, end_date]]
+            "transaction_date": ["between", [start_date, end_date.split()[0]]]  # Remove time part
         })
         
         return {
             "success": True,
-            "period": f"{start_date} to {end_date}",
+            "period": f"{start_date} to {end_date.split()[0]}",
             "sample_orders_found": len(orders),
             "has_more_pages": has_more,
             "estimated_total": "1000+" if has_more else len(orders),
@@ -2778,7 +2780,7 @@ def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-08-
                 {
                     "order_sn": o.get("order_sn"),
                     "status": o.get("order_status"),
-                    "create_time": _hum_epoch(o.get("create_time"))
+                    "create_time": _hum_epoch(o.get("create_time")) if o.get("create_time") else None
                 } for o in orders[:5]
             ],
             "next_step": "Run migrate_completed_orders_execute() if looks good"
@@ -2788,19 +2790,11 @@ def migrate_completed_orders_preview(start_date="2024-01-01", end_date="2024-08-
         frappe.log_error(f"Migration preview failed: {str(e)}", "Migration Preview")
         return {"error": str(e)}
 
-
 @frappe.whitelist()
 def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-31", 
                                    batch_size=50, max_batches=0, skip_existing=1):
     """
-    Execute migration untuk completed orders. 
-    
-    Args:
-        start_date: Format YYYY-MM-DD
-        end_date: Format YYYY-MM-DD  
-        batch_size: Orders per batch (50-100 recommended)
-        max_batches: Max batches to process (0 = unlimited, 10 = first 10 batches)
-        skip_existing: 1 = skip yang sudah ada SI/SO, 0 = process semua
+    Execute migration untuk completed orders dengan type fixing.
     """
     from datetime import datetime
     import time
@@ -2831,12 +2825,17 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
         total_skipped = 0
         batches_detail = []
         
+        # Convert to int untuk avoid type comparison errors
+        batch_size = int(batch_size)
+        max_batches = int(max_batches) 
+        skip_existing = int(skip_existing)
+        
         frappe.logger().info(f"Starting migration: {start_date} to {end_date}")
         
         while True:
             batch_count += 1
             
-            # Check max batches limit
+            # Check max batches limit  
             if max_batches > 0 and batch_count > max_batches:
                 frappe.logger().info(f"Reached max batches limit: {max_batches}")
                 break
@@ -2847,10 +2846,10 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
             ol = _call("/api/v2/order/get_order_list",
                        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
                        {
-                           "time_range_field": "create_time",
+                           "time_range_field": "create_time",  # FIX: use create_time for historical
                            "time_from": int(start.timestamp()),
                            "time_to": int(end.timestamp()),
-                           "page_size": int(batch_size),
+                           "page_size": batch_size,
                            "order_status": "COMPLETED",
                            "offset": offset
                        })
@@ -2900,7 +2899,7 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
                 
                 try:
                     # Skip if already exists
-                    if int(skip_existing):
+                    if skip_existing:
                         if (frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}) or
                             frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})):
                             batch_skipped += 1
@@ -2912,7 +2911,10 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
                     if result and result.get("ok"):
                         batch_processed += 1
                         frappe.logger().info(f"✓ Processed {order_sn}")
-                    
+                    else:
+                        batch_errors += 1
+                        frappe.logger().warning(f"✗ Failed {order_sn}: {result}")
+                
                 except Exception as e:
                     batch_errors += 1
                     frappe.log_error(f"Failed to process order {order_sn}: {str(e)}", "Migration Order Process")
@@ -2963,7 +2965,7 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
             "settings": {
                 "batch_size": batch_size,
                 "max_batches": max_batches,
-                "skip_existing": bool(int(skip_existing))
+                "skip_existing": bool(skip_existing)
             }
         }
         
@@ -2985,8 +2987,7 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
 @frappe.whitelist()
 def migrate_completed_orders_monthly(year=2024, start_month=1, end_month=8, batch_size=50):
     """
-    Migrate completed orders bulan per bulan untuk handle volume besar.
-    Lebih aman untuk data banyak karena per bulan.
+    Migrate completed orders bulan per bulan dengan type fixing.
     """
     from datetime import datetime, timedelta
     import calendar
@@ -2995,6 +2996,12 @@ def migrate_completed_orders_monthly(year=2024, start_month=1, end_month=8, batc
         s = _settings()
         if not s.access_token:
             frappe.throw("No access token. Please authenticate first.")
+        
+        # Convert to int untuk avoid comparison errors
+        year = int(year)
+        start_month = int(start_month)
+        end_month = int(end_month)
+        batch_size = int(batch_size)
         
         # Force SI flow
         original_flow = getattr(s, "use_sales_order_flow", 0)  
@@ -3005,43 +3012,58 @@ def migrate_completed_orders_monthly(year=2024, start_month=1, end_month=8, batc
         total_processed = 0
         total_errors = 0
         
-        for month in range(int(start_month), int(end_month) + 1):
+        for month in range(start_month, end_month + 1):
             # Get month boundaries
-            start_date = datetime(int(year), month, 1)
-            last_day = calendar.monthrange(int(year), month)[1]
-            end_date = datetime(int(year), month, last_day, 23, 59, 59)
+            start_date = datetime(year, month, 1)
+            last_day = calendar.monthrange(year, month)[1]
+            end_date = datetime(year, month, last_day, 23, 59, 59)
             
             month_str = start_date.strftime("%B %Y")
             frappe.logger().info(f"Processing month: {month_str}")
             
-            # Execute migration for this month
-            result = migrate_completed_orders_execute(
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
-                batch_size=batch_size,
-                max_batches=0,  # No limit for monthly
-                skip_existing=1
-            )
+            # Execute migration for this month using 15-day chunks to handle API limitation
+            month_processed = 0
+            month_errors = 0
             
-            if result.get("success"):
-                monthly_results.append({
-                    "month": month_str,
-                    "processed": result.get("total_processed", 0),
-                    "errors": result.get("total_errors", 0),
-                    "batches": result.get("total_batches", 0)
-                })
-                total_processed += result.get("total_processed", 0)
-                total_errors += result.get("total_errors", 0)
-            else:
-                monthly_results.append({
-                    "month": month_str,
-                    "error": result.get("error", "Unknown error"),
-                    "processed": 0,
-                    "errors": 1
-                })
-                total_errors += 1
+            # Split month into 15-day chunks
+            current_date = start_date
+            while current_date <= end_date:
+                chunk_end = min(current_date + timedelta(days=14), end_date)
+                
+                frappe.logger().info(f"Processing chunk: {current_date.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}")
+                
+                result = migrate_completed_orders_execute(
+                    start_date=current_date.strftime("%Y-%m-%d"),
+                    end_date=chunk_end.strftime("%Y-%m-%d"),
+                    batch_size=batch_size,
+                    max_batches=0,  # No limit for chunks
+                    skip_existing=1
+                )
+                
+                if result.get("success"):
+                    month_processed += result.get("total_processed", 0)
+                    month_errors += result.get("total_errors", 0)
+                else:
+                    month_errors += 1
+                    frappe.log_error(f"Chunk failed for {current_date.strftime('%Y-%m-%d')}: {result.get('error')}", "Monthly Migration Chunk")
+                
+                current_date = chunk_end + timedelta(days=1)
+                
+                # Sleep between chunks
+                import time
+                time.sleep(1)
             
-            frappe.logger().info(f"Completed {month_str}: {result.get('total_processed', 0)} orders")
+            monthly_results.append({
+                "month": month_str,
+                "processed": month_processed,
+                "errors": month_errors,
+                "status": "completed" if month_errors == 0 else "partial"
+            })
+            
+            total_processed += month_processed
+            total_errors += month_errors
+            
+            frappe.logger().info(f"Completed {month_str}: {month_processed} orders, {month_errors} errors")
             
             # Sleep between months
             import time
@@ -3070,6 +3092,7 @@ def migrate_completed_orders_monthly(year=2024, start_month=1, end_month=8, batc
         
         frappe.log_error(f"Monthly migration failed: {str(e)}", "Monthly Migration")
         return {"error": str(e), "success": False}
+
 
 
 @frappe.whitelist()  
