@@ -732,9 +732,10 @@ def _process_order_to_so(order_sn: str):
             "Sales Order Creation",
         )
         return {"status": "error", "message": str(e)}
-           
+# ===== 1. REPLACE _process_order_to_si FUNCTION IN api.py =====
+
 def _process_order_to_si(order_sn: str):
-    """Jalur lama: langsung buat Sales Invoice. Fixed untuk stock issue."""
+    """Process order dengan migration mode support - no stock movement untuk historical data."""
     s = _settings()
 
     # Skip jika sudah pernah dibuat
@@ -747,16 +748,36 @@ def _process_order_to_si(order_sn: str):
         det = _call(
             "/api/v2/order/get_order_detail",
             str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info"}
+            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info,create_time"}
         )
         if det.get("error"):
-            _short_log(f"Order detail fail {order_sn}: {det.get('message')}", f"Shopee {order_sn[:8]}")
+            frappe.log_error(f"Order detail fail {order_sn}: {det.get('message')}", f"Shopee {order_sn[:10]}")
             return {"ok": False, "error": det.get("message")}
 
         orders = (det.get("response") or {}).get("order_list", []) or []
         if not orders:
             return {"ok": False, "error": "No order data"}
         od = orders[0]
+
+        # --- MIGRATION MODE LOGIC ---
+        update_stock = 1  # Default: update stock untuk order baru
+        
+        if cint(getattr(s, "migration_mode", 0)):
+            # Migration mode ON: semua order no stock movement
+            update_stock = 0
+        elif getattr(s, "migration_cutoff_date", None):
+            # Check order date vs cutoff date
+            create_time = od.get("create_time")
+            if create_time:
+                from datetime import datetime
+                try:
+                    order_date = datetime.fromtimestamp(int(create_time)).date()
+                    cutoff = frappe.utils.getdate(s.migration_cutoff_date)
+                    if order_date < cutoff:
+                        update_stock = 0
+                except:
+                    # Kalau error parsing date, default ke migration mode
+                    update_stock = 0 if cint(getattr(s, "migration_mode", 0)) else 1
 
         # --- Customer ---
         customer = _create_or_get_customer(od)
@@ -766,10 +787,13 @@ def _process_order_to_si(order_sn: str):
         si.customer = customer
         si.posting_date = nowdate()
         si.set_posting_time = 1
-        si.update_stock = 0  # PERBAIKAN: Set 0 karena stok belum ada
+        si.update_stock = update_stock  # KEY: migration mode determines stock movement
         si.currency = "IDR"
         si.custom_shopee_order_sn = order_sn
-        si.remarks = f"Shopee order SN {order_sn}"
+        
+        # Add migration status to remarks
+        stock_note = " (No Stock)" if not update_stock else " (With Stock)"
+        si.remarks = f"Shopee order SN {order_sn}{stock_note}"
 
         company = frappe.db.get_single_value("Global Defaults", "default_company")
         if company:
@@ -783,7 +807,7 @@ def _process_order_to_si(order_sn: str):
         default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
 
         for it in items:
-            # PERBAIKAN: Gunakan model_sku sebagai item_code utama
+            # Gunakan model_sku sebagai item_code utama
             model_sku = (it.get("model_sku") or "").strip()
             
             if model_sku:
@@ -800,9 +824,9 @@ def _process_order_to_si(order_sn: str):
 
             # Buat item kalau belum ada
             if not frappe.db.exists("Item", item_code):
-                # PERBAIKAN: Nama item yang lebih pendek
-                base_name = (it.get("item_name") or "")[:50]
-                model_name = (it.get("model_name") or "")[:30]
+                # Nama item yang lebih pendek untuk avoid title truncation
+                base_name = (it.get("item_name") or "")[:40]  # Shorter
+                model_name = (it.get("model_name") or "")[:25]  # Shorter
                 
                 if base_name and model_name:
                     item_name = f"{base_name} - {model_name}"
@@ -835,8 +859,9 @@ def _process_order_to_si(order_sn: str):
                     item.insert(ignore_permissions=True)
                     
                 except Exception as e:
-                    # Log dengan title pendek
-                    frappe.log_error(f"Item create fail {item_code}: {str(e)[:80]}", f"Item {order_sn[:8]}")
+                    # Log dengan title pendek untuk avoid truncation
+                    error_msg = str(e)[:60] + "..." if len(str(e)) > 60 else str(e)
+                    frappe.log_error(f"Item create fail {item_code}: {error_msg}", f"Item {order_sn[:8]}")
                     # Skip item ini, lanjut ke next
                     continue
 
@@ -852,18 +877,337 @@ def _process_order_to_si(order_sn: str):
             return {"ok": False, "error": "No valid items"}
 
         # --- Insert + submit ---
-        si.insert(ignore_permissions=True)
-        si.submit()  # Should work karena update_stock=0
-
-        frappe.logger().info(f"Created Sales Invoice {si.name} for order {order_sn}")
-        return {"ok": True, "sales_invoice": si.name}
+        try:
+            si.insert(ignore_permissions=True)
+            si.submit()
+            
+            mode = "Historical" if not update_stock else "Live"
+            frappe.logger().info(f"Created {mode} Sales Invoice {si.name} for order {order_sn}")
+            
+            return {
+                "ok": True, 
+                "sales_invoice": si.name, 
+                "stock_updated": bool(update_stock),
+                "mode": mode
+            }
+            
+        except Exception as e:
+            # Kalau error submit, kemungkinan stock issue
+            if "needed in Warehouse" in str(e) and update_stock:
+                # Retry tanpa stock movement
+                si.reload()
+                si.update_stock = 0
+                si.remarks += " (Auto: No Stock - Stock Issue)"
+                si.save()
+                si.submit()
+                
+                frappe.logger().warning(f"SI {si.name} submitted without stock movement due to stock issue")
+                return {
+                    "ok": True,
+                    "sales_invoice": si.name,
+                    "stock_updated": False,
+                    "mode": "Fallback No Stock",
+                    "warning": "Stock issue detected, submitted without stock movement"
+                }
+            else:
+                raise
 
     except Exception as e:
-        # PERBAIKAN: Error log dengan title pendek
-        error_msg = str(e)[:100]
-        frappe.log_error(f"Process order fail {order_sn}: {error_msg}", f"Migration {order_sn[:10]}")
+        error_msg = str(e)[:80] + "..." if len(str(e)) > 80 else str(e)
+        frappe.log_error(f"Process order fail {order_sn}: {error_msg}", f"Migration {order_sn[:8]}")
         return {"ok": False, "error": error_msg}
 
+
+# ===== 2. ADD THESE NEW FUNCTIONS TO api.py =====
+
+@frappe.whitelist()
+def toggle_migration_mode(enable=1):
+    """Toggle migration mode on/off."""
+    s = _settings()
+    s.migration_mode = cint(enable)
+    if cint(enable):
+        # Set cutoff ke hari ini kalau enable
+        s.migration_cutoff_date = frappe.utils.today()
+    s.save(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return {
+        "success": True,
+        "migration_mode": bool(s.migration_mode),
+        "cutoff_date": s.migration_cutoff_date,
+        "message": f"Migration mode {'enabled' if enable else 'disabled'}",
+        "note": "Historical orders will not update stock" if enable else "New orders will update stock normally"
+    }
+
+@frappe.whitelist()
+def check_migration_mode():
+    """Check current migration mode status."""
+    s = _settings()
+    return {
+        "success": True,
+        "migration_mode": cint(getattr(s, "migration_mode", 0)),
+        "cutoff_date": getattr(s, "migration_cutoff_date", None),
+        "use_sales_order_flow": cint(getattr(s, "use_sales_order_flow", 0)),
+        "environment": getattr(s, "environment", "Test"),
+        "shop_id": getattr(s, "shop_id", None),
+        "has_token": bool(getattr(s, "access_token", None))
+    }
+
+@frappe.whitelist()
+def set_migration_cutoff(cutoff_date):
+    """Set migration cutoff date manually."""
+    s = _settings()
+    s.migration_cutoff_date = frappe.utils.getdate(cutoff_date)
+    s.save(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return {
+        "success": True,
+        "cutoff_date": s.migration_cutoff_date,
+        "message": f"Orders before {s.migration_cutoff_date} will not update stock"
+    }
+
+@frappe.whitelist()
+def migration_stats():
+    """Get migration statistics."""
+    try:
+        # Count by stock status in remarks
+        with_stock = frappe.db.count("Sales Invoice", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "remarks": ["like", "%(With Stock)%"]
+        })
+        
+        without_stock = frappe.db.count("Sales Invoice", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "remarks": ["like", "%(No Stock)%"]
+        })
+        
+        fallback_stock = frappe.db.count("Sales Invoice", {
+            "custom_shopee_order_sn": ["!=", ""],
+            "remarks": ["like", "%Auto: No Stock%"]
+        })
+        
+        total_shopee = frappe.db.count("Sales Invoice", {
+            "custom_shopee_order_sn": ["!=", ""]
+        })
+        
+        return {
+            "success": True,
+            "total_shopee_invoices": total_shopee,
+            "with_stock_movement": with_stock,
+            "without_stock_movement": without_stock,
+            "fallback_no_stock": fallback_stock,
+            "unprocessed": total_shopee - with_stock - without_stock - fallback_stock
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ===== 3. UPDATE migrate_completed_orders_execute FUNCTION =====
+# Replace the existing function with this enhanced version:
+
+@frappe.whitelist()
+def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-31", 
+                                   batch_size=50, max_batches=0, skip_existing=1):
+    """Execute migration dengan migration mode auto-enabled."""
+    from datetime import datetime
+    import time
+    
+    try:
+        s = _settings()
+        
+        if not s.access_token:
+            frappe.throw("No access token. Please authenticate with Shopee first.")
+        
+        # AUTO-ENABLE migration mode untuk historical data
+        original_migration_mode = cint(getattr(s, "migration_mode", 0))
+        original_flow = cint(getattr(s, "use_sales_order_flow", 0))
+        
+        # Enable migration mode dan SI flow
+        s.migration_mode = 1
+        s.use_sales_order_flow = 0
+        s.migration_cutoff_date = frappe.utils.today()
+        s.save(ignore_permissions=True)
+        frappe.db.commit()
+        
+        frappe.logger().info(f"Auto-enabled migration mode for historical data processing")
+        
+        try:
+            refresh_if_needed()
+        except:
+            pass
+        
+        # Convert parameters
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date + " 23:59:59", "%Y-%m-%d %H:%M:%S")
+        batch_size = int(batch_size)
+        max_batches = int(max_batches) 
+        skip_existing = int(skip_existing)
+        
+        offset = 0
+        batch_count = 0
+        total_processed = 0
+        total_errors = 0
+        total_skipped = 0
+        batches_detail = []
+        
+        frappe.logger().info(f"Starting migration: {start_date} to {end_date} (Migration Mode: ON)")
+        
+        while True:
+            batch_count += 1
+            
+            if max_batches > 0 and batch_count > max_batches:
+                frappe.logger().info(f"Reached max batches limit: {max_batches}")
+                break
+            
+            frappe.logger().info(f"Processing batch {batch_count}, offset {offset}")
+            
+            # Get orders batch
+            ol = _call("/api/v2/order/get_order_list",
+                       str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                       {
+                           "time_range_field": "create_time",
+                           "time_from": int(start.timestamp()),
+                           "time_to": int(end.timestamp()),
+                           "page_size": batch_size,
+                           "order_status": "COMPLETED",
+                           "offset": offset
+                       })
+            
+            if ol.get("error"):
+                error_msg = f"Batch {batch_count} failed: {ol.get('error')} - {ol.get('message')}"
+                frappe.log_error(error_msg, f"Migration Batch {batch_count}")
+                
+                # Try token refresh once
+                if "access token" in str(ol.get("message", "")).lower():
+                    try:
+                        refresh_result = refresh_if_needed()
+                        if refresh_result.get("status") == "refreshed":
+                            frappe.logger().info("Token refreshed, continuing...")
+                            continue
+                    except:
+                        pass
+                
+                batches_detail.append({
+                    "batch": batch_count,
+                    "status": "error",
+                    "error": error_msg,
+                    "processed": 0,
+                    "skipped": 0,
+                    "errors": 1
+                })
+                total_errors += 1
+                break
+            
+            response = ol.get("response", {})
+            orders = response.get("order_list", [])
+            
+            if not orders:
+                frappe.logger().info("No more orders found")
+                break
+            
+            batch_processed = 0
+            batch_skipped = 0 
+            batch_errors = 0
+            
+            # Process each order in batch
+            for order in orders:
+                order_sn = order.get("order_sn")
+                if not order_sn:
+                    continue
+                
+                try:
+                    # Skip if already exists
+                    if skip_existing:
+                        if (frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}) or
+                            frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})):
+                            batch_skipped += 1
+                            continue
+                    
+                    # Process order (migration mode will ensure no stock movement)
+                    result = _process_order_to_si(order_sn)
+                    
+                    if result and result.get("ok"):
+                        batch_processed += 1
+                        frappe.logger().info(f"✓ Processed {order_sn} ({result.get('mode', 'Unknown')})")
+                    else:
+                        batch_errors += 1
+                        frappe.logger().warning(f"✗ Failed {order_sn}: {result.get('error', 'Unknown error')}")
+                
+                except Exception as e:
+                    batch_errors += 1
+                    error_msg = str(e)[:50] + "..." if len(str(e)) > 50 else str(e)
+                    frappe.log_error(f"Process order {order_sn}: {error_msg}", f"Order {order_sn[:8]}")
+                    frappe.logger().warning(f"✗ Exception {order_sn}: {error_msg}")
+                
+                # Throttle
+                time.sleep(0.1)
+            
+            batches_detail.append({
+                "batch": batch_count,
+                "status": "completed",
+                "orders_in_batch": len(orders),
+                "processed": batch_processed,
+                "skipped": batch_skipped,
+                "errors": batch_errors,
+                "offset": offset
+            })
+            
+            total_processed += batch_processed
+            total_skipped += batch_skipped
+            total_errors += batch_errors
+            
+            frappe.logger().info(f"Batch {batch_count}: {batch_processed} processed, {batch_skipped} skipped, {batch_errors} errors")
+            
+            # Check if has more pages
+            if not response.get("has_next_page"):
+                frappe.logger().info("No more pages")
+                break
+                
+            offset = response.get("next_offset", offset + batch_size)
+            time.sleep(1)
+        
+        # RESTORE original settings setelah migration selesai
+        s.migration_mode = original_migration_mode
+        s.use_sales_order_flow = original_flow
+        s.save(ignore_permissions=True)
+        frappe.db.commit()
+        
+        frappe.logger().info(f"Restored original settings: migration_mode={original_migration_mode}, use_sales_order_flow={original_flow}")
+        
+        result = {
+            "success": True,
+            "migration_completed": True,
+            "period": f"{start_date} to {end_date}",
+            "total_batches": batch_count,
+            "total_processed": total_processed,
+            "total_skipped": total_skipped,
+            "total_errors": total_errors,
+            "batch_details": batches_detail,
+            "settings": {
+                "batch_size": batch_size,
+                "max_batches": max_batches,
+                "skip_existing": bool(skip_existing),
+                "migration_mode_used": True
+            }
+        }
+        
+        frappe.logger().info(f"Migration completed: {total_processed} processed, {total_errors} errors")
+        return result
+        
+    except Exception as e:
+        # Restore settings on error
+        try:
+            s.migration_mode = original_migration_mode
+            s.use_sales_order_flow = original_flow
+            s.save(ignore_permissions=True)
+        except:
+            pass
+            
+        frappe.log_error(f"Migration execute failed: {str(e)}", "Migration Execute")
+        return {"error": str(e), "success": False}
+
+@frappe.whitelist()    
 def _process_order(order_sn: str):
     """
     Router:
