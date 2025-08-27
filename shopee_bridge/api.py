@@ -1283,7 +1283,7 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
         sn_clean = re.sub(r"[^A-Z0-9]", "", (order_sn or "").upper())
         suffix = sn_clean[:6] if len(sn_clean) >= 6 else (sn_clean.ljust(6, "0") if sn_clean else "0000")
 
-    customer_name = f"SHP-{clean_name}-{suffix}"
+    customer_name = f"SHP-{clean_name}"
 
     # Sudah ada? langsung pakai
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
