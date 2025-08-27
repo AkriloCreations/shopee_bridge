@@ -2596,3 +2596,112 @@ def _get_default_stock_uom() -> str:
     
     # Ultimate fallback
     return "Nos"
+
+@frappe.whitelist()
+def manual_exchange_code(code: str, shop_id: str = None):
+    """Manual exchange authorization code ke access token - bisa dipanggil dari browser/client"""
+    try:
+        if not code or not code.strip():
+            return {
+                "status": "error",
+                "message": "Authorization code is required"
+            }
+        
+        result = exchange_code(code, shop_id)
+        
+        if result.get("ok"):
+            return {
+                "status": "success",
+                "message": "Successfully exchanged authorization code for tokens",
+                "data": {
+                    "shop_id": result.get("shop_id"),
+                    "token_expires_at": result.get("expire_at"),
+                    "access_token_preview": result.get("access_token_preview")
+                }
+            }
+        else:
+            return {
+                "status": "error", 
+                "message": "Failed to exchange code",
+                "data": result
+            }
+            
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "Manual Exchange Code Error")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@frappe.whitelist()
+def manual_token_refresh():
+    """Manual refresh token - bisa dipanggil dari client script"""
+    try:
+        result = refresh_if_needed()
+        return {
+            "status": "success" if result.get("status") == "refreshed" else result.get("status", "unknown"),
+            "message": result.get("message", "Token refresh completed"),
+            "data": result
+        }
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "Manual Token Refresh Error")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@frappe.whitelist()
+def get_oauth_url():
+    """Generate OAuth URL untuk mendapatkan authorization code"""
+    try:
+        result = connect_url("shop")
+        return {
+            "status": "success",
+            "message": "OAuth URL generated successfully",
+            "data": {
+                "oauth_url": result.get("url"),
+                "redirect_url": result.get("redirect_url"),
+                "partner_id": result.get("partner_id")
+            }
+        }
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "OAuth URL Generation Error")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@frappe.whitelist()
+def get_token_status():
+    """Get current token status and info"""
+    try:
+        s = _settings()
+        
+        token_valid = bool(s.access_token)
+        expires_soon = False
+        expires_in = None
+        
+        if s.token_expire_at:
+            import time
+            current_time = int(time.time())
+            expires_in = int(s.token_expire_at) - current_time
+            expires_soon = expires_in < 300  # Less than 5 minutes
+        
+        return {
+            "status": "success",
+            "data": {
+                "has_access_token": token_valid,
+                "has_refresh_token": bool(s.refresh_token),
+                "shop_id": s.shop_id,
+                "partner_id": s.partner_id,
+                "environment": s.environment,
+                "token_expires_in": expires_in,
+                "token_expires_soon": expires_soon,
+                "access_token_preview": s.access_token[:20] + "..." if s.access_token else None
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
