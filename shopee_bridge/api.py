@@ -733,7 +733,6 @@ def _process_order_to_so(order_sn: str):
         )
         return {"status": "error", "message": str(e)}
 # ===== 1. REPLACE _process_order_to_si FUNCTION IN api.py =====
-
 def _process_order_to_si(order_sn: str):
     """Process order dengan migration mode support - no stock movement untuk historical data."""
     s = _settings()
@@ -761,12 +760,9 @@ def _process_order_to_si(order_sn: str):
 
         # --- MIGRATION MODE LOGIC ---
         update_stock = 1  # Default: update stock untuk order baru
-        
         if cint(getattr(s, "migration_mode", 0)):
-            # Migration mode ON: semua order no stock movement
             update_stock = 0
         elif getattr(s, "migration_cutoff_date", None):
-            # Check order date vs cutoff date
             create_time = od.get("create_time")
             if create_time:
                 from datetime import datetime
@@ -776,22 +772,20 @@ def _process_order_to_si(order_sn: str):
                     if order_date < cutoff:
                         update_stock = 0
                 except:
-                    # Kalau error parsing date, default ke migration mode
                     update_stock = 0 if cint(getattr(s, "migration_mode", 0)) else 1
 
         # --- Customer ---
-        customer = _create_or_get_customer(od)
+        customer = _create_or_get_customer(od, order_sn)
 
         # --- Sales Invoice header ---
         si = frappe.new_doc("Sales Invoice")
         si.customer = customer
         si.posting_date = nowdate()
         si.set_posting_time = 1
-        si.update_stock = update_stock  # KEY: migration mode determines stock movement
+        si.update_stock = update_stock
         si.currency = "IDR"
         si.custom_shopee_order_sn = order_sn
-        
-        # Add migration status to remarks
+
         stock_note = " (No Stock)" if not update_stock else " (With Stock)"
         si.remarks = f"Shopee order SN {order_sn}{stock_note}"
 
@@ -807,64 +801,88 @@ def _process_order_to_si(order_sn: str):
         default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
 
         for it in items:
-            # Gunakan model_sku sebagai item_code utama
+            # ====== FIXED ITEM CODE PRIORITY & LOOKUP ======
             model_sku = (it.get("model_sku") or "").strip()
-            
+            item_sku  = (it.get("item_sku") or "").strip()
+
+            # Priority: model_sku > item_sku > fallback
             if model_sku:
                 item_code = model_sku
+            elif item_sku:
+                item_code = item_sku
             else:
-                # Fallback kalau tidak ada model_sku
                 item_code = f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
 
+            # Rate & qty (tetap seperti sebelumnya)
             qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-            rate = float(it.get("model_original_price") or it.get("model_discounted_price")
-                         or it.get("order_price") or it.get("item_price") or 0)
+            rate = float(
+                it.get("model_original_price")
+                or it.get("model_discounted_price")
+                or it.get("order_price")
+                or it.get("item_price")
+                or 0
+            )
             if rate > 1_000_000:
                 rate = rate / 100000
 
-            # Buat item kalau belum ada
+            # Cek existing item by exact code; jika belum ada coba mapping by custom fields
             if not frappe.db.exists("Item", item_code):
-                # Nama item yang lebih pendek untuk avoid title truncation
-                base_name = (it.get("item_name") or "")[:40]  # Shorter
-                model_name = (it.get("model_name") or "")[:25]  # Shorter
-                
-                if base_name and model_name:
-                    item_name = f"{base_name} - {model_name}"
+                existing_item = None
+                # 1) Cari by custom_model_sku (jika punya model_sku)
+                if model_sku:
+                    existing_item = frappe.db.get_value("Item", {"custom_model_sku": model_sku}, "name")
+                # 2) Kalau belum ketemu, cari by (custom_shopee_item_id + custom_shopee_model_id)
+                if not existing_item:
+                    existing_item = frappe.db.get_value(
+                        "Item",
+                        {
+                            "custom_shopee_item_id": str(it.get("item_id", "")),
+                            "custom_shopee_model_id": str(it.get("model_id", "")),
+                        },
+                        "name",
+                    )
+
+                if existing_item:
+                    item_code = existing_item
                 else:
-                    item_name = base_name or model_name or item_code
-                
-                item_name = item_name[:140]  # ERPNext limit
+                    # Buat item baru dengan nama yang pendek/rapi
+                    base_name = (it.get("item_name") or "")[:40]
+                    model_name = (it.get("model_name") or "")[:25]
+                    if base_name and model_name:
+                        item_name = f"{base_name} - {model_name}"
+                    else:
+                        item_name = base_name or model_name or item_code
+                    item_name = item_name[:140]
 
-                try:
-                    item = frappe.new_doc("Item")
-                    item.item_code = item_code
-                    item.item_name = item_name
-                    item.item_group = "All Item Groups"
-                    item.stock_uom = _get_default_stock_uom()
-                    item.is_stock_item = 1
-                    item.is_sales_item = 1
-                    item.maintain_stock = 1
-                    
-                    if rate > 0:
-                        item.standard_rate = rate
-                    
-                    # Set custom fields kalau ada
-                    if hasattr(item, 'custom_model_sku'):
-                        item.custom_model_sku = model_sku
-                    if hasattr(item, 'custom_shopee_item_id'):
-                        item.custom_shopee_item_id = str(it.get("item_id", ""))
-                    if hasattr(item, 'custom_shopee_model_id'):
-                        item.custom_shopee_model_id = str(it.get("model_id", ""))
-                    
-                    item.insert(ignore_permissions=True)
-                    
-                except Exception as e:
-                    # Log dengan title pendek untuk avoid truncation
-                    error_msg = str(e)[:60] + "..." if len(str(e)) > 60 else str(e)
-                    frappe.log_error(f"Item create fail {item_code}: {error_msg}", f"Item {order_sn[:8]}")
-                    # Skip item ini, lanjut ke next
-                    continue
+                    try:
+                        item = frappe.new_doc("Item")
+                        item.item_code = item_code
+                        item.item_name = item_name
+                        item.item_group = "All Item Groups"
+                        item.stock_uom = _get_default_stock_uom()
+                        item.is_stock_item = 1
+                        item.is_sales_item = 1
+                        item.maintain_stock = 1
 
+                        if rate > 0:
+                            item.standard_rate = rate
+
+                        # Set custom fields jika tersedia
+                        if hasattr(item, "custom_model_sku") and model_sku:
+                            item.custom_model_sku = model_sku
+                        if hasattr(item, "custom_shopee_item_id"):
+                            item.custom_shopee_item_id = str(it.get("item_id", ""))
+                        if hasattr(item, "custom_shopee_model_id"):
+                            item.custom_shopee_model_id = str(it.get("model_id", ""))
+
+                        item.insert(ignore_permissions=True)
+                    except Exception as e:
+                        error_msg = (str(e)[:60] + "...") if len(str(e)) > 60 else str(e)
+                        frappe.log_error(f"Item create fail {item_code}: {error_msg}", f"Item {order_sn[:8]}")
+                        # Skip baris item ini, lanjut ke berikutnya
+                        continue
+
+            # Tambah row SI
             row = si.append("items", {})
             row.item_code = item_code
             row.qty = qty
@@ -880,43 +898,41 @@ def _process_order_to_si(order_sn: str):
         try:
             si.insert(ignore_permissions=True)
             si.submit()
-            
+
             mode = "Historical" if not update_stock else "Live"
             frappe.logger().info(f"Created {mode} Sales Invoice {si.name} for order {order_sn}")
-            
+
             return {
-                "ok": True, 
-                "sales_invoice": si.name, 
+                "ok": True,
+                "sales_invoice": si.name,
                 "stock_updated": bool(update_stock),
-                "mode": mode
+                "mode": mode,
             }
-            
+
         except Exception as e:
-            # Kalau error submit, kemungkinan stock issue
+            # Jika gagal karena stok & mode masih update_stock, retry tanpa stock movement
             if "needed in Warehouse" in str(e) and update_stock:
-                # Retry tanpa stock movement
                 si.reload()
                 si.update_stock = 0
                 si.remarks += " (Auto: No Stock - Stock Issue)"
                 si.save()
                 si.submit()
-                
+
                 frappe.logger().warning(f"SI {si.name} submitted without stock movement due to stock issue")
                 return {
                     "ok": True,
                     "sales_invoice": si.name,
                     "stock_updated": False,
                     "mode": "Fallback No Stock",
-                    "warning": "Stock issue detected, submitted without stock movement"
+                    "warning": "Stock issue detected, submitted without stock movement",
                 }
             else:
                 raise
 
     except Exception as e:
-        error_msg = str(e)[:80] + "..." if len(str(e)) > 80 else str(e)
+        error_msg = (str(e)[:80] + "...") if len(str(e)) > 80 else str(e)
         frappe.log_error(f"Process order fail {order_sn}: {error_msg}", f"Migration {order_sn[:8]}")
         return {"ok": False, "error": error_msg}
-
 
 # ===== 2. ADD THESE NEW FUNCTIONS TO api.py =====
 
