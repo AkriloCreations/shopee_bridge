@@ -745,10 +745,19 @@ def _process_order_to_si(order_sn: str):
     try:
         # --- Order detail ---
         det = _call(
-            "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-            {"order_sn_list": order_sn, "response_optional_fields": "item_list,recipient_address,payment_info,buyer_info,create_time"}
-        )
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(),
+        s.partner_key,
+        s.shop_id,
+        s.access_token,
+        {
+            "order_sn_list": order_sn,
+            "response_optional_fields": (
+                "buyer_user_id,buyer_username,recipient_address,"
+                "item_list,create_time,ship_by_date,days_to_ship,order_status"
+            ),
+        },
+    )
         if det.get("error"):
             frappe.log_error(f"Order detail fail {order_sn}: {det.get('message')}", f"Shopee {order_sn[:10]}")
             return {"ok": False, "error": det.get("message")}
@@ -760,8 +769,12 @@ def _process_order_to_si(order_sn: str):
 
         # --- MIGRATION MODE LOGIC ---
         update_stock = 1  # Default: update stock untuk order baru
-        if cint(getattr(s, "migration_mode", 0)):
+        migration_mode_enabled = cint(getattr(s, "migration_mode", 0)) == 1
+        frappe.logger().info(f"[Migration] Order {order_sn} - Migration mode: {migration_mode_enabled}")
+        
+        if migration_mode_enabled:
             update_stock = 0
+            frappe.logger().info(f"[Migration] Order {order_sn} - Setting update_stock=0 (migration mode enabled)")
         elif getattr(s, "migration_cutoff_date", None):
             create_time = od.get("create_time")
             if create_time:
@@ -769,13 +782,17 @@ def _process_order_to_si(order_sn: str):
                 try:
                     order_date = datetime.fromtimestamp(int(create_time)).date()
                     cutoff = frappe.utils.getdate(s.migration_cutoff_date)
+                    frappe.logger().info(f"[Migration] Order {order_sn} - Order date: {order_date}, Cutoff: {cutoff}")
                     if order_date < cutoff:
                         update_stock = 0
-                except:
-                    update_stock = 0 if cint(getattr(s, "migration_mode", 0)) else 1
+                        frappe.logger().info(f"[Migration] Order {order_sn} - Order date before cutoff, setting update_stock=0")
+                except Exception as e:
+                    frappe.logger().error(f"[Migration] Error checking order date for {order_sn}: {str(e)}")
+                    update_stock = 0 if migration_mode_enabled else 1
 
         # --- Customer ---
         customer = _create_or_get_customer(od, order_sn)
+        frappe.logger().info(f"[Customer] Using customer: {customer} for order {order_sn}")
 
         # --- Sales Invoice header ---
         si = frappe.new_doc("Sales Invoice")
@@ -1092,7 +1109,7 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
             
             if ol.get("error"):
                 error_msg = f"Batch {batch_count} failed: {ol.get('error')} - {ol.get('message')}"
-                frappe.log_error(error_msg, f"Migration Batch {batch_count}")
+                frappe.log_error(error_msg, "Migration Batch {batch_count}")
                 
                 # Try token refresh once
                 if "access token" in str(ol.get("message", "")).lower():
@@ -1170,16 +1187,6 @@ def migrate_completed_orders_execute(start_date="2024-01-01", end_date="2024-08-
             })
             
             total_processed += batch_processed
-            total_skipped += batch_skipped
-            total_errors += batch_errors
-            
-            frappe.logger().info(f"Batch {batch_count}: {batch_processed} processed, {batch_skipped} skipped, {batch_errors} errors")
-            
-            # Check if has more pages
-            if not response.get("has_next_page"):
-                frappe.logger().info("No more pages")
-                break
-                
             offset = response.get("next_offset", offset + batch_size)
             time.sleep(1)
         
