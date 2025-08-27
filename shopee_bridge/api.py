@@ -868,14 +868,13 @@ def _process_order(order_sn: str):
         raise
 def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
     """Create/get Customer dari detail order Shopee.
-    Prioritas nama: buyer_username (bukan '****') → recipient_name → buyer_user_id.
+    Selalu gunakan buyer_username asli tanpa edit (kecuali yang di-mask '****').
     Suffix unik: 4 digit terakhir phone → 4 digit terakhir buyer_user_id → 6 char dari order_sn → "0000".
     Bisa dipanggil _create_or_get_customer(order_detail) saja.
     """
     order_sn = (order_sn or order_detail.get("order_sn") or "").strip()
 
     addr = order_detail.get("recipient_address") or {}
-    recipient_name = (addr.get("name") or "").strip()
     phone = (addr.get("phone") or "").strip()
 
     # username bisa dimasking "****", maka abaikan
@@ -885,17 +884,14 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
 
     buyer_user_id = str(order_detail.get("buyer_user_id") or "").strip()
 
-    # Base name: username → recipient → buyer-id → fallback "buyer"
-    raw_name = recipient_name or (buyer_username or f"buyer-{buyer_user_id}")
-    clean_name = re.sub(r"[^A-Za-z0-9\- ]", "", raw_name)[:20]
-    if not clean_name:
+    # Base name: HANYA buyer_username (tanpa edit) → buyer-id → fallback "buyer"
+    if buyer_username:
+        # Gunakan buyer_username asli tanpa cleaning/editing
+        clean_name = buyer_username[:20]  # Hanya batasi panjang
+    elif buyer_user_id:
+        clean_name = f"buyer-{buyer_user_id}"
+    else:
         clean_name = "buyer"
-    import unicodedata
-    raw_name = recipient_name or (buyer_username or f"buyer-{buyer_user_id}")
-    clean_name = "".join(
-        c for c in raw_name
-        if unicodedata.category(c)[0] not in ("C", "Z")
-    )[:20] or "buyer"
 
     # Suffix unik
     phone_digits = re.sub(r"\D", "", phone)
@@ -907,7 +903,7 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
         sn_clean = re.sub(r"[^A-Z0-9]", "", (order_sn or "").upper())
         suffix = sn_clean[:6] if len(sn_clean) >= 6 else (sn_clean.ljust(6, "0") if sn_clean else "0000")
 
-    customer_name = f"SHP-{raw_name}-{suffix}"
+    customer_name = f"SHP-{clean_name}-{suffix}"
 
     # Sudah ada? langsung pakai
     if frappe.db.exists("Customer", {"customer_name": customer_name}):
