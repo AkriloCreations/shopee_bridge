@@ -3785,3 +3785,15 @@ def shopee_webhook():
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Exception")
         return {"success": False, "error": "server_error"}
+
+def verify_webhook_signature(raw_body: bytes, headers) -> bool:
+    s = _settings()
+    partner_key = (getattr(s, "partner_key", "") or "").encode()
+
+    sig = headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
+    if not sig or not partner_key:
+        return False
+
+    calc_hex = hmac.new(partner_key, raw_body, hashlib.sha256).hexdigest()
+    # beberapa integrasi mengirim hex-lowercase; samakan casing saja
+    return sig.lower() == calc_hex.lower()
