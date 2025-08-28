@@ -1,8 +1,8 @@
 # --- imports (lengkapi jika modulmu belum mengimpornya) ---
-import time, hmac, hashlib, requests, frappe, re  # pyright: ignore[reportMissingImports]
-from frappe.utils import get_url, flt, nowdate, cint, add_days, now, format_datetime, get_system_timezone, convert_utc_to_system_timezone, formatdate # pyright: ignore[reportMissingImports]
-from datetime import datetime, timedelta, timezone
-import json
+import hmac, hashlib, time
+import frappe # pyright: ignore[reportMissingImports]
+from frappe.utils import flt # pyright: ignore[reportMissingImports]
+from shopee_bridge.api import _get_or_create_account, _get_or_create_mode_of_payment, _date_iso_from_epoch, _insert_submit_with_retry, _safe_int, _safe_flt, _settings, _sign
 
 # --------------------------------------------
 # K O N S T A N T A
@@ -11,57 +11,16 @@ LOCK_ERRORS = (
     "deadlock", "lock wait timeout", "locked", "1213", "1205",
     "could not obtain lock", "too many connections"
 )
-def _settings():
-    return frappe.get_single("Shopee Settings")
 
-def _safe_int(v, d=0):
-    """Convert value to int with fallback default."""
-    try:
-        return int(v) if v not in (None, "") else d
-    except Exception:
-        return d
-    
-def _date_iso_from_epoch(ts: int | None) -> str:
-    """Epoch detik → 'YYYY-MM-DD' (UTC baseline, cukup untuk tanggal dokumen)."""
-    if not ts:
-        return frappe.utils.nowdate()
-    return datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+# --------------------------------------------
+# U T I L - yg SUDAH kamu punya:
+# _settings, _safe_int, _safe_flt, _date_iso_from_epoch,
+# _insert_submit_with_retry, _sign, dll — dianggap tersedia.
+# --------------------------------------------
 
-def _safe_flt(v, d=0.0):
-    """Convert value to float with fallback default."""
-    try:
-        return float(v) if v not in (None, "") else d
-    except Exception:
-        return d
-
-def _get_or_create_account(account_name, account_type):
-    """Get or create account."""
-    """Get or create account."""
-    if frappe.db.exists("Account", {"account_name": account_name}):
-        return account_name
-    
-    try:
-        company = frappe.db.get_single_value("Global Defaults", "default_company")
-        
-        account = frappe.new_doc("Account")
-        account.account_name = account_name
-        account.account_type = account_type
-        account.company = company
-        
-        # Set parent account based on type
-        if account_type == "Bank":
-            account.parent_account = "Bank Accounts - " + frappe.db.get_value("Company", company, "abbr")
-        elif account_type == "Expense Account":
-            account.parent_account = "Expenses - " + frappe.db.get_value("Company", company, "abbr")
-        
-        account.insert(ignore_permissions=True)
-        return account_name
-    except Exception as e:
-        frappe.log_error(f"Failed to create account {account_name}: {str(e)}", "Shopee Account Creation")
-        # Return a default account
-        return frappe.db.get_single_value("Accounts Settings", "default_cash_account")
-
-    
+# -------------------------------------------------------------
+# 1) Create Payment Entry dari escrow Shopee (NET + deductions)
+# -------------------------------------------------------------
 def create_payment_entry_from_shopee(
     si_name: str,
     escrow: dict,
@@ -201,21 +160,6 @@ def _verify_webhook_signature(raw_body: bytes) -> bool:
     calc = hmac.new(partner_key.encode(), raw_body, hashlib.sha256).hexdigest()
     return sig.lower() == calc.lower()
 
-def _get_or_create_mode_of_payment(mode_name):
-    """Get or create mode of payment."""
-    if frappe.db.exists("Mode of Payment", mode_name):
-        return mode_name
-    
-    try:
-        mode = frappe.new_doc("Mode of Payment")
-        mode.mode_of_payment = mode_name
-        mode.type = "Electronic"
-        mode.insert(ignore_permissions=True)
-        return mode_name
-    except Exception as e:
-        frappe.log_error(f"Failed to create mode of payment {mode_name}: {str(e)}", "Shopee Mode of Payment Creation")
-        return "Cash"  # Fallback to default
-
 
 def _find_si_by_order_sn(order_sn: str) -> str | None:
     # sesuaikan field link order_sn milikmu
@@ -274,29 +218,3 @@ def shopee_webhook():
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Exception")
         return {"success": False, "error": "server_error"}
-
-def _insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0):
-    """
-    Insert + submit dengan retry saat kena lock/deadlock.
-    Gunakan utk SO/DN/SI.
-    """
-    last_err = None
-    for i in range(max_tries):
-        try:
-            doc.insert(ignore_permissions=True)
-            # commit kecil setelah insert agar kunci cepat lepas
-            frappe.db.commit()
-            doc.submit()
-            frappe.db.commit()
-            return doc
-        except Exception as e:
-            msg = str(e)
-            last_err = e
-            if any(k.lower() in msg.lower() for k in LOCK_ERRORS):
-                frappe.db.rollback()
-                time.sleep(sleep_base * (i + 1))  # backoff
-                continue
-            # error lain: lempar
-            raise
-    # kalau mentok retry, lempar error terakhir
-    raise last_err
