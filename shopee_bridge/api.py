@@ -3656,99 +3656,105 @@ def create_payment_entry_from_shopee(
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee PE Creation Error")
         raise
-
 def verify_webhook_signature(raw_body: bytes, headers) -> bool:
     """
-    Verifikasi Shopee Push/Test:
-      - Header: X-Shopee-Signature atau Authorization
+    Shopee Push/Test signature verification:
+      - Header: X-Shopee-Signature atau Authorization: sha256=<sig>
       - Format: hex / base64 / base64url (dengan & tanpa padding)
-      - Raw body: apa adanya; fallback coba rstrip CR/LF
+      - Body: raw apa adanya; fallback rstrip CR/LF
+      - Coba LIVE key dulu, lalu TEST key (kalau ada)
     """
     s = _settings()
-    webhook_key = (getattr(s, "webhook_key", "") or "").strip()
-    if not webhook_key:
-        frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
-        return False
-
-    incoming_sig_raw = (
+    live_key = (getattr(s, "webhook_key", "") or "").strip()
+    test_key = (getattr(s, "webhook_test_key", "") or "").strip()
+    
+    inc = (
         headers.get("X-Shopee-Signature")
         or headers.get("x-shopee-signature")
         or headers.get("Authorization")
         or headers.get("authorization")
         or ""
-    )
-    incoming_sig = (incoming_sig_raw or "").strip()
-    if not incoming_sig:
+    ).strip()
+    
+    if not inc:
         frappe.log_error("No signature header present", "Shopee Webhook")
         return False
-
-    low = incoming_sig.lower()
+    
+    low = inc.lower()
     if low.startswith(("sha256=", "hmac=", "signature=")):
-        incoming_sig = incoming_sig.split("=", 1)[1].strip()
+        inc = inc.split("=", 1)[1].strip()
     elif low.startswith(("sha256 ", "hmac ", "signature ")):
-        incoming_sig = incoming_sig.split(" ", 1)[1].strip()
+        inc = inc.split(" ", 1)[1].strip()
 
-    key = webhook_key.encode("utf-8")
-
-    def _digest(rb: bytes) -> bytes:
-        return hmac.new(key, rb, hashlib.sha256).digest()
-
-    def _match(dbytes: bytes) -> bool:
-        calc_hex = dbytes.hex()
-        calc_b64 = base64.b64encode(dbytes).decode("ascii").strip()
-        calc_b64u = base64.urlsafe_b64encode(dbytes).decode("ascii").strip()
-
-        # 1) hex
-        if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
+    def match_with_digest(sig: str, dbytes: bytes) -> bool:
+        # hex
+        if hmac.compare_digest(sig.lower(), dbytes.hex().lower()):
             return True
-
-        # 2) base64 standar (dengan padding)
-        if _b64eq(incoming_sig, calc_b64):
+        # base64 (dengan & tanpa padding)
+        b64 = base64.b64encode(dbytes).decode().strip()
+        if hmac.compare_digest(sig, b64) or hmac.compare_digest(sig.rstrip("="), b64.rstrip("=")):
             return True
-        # 2b) base64 standar tanpa '='
-        if _b64eq(incoming_sig.rstrip("="), calc_b64.rstrip("=")):
+        # base64url (dengan & tanpa padding)
+        b64u = base64.urlsafe_b64encode(dbytes).decode().strip()
+        if hmac.compare_digest(sig, b64u) or hmac.compare_digest(sig.rstrip("="), b64u.rstrip("=")):
             return True
-
-        # 3) base64url (dengan padding)
-        if _b64eq(incoming_sig, calc_b64u):
-            return True
-        # 3b) base64url tanpa '='
-        if _b64eq(incoming_sig.rstrip("="), calc_b64u.rstrip("=")):
-            return True
-
         return False
 
-    # A) raw apa adanya
-    d = _digest(raw_body)
-    if _match(d):
+    def try_key(key: str, label: str) -> bool:
+        if not key:
+            return False
+        kb = key.encode("utf-8")
+        # A) raw apa adanya
+        d = hmac.new(kb, raw_body, hashlib.sha256).digest()
+        if match_with_digest(inc, d):
+            frappe.logger().info({"ShopeeWebhook": f"signature matched ({label})"})
+            return True
+        # B) fallback: strip CR/LF di akhir
+        if raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n"):
+            d2 = hmac.new(kb, raw_body.rstrip(b"\r\n"), hashlib.sha256).digest()
+            if match_with_digest(inc, d2):
+                frappe.logger().info({"ShopeeWebhook": f"signature matched ({label}, stripped CR/LF)"})
+                return True
+        return False
+
+    # 1) Coba LIVE key
+    if try_key(live_key, "LIVE"):
+        return True
+    
+    # 2) Coba TEST key
+    if try_key(test_key, "TEST"):
         return True
 
-    # B) coba rstrip newline/CRLF (kasus test console kadang append)
-    if raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n"):
-        d2 = _digest(raw_body.rstrip(b"\r\n"))
-        if _match(d2):
-            return True
-
-    # DEBUG AMAN (prefix & panjang saja)
+    # Debug ringan (prefix saja biar aman)
     try:
-        calc_hex = d.hex(); calc_b64 = base64.b64encode(d).decode("ascii"); calc_b64u = base64.urlsafe_b64encode(d).decode("ascii")
+        def _pref(key):
+            if not key: 
+                return None
+            kb = key.encode("utf-8")
+            d = hmac.new(kb, raw_body, hashlib.sha256).digest()
+            return {
+                "hex": d.hex()[:16],
+                "b64": base64.b64encode(d).decode().strip()[:16],
+                "b64u": base64.urlsafe_b64encode(d).decode().strip().rstrip("=")[:16],
+            }
+        
         frappe.logger().info({
             "ShopeeWebhookSigDebug": {
                 "header_used": ("X-Shopee-Signature" if headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
                                 else ("Authorization" if headers.get("Authorization") or headers.get("authorization") else "unknown")),
-                "incoming_len": len(incoming_sig),
-                "incoming_prefix": incoming_sig[:16],
+                "incoming_len": len(inc),
+                "incoming_prefix": inc[:16],
                 "raw_len": len(raw_body),
-                "calc_hex_prefix": calc_hex[:16],
-                "calc_b64_prefix": calc_b64[:16],
-                "calc_b64u_prefix": calc_b64u[:16],
+                "calc_live_prefix": _pref(live_key),
+                "calc_test_prefix": _pref(test_key),
                 "tried_strip_newline": (raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n")),
             }
         })
     except Exception:
         pass
-
+    
     return False
+
 def _find_si_by_order_sn(order_sn: str) -> str | None:
     # sesuaikan field link order_sn milikmu
     return frappe.db.get_value(
