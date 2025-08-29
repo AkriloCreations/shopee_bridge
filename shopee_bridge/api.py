@@ -3657,26 +3657,37 @@ def create_payment_entry_from_shopee(
 # -------------------------------------------------------------
 # 2) Webhook endpoint (pakai helper _settings dan _sign)
 # -------------------------------------------------------------
-def _verify_webhook_signature(raw_body: bytes) -> bool:
+def verify_webhook_signature(raw_body: bytes, headers) -> bool:
     """
-    Verifikasi sederhana: sebagian webhook Shopee menandatangani raw body
-    dengan HMAC-SHA256(partner_key). Jika versimu butuh base string lain,
-    cukup ganti implementasi ini — _sign() sudah kamu sediakan.
+    Verify Shopee webhook signature using HMAC-SHA256
     """
     s = _settings()
-    partner_key = (getattr(s, "partner_key", None) or "").strip()
-    if not partner_key:
+    webhook_key = (getattr(s, "webhook_key", "") or "").strip()
+    
+    if not webhook_key:
+        frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
         return False
 
-    # ambil signature dari header umum
-    headers = {k: v for k, v in (frappe.request.headers or {}).items()}
-    sig = headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature") \
-          or headers.get("Authorization") or headers.get("authorization")
-    if not sig:
+    # Get signature from headers
+    incoming_sig = (
+        headers.get("X-Shopee-Signature")
+        or headers.get("x-shopee-signature")
+        or ""
+    ).strip()
+    
+    if not incoming_sig:
+        frappe.log_error("No signature found in headers", "Shopee Webhook")
         return False
 
-    calc = hmac.new(partner_key.encode(), raw_body, hashlib.sha256).hexdigest()
-    return sig.lower() == calc.lower()
+    # Calculate expected signature
+    calculated_sig = hmac.new(
+        webhook_key.encode('utf-8'), 
+        raw_body, 
+        hashlib.sha256
+    ).hexdigest()
+    
+    # Compare signatures (case-insensitive)
+    return hmac.compare_digest(incoming_sig.lower(), calculated_sig.lower())
 
 
 def _find_si_by_order_sn(order_sn: str) -> str | None:
@@ -3701,7 +3712,7 @@ def shopee_webhook():
         event = (data.get("event") or "").strip()
 
         # (opsional tapi dianjurkan) validasi signature
-        if not _verify_webhook_signature(raw):
+        if not verify_webhook_signature(raw):
             frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
             return {"success": False, "error": "invalid_signature"}
 
@@ -3750,7 +3761,7 @@ def shopee_webhook():
         event = (data.get("event") or "").strip()
 
         # (opsional tapi dianjurkan) validasi signature
-        if not _verify_webhook_signature(raw):
+        if not verify_webhook_signature(raw):
             frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
             return {"success": False, "error": "invalid_signature"}
 
@@ -3785,20 +3796,6 @@ def shopee_webhook():
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Exception")
         return {"success": False, "error": "server_error"}
-
-def verify_webhook_signature(raw_body: bytes, headers):
-    s = _settings()
-    webhook_key = (getattr(s, "webhook_sign_key", "") or "").encode("utf-8")
-
-    if not webhook_key:
-        frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
-        return False
-
-    incoming_sig = (
-        headers.get("X-Shopee-Signature")
-        or headers.get("x-shopee-signature")
-        or ""
-    )
 
     calc_hex = hmac.new(webhook_key, raw_body, hashlib.sha256).hexdigest()
     return incoming_sig.lower() == calc_hex.lower()
