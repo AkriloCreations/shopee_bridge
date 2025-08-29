@@ -3699,37 +3699,49 @@ def _find_si_by_order_sn(order_sn: str) -> str | None:
     )
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def shopee_webhook():
     """
-    Set di Shopee Partner Console:
+    Endpoint untuk Shopee Partner Console:
     https://<domain>/api/method/shopee_bridge.api.shopee_webhook
-    Menangani: order_status_update, payment_update/escrow_settled.
+
+    Menangani: order_status_update, payment_update/escrow_settled/payout
     """
     try:
-        raw = frappe.request.data or b""
-        headers = dict(frappe.request.headers)
-        
-        # Fix the data parsing
-        if raw:
-            data = frappe.parse_json(raw.decode('utf-8'))
-        else:
-            data = frappe.local.form_dict or {}
-        
-        # Log the incoming data
-        frappe.logger().info(f"[Shopee Webhook] Raw data: {raw.decode('utf-8') if raw else 'No raw data'}")
-        frappe.logger().info(f"[Shopee Webhook] Headers: {headers}")
-        frappe.logger().info(f"[Shopee Webhook] Parsed data: {data}")
-        
-        event = (data.get("event") or "").strip()
+        # 1) Ambil raw bytes persis dari request
+        raw = frappe.request.get_data(as_text=False) or b""
 
-        # Fix signature verification - pass both parameters
-        if not verify_webhook_signature(raw):
+        # 2) Ambil headers (case-insensitive mapping)
+        headers = dict(frappe.request.headers or {})
+
+        # 3) Verifikasi signature SEBELUM parsing body
+        if not verify_webhook_signature(raw, headers):
             frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
+            frappe.local.response.http_status_code = 403
             return {"success": False, "error": "invalid_signature"}
 
+        # 4) Setelah lolos verifikasi, log dan parse JSON
+        raw_str = ""
+        try:
+            raw_str = raw.decode("utf-8", errors="replace")
+        except Exception:
+            # biarkan kosong jika gagal decode (tetap aman karena sudah diverifikasi)
+            pass
+
+        frappe.logger().info(f"[Shopee Webhook] Raw data: {raw_str or 'No/undecodable raw'}")
+        frappe.logger().info(f"[Shopee Webhook] Headers: {headers}")
+
+        # Prefer JSON resmi dari request bila tersedia
+        data = frappe.request.get_json(silent=True) or {}
+        if not data and raw_str:
+            # fallback: coba parse manual kalau get_json() silent
+            data = frappe.parse_json(raw_str) or {}
+
+        frappe.logger().info(f"[Shopee Webhook] Parsed data: {data}")
+
+        event = (data.get("event") or "").strip()
+
         if event == "order_status_update":
-            # taruh logika update SO/DN jika diperlukan
             frappe.logger().info(f"[Shopee] order_status_update: {data.get('order_sn')}")
 
         elif event in ("payment_update", "escrow_settled", "payout"):
@@ -3742,23 +3754,25 @@ def shopee_webhook():
             net = _safe_flt(data.get("escrow_amount") or data.get("payout_amount"))
             posting_ts = _safe_int(data.get("payout_time") or data.get("update_time"))
 
-            # bikin Payment Entry (enqueue biar non-blocking)
             create_payment_entry_from_shopee(
                 si_name=si_name,
                 escrow=data,
                 net_amount=net,
                 order_sn=order_sn,
                 posting_ts=posting_ts,
-                enqueue=True
+                enqueue=True,
             )
 
         else:
             frappe.logger().info(f"[Shopee] unhandled event: {event}")
 
         return {"success": True}
+
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Exception")
+        frappe.local.response.http_status_code = 500
         return {"success": False, "error": "server_error"}
+
     
 @frappe.whitelist(allow_guest=True)
 def test_webhook_verification():
