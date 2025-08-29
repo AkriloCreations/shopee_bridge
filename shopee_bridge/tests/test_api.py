@@ -3,32 +3,60 @@ import frappe # pyright: ignore[reportMissingImports]
 import json
 import hmac
 import hashlib
-from shopee_bridge.api import _settings
 
 class TestWebhookSignature(unittest.TestCase):
     def setUp(self):
         frappe.set_user("Administrator")
     
     def test_valid_signature(self):
-        from shopee_bridge.api import verify_webhook_signature
+        from shopee_bridge.api import verify_webhook_signature, _settings
         
-        # Test implementation here
-        pass
+        # Get actual webhook key
+        s = _settings()
+        webhook_key = getattr(s, "webhook_key", "")
+        
+        if not webhook_key:
+            self.skipTest("Webhook key not configured")
+        
+        # Create test data
+        test_data = {"order_id": "12345", "status": "completed"}
+        raw_body = json.dumps(test_data).encode('utf-8')
+        
+        # Calculate correct signature
+        correct_sig = hmac.new(
+            webhook_key.encode('utf-8'),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Test with correct signature
+        headers = {"X-Shopee-Signature": correct_sig}
+        result = verify_webhook_signature(raw_body, headers)
+        
+        self.assertTrue(result)
     
     def test_invalid_signature(self):
         from shopee_bridge.api import verify_webhook_signature
         
-        # Test implementation here  
-        pass
-
-def verify_webhook_signature(raw_body: bytes, headers) -> bool:
-    print(f"DEBUG: Raw body length: {len(raw_body)}")
-    print(f"DEBUG: Headers: {headers}")
+        test_data = {"order_id": "12345", "status": "completed"}
+        raw_body = json.dumps(test_data).encode('utf-8')
+        
+        # Test with wrong signature
+        headers = {"X-Shopee-Signature": "wrong_signature"}
+        result = verify_webhook_signature(raw_body, headers)
+        
+        self.assertFalse(result)
     
-    s = _settings()
-    webhook_key = (getattr(s, "webhook_key", "") or "").strip()
-    print(f"DEBUG: Webhook key configured: {bool(webhook_key)}")
-    
-    # ... rest of function
+    def test_missing_signature(self):
+        from shopee_bridge.api import verify_webhook_signature
+        
+        test_data = {"order_id": "12345", "status": "completed"}
+        raw_body = json.dumps(test_data).encode('utf-8')
+        
+        # Test with no signature
+        headers = {}
+        result = verify_webhook_signature(raw_body, headers)
+        
+        self.assertFalse(result)
 
-# Run with: bench --site sitename run-tests shopee_bridge.tests.test_api
+# Don't redefine the function here - it should be in api.py
