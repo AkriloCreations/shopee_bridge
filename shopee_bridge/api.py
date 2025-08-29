@@ -3941,3 +3941,78 @@ def _sig_probe():
             "b64u_prefix": calc_b64u2,
         }
     }
+
+def _hmac_sha256(key: str, raw: bytes) -> bytes:
+    return hmac.new((key or "").encode("utf-8"), raw, hashlib.sha256).digest()
+
+def _normalize_incoming_sig(sig: str) -> str:
+    if not sig:
+        return ""
+    s = sig.strip()
+    low = s.lower()
+    if low.startswith(("sha256=", "hmac=", "signature=")):
+        return s.split("=", 1)[1].strip()
+    if low.startswith(("sha256 ", "hmac ", "signature ")):
+        return s.split(" ", 1)[1].strip()
+    return s
+
+def _verify_with_formats(incoming: str, digest: bytes) -> dict:
+    """Cek ke 4 format umum: hex, b64(+no-pad), b64url(+no-pad)."""
+    calc_hex   = digest.hex()
+    calc_b64   = base64.b64encode(digest).decode().strip()
+    calc_b64np = calc_b64.rstrip("=")
+    calc_b64u  = base64.urlsafe_b64encode(digest).decode().strip()
+    calc_b64unp= calc_b64u.rstrip("=")
+
+    res = {
+        "match_hex":      hmac.compare_digest(incoming.lower(), calc_hex.lower()),
+        "match_b64":      hmac.compare_digest(incoming, calc_b64),
+        "match_b64_nopad":hmac.compare_digest(incoming, calc_b64np),
+        "match_b64url":   hmac.compare_digest(incoming, calc_b64u),
+        "match_b64url_nopad": hmac.compare_digest(incoming, calc_b64unp),
+        "calc_preview": {
+            "hex_prefix":   calc_hex[:16],
+            "b64_prefix":   calc_b64[:16],
+            "b64u_prefix":  calc_b64u[:16],
+        }
+    }
+    res["matched"] = any([res["match_hex"], res["match_b64"], res["match_b64_nopad"],
+                          res["match_b64url"], res["match_b64url_nopad"]])
+    return res
+
+@frappe.whitelist(allow_guest=False, methods=["POST"])
+def test_webhook_key(body: str, signature: str, header: str="X-Shopee-Signature", key_type: str="test"):
+    """
+    Uji kecocokan signature HMAC-SHA256 di server (tanpa keluar).
+    - body: string JSON mentah (persis seperti dikirim Shopee)
+    - signature: nilai dari header (boleh hex/b64/b64url, dengan/ tanpa prefix 'sha256=')
+    - header: nama header yang kamu pakai (hanya untuk echo/log)
+    - key_type: 'test' -> Shopee Settings.webhook_test_key, 'live' -> webhook_key
+    Return: hasil match per format + preview kalkulasi.
+    """
+    s = frappe.get_single("Shopee Settings")
+    key = (s.webhook_test_key if key_type == "test" else s.webhook_key) or ""
+    if not key:
+        frappe.throw(f"{'Test Push' if key_type=='test' else 'Live Push'} Partner Key belum diisi di Shopee Settings")
+
+    raw = body.encode("utf-8", errors="strict")
+    inc = _normalize_incoming_sig(signature)
+
+    # A) raw apa adanya
+    d = _hmac_sha256(key, raw)
+    r1 = _verify_with_formats(inc, d)
+
+    # B) coba rstrip CR/LF (untuk anomali test console)
+    r2 = {}
+    if raw.endswith(b"\n") or raw.endswith(b"\r\n"):
+        d2 = _hmac_sha256(key, raw.rstrip(b"\r\n"))
+        r2 = _verify_with_formats(inc, d2)
+
+    return {
+        "header_used": header,
+        "key_type": key_type,
+        "incoming_len": len(inc),
+        "raw_len": len(raw),
+        "result_raw": r1,
+        "result_stripped": r2,
+    }
