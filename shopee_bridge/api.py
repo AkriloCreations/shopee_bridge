@@ -3776,7 +3776,7 @@ def _find_si_by_order_sn(order_sn: str) -> str | None:
         "name"
     )
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=False)
 def shopee_webhook():
     """
     Set di Shopee Partner Console:
