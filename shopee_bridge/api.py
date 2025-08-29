@@ -22,6 +22,10 @@ def _base():
         return "https://partner.shopeemobile.com"
     return "https://partner.test-stable.shopeemobile.com"
 
+def _b64eq(a: str, b: str) -> bool:
+    # perbandingan konstan
+    return hmac.compare_digest(a, b)
+
 def _safe_int(v, d=0):
     """Convert value to int with fallback default."""
     try:
@@ -3652,12 +3656,13 @@ def create_payment_entry_from_shopee(
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee PE Creation Error")
         raise
+
 def verify_webhook_signature(raw_body: bytes, headers) -> bool:
     """
-    Verifikasi signature Shopee Push (TEST or LIVE).
-    - Header: X-Shopee-Signature atau Authorization
-    - Format: base64 (umum) atau hex
-    - Coba HMAC atas raw body apa adanya & varian strip newline (kasus test console)
+    Verifikasi Shopee Push/Test:
+      - Header: X-Shopee-Signature atau Authorization
+      - Format: hex / base64 / base64url (dengan & tanpa padding)
+      - Raw body: apa adanya; fallback coba rstrip CR/LF
     """
     s = _settings()
     webhook_key = (getattr(s, "webhook_key", "") or "").strip()
@@ -3665,7 +3670,6 @@ def verify_webhook_signature(raw_body: bytes, headers) -> bool:
         frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
         return False
 
-    # --- ambil signature dari beberapa kemungkinan header ---
     incoming_sig_raw = (
         headers.get("X-Shopee-Signature")
         or headers.get("x-shopee-signature")
@@ -3678,53 +3682,66 @@ def verify_webhook_signature(raw_body: bytes, headers) -> bool:
         frappe.log_error("No signature header present", "Shopee Webhook")
         return False
 
-    # --- normalisasi Authorization: "sha256=<sig>" / "hmac <sig>" / "signature=<sig>" ---
     low = incoming_sig.lower()
     if low.startswith(("sha256=", "hmac=", "signature=")):
         incoming_sig = incoming_sig.split("=", 1)[1].strip()
     elif low.startswith(("sha256 ", "hmac ", "signature ")):
         incoming_sig = incoming_sig.split(" ", 1)[1].strip()
 
-    # Helper untuk cek 2 format (hex / base64)
-    def _match(digest_bytes: bytes) -> bool:
-        calc_hex = digest_bytes.hex()
-        calc_b64 = base64.b64encode(digest_bytes).decode("ascii").strip()
-        # cocokkan sebagai hex
-        if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
-            return True
-        # cocokkan sebagai base64
-        if hmac.compare_digest(incoming_sig, calc_b64):
-            return True
-        return False
-
     key = webhook_key.encode("utf-8")
 
-    # 1) HMAC atas raw body apa adanya
-    mac = hmac.new(key, raw_body, hashlib.sha256).digest()
-    if _match(mac):
-        return True
+    def _digest(rb: bytes) -> bytes:
+        return hmac.new(key, rb, hashlib.sha256).digest()
 
-    # 2) Coba varian tanpa newline di akhir (mengatasi test console yang kadang append '\n' / '\r\n')
-    if raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n"):
-        rb = raw_body.rstrip(b"\r\n")
-        mac2 = hmac.new(key, rb, hashlib.sha256).digest()
-        if _match(mac2):
+    def _match(dbytes: bytes) -> bool:
+        calc_hex = dbytes.hex()
+        calc_b64 = base64.b64encode(dbytes).decode("ascii").strip()
+        calc_b64u = base64.urlsafe_b64encode(dbytes).decode("ascii").strip()
+
+        # 1) hex
+        if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
             return True
 
-    # --- DEBUG aman (tanpa bocorkan nilai lengkap) ---
+        # 2) base64 standar (dengan padding)
+        if _b64eq(incoming_sig, calc_b64):
+            return True
+        # 2b) base64 standar tanpa '='
+        if _b64eq(incoming_sig.rstrip("="), calc_b64.rstrip("=")):
+            return True
+
+        # 3) base64url (dengan padding)
+        if _b64eq(incoming_sig, calc_b64u):
+            return True
+        # 3b) base64url tanpa '='
+        if _b64eq(incoming_sig.rstrip("="), calc_b64u.rstrip("=")):
+            return True
+
+        return False
+
+    # A) raw apa adanya
+    d = _digest(raw_body)
+    if _match(d):
+        return True
+
+    # B) coba rstrip newline/CRLF (kasus test console kadang append)
+    if raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n"):
+        d2 = _digest(raw_body.rstrip(b"\r\n"))
+        if _match(d2):
+            return True
+
+    # DEBUG AMAN (prefix & panjang saja)
     try:
-        calc_hex_prefix = mac.hex()[:16]
-        calc_b64_prefix = base64.b64encode(mac).decode("ascii").strip()[:16]
+        calc_hex = d.hex(); calc_b64 = base64.b64encode(d).decode("ascii"); calc_b64u = base64.urlsafe_b64encode(d).decode("ascii")
         frappe.logger().info({
             "ShopeeWebhookSigDebug": {
                 "header_used": ("X-Shopee-Signature" if headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
                                 else ("Authorization" if headers.get("Authorization") or headers.get("authorization") else "unknown")),
-                "content_type": headers.get("Content-Type") or headers.get("content-type"),
                 "incoming_len": len(incoming_sig),
                 "incoming_prefix": incoming_sig[:16],
                 "raw_len": len(raw_body),
-                "calc_hex_prefix": calc_hex_prefix,
-                "calc_b64_prefix": calc_b64_prefix,
+                "calc_hex_prefix": calc_hex[:16],
+                "calc_b64_prefix": calc_b64[:16],
+                "calc_b64u_prefix": calc_b64u[:16],
                 "tried_strip_newline": (raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n")),
             }
         })
@@ -3732,7 +3749,6 @@ def verify_webhook_signature(raw_body: bytes, headers) -> bool:
         pass
 
     return False
-
 def _find_si_by_order_sn(order_sn: str) -> str | None:
     # sesuaikan field link order_sn milikmu
     return frappe.db.get_value(
@@ -3867,3 +3883,61 @@ def test_shopee_webhook_with_signature():
         return {"test_payload": test_payload, "signature": signature}
     else:
         return {"error": "No webhook key configured"}
+
+def _sig_probe():
+    """
+    PROBE sementara untuk debug signature.
+    BALIKIN info aman (prefix/panjang), tidak bocorin key/sig full.
+    Hapus/disable setelah beres.
+    """
+    raw = frappe.request.get_data(as_text=False) or b""
+    headers = dict(frappe.request.headers or {})
+
+    # ambil incoming signature mentah
+    incoming_sig_raw = (
+        headers.get("X-Shopee-Signature")
+        or headers.get("x-shopee-signature")
+        or headers.get("Authorization")
+        or headers.get("authorization")
+        or ""
+    ) or ""
+    incoming_sig = incoming_sig_raw.strip()
+    low = incoming_sig.lower()
+    if low.startswith(("sha256=", "hmac=", "signature=")):
+        incoming_sig = incoming_sig.split("=", 1)[1].strip()
+    elif low.startswith(("sha256 ", "hmac ", "signature ")):
+        incoming_sig = incoming_sig.split(" ", 1)[1].strip()
+
+    # hitung kalkulasi lokal
+    s = _settings()
+    key = (getattr(s, "webhook_key", "") or "").strip().encode("utf-8")
+    mac = hmac.new(key, raw, hashlib.sha256).digest()
+    calc_hex = mac.hex()
+    calc_b64 = base64.b64encode(mac).decode("ascii").strip()
+    calc_b64u = base64.urlsafe_b64encode(mac).decode("ascii").strip()
+
+    # juga coba varian rstrip
+    mac2 = hmac.new(key, raw.rstrip(b"\r\n"), hashlib.sha256).digest() if (raw.endswith(b"\n") or raw.endswith(b"\r\n")) else None
+    calc_hex2 = mac2.hex()[:16] if mac2 else None
+    calc_b642 = (base64.b64encode(mac2).decode("ascii").strip()[:16]) if mac2 else None
+    calc_b64u2 = (base64.urlsafe_b64encode(mac2).decode("ascii").strip()[:16]) if mac2 else None
+
+    return {
+        "incoming": {
+            "header_used": ("X-Shopee-Signature" if headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
+                            else ("Authorization" if headers.get("Authorization") or headers.get("authorization") else "unknown")),
+            "len": len(incoming_sig),
+            "prefix": incoming_sig[:16],
+        },
+        "raw_len": len(raw),
+        "calc": {
+            "hex_prefix": calc_hex[:16],
+            "b64_prefix": calc_b64[:16],
+            "b64u_prefix": calc_b64u[:16],
+        },
+        "calc_stripped_if_any": {
+            "hex_prefix": calc_hex2,
+            "b64_prefix": calc_b642,
+            "b64u_prefix": calc_b64u2,
+        }
+    }
