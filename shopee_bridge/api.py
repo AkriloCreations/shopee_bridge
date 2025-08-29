@@ -1,4 +1,4 @@
-import time, hmac, hashlib, requests, frappe, re  # pyright: ignore[reportMissingImports]
+import time, hmac, hashlib, requests, frappe, re, base64  # pyright: ignore[reportMissingImports]
 from frappe.utils import get_url, flt, nowdate, cint, add_days, now, format_datetime, get_system_timezone, convert_utc_to_system_timezone, formatdate # pyright: ignore[reportMissingImports]
 from datetime import datetime, timedelta, timezone
 import json
@@ -3652,27 +3652,20 @@ def create_payment_entry_from_shopee(
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee PE Creation Error")
         raise
-
-
-# -------------------------------------------------------------
-# 2) Webhook endpoint (pakai helper _settings dan _sign)
-# -------------------------------------------------------------
 def verify_webhook_signature(raw_body: bytes, headers) -> bool:
     """
-    Verifikasi signature Shopee Push/Webhook.
-    Support:
-      - X-Shopee-Signature atau Authorization
-      - Format hex atau base64
-      - Prefix: "sha256=<sig>", "hmac <sig>", dll.
+    Verifikasi signature Shopee Push (TEST or LIVE).
+    - Header: X-Shopee-Signature atau Authorization
+    - Format: base64 (umum) atau hex
+    - Coba HMAC atas raw body apa adanya & varian strip newline (kasus test console)
     """
     s = _settings()
     webhook_key = (getattr(s, "webhook_key", "") or "").strip()
-
     if not webhook_key:
         frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
         return False
 
-    # Ambil signature dari berbagai kemungkinan header
+    # --- ambil signature dari beberapa kemungkinan header ---
     incoming_sig_raw = (
         headers.get("X-Shopee-Signature")
         or headers.get("x-shopee-signature")
@@ -3681,51 +3674,64 @@ def verify_webhook_signature(raw_body: bytes, headers) -> bool:
         or ""
     )
     incoming_sig = (incoming_sig_raw or "").strip()
-
     if not incoming_sig:
         frappe.log_error("No signature header present", "Shopee Webhook")
         return False
 
-    # Normalisasi header Authorization yang punya prefix
+    # --- normalisasi Authorization: "sha256=<sig>" / "hmac <sig>" / "signature=<sig>" ---
     low = incoming_sig.lower()
     if low.startswith(("sha256=", "hmac=", "signature=")):
         incoming_sig = incoming_sig.split("=", 1)[1].strip()
     elif low.startswith(("sha256 ", "hmac ", "signature ")):
         incoming_sig = incoming_sig.split(" ", 1)[1].strip()
 
-    # Hitung HMAC dari RAW body
-    mac = hmac.new(webhook_key.encode("utf-8"), raw_body, hashlib.sha256)
-    calc_hex = mac.hexdigest()
-    calc_b64 = base64.b64encode(mac.digest()).decode("ascii").strip()
+    # Helper untuk cek 2 format (hex / base64)
+    def _match(digest_bytes: bytes) -> bool:
+        calc_hex = digest_bytes.hex()
+        calc_b64 = base64.b64encode(digest_bytes).decode("ascii").strip()
+        # cocokkan sebagai hex
+        if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
+            return True
+        # cocokkan sebagai base64
+        if hmac.compare_digest(incoming_sig, calc_b64):
+            return True
+        return False
 
-    # Cek sebagai hex
-    if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
-        return True
-    # Cek sebagai base64
-    if hmac.compare_digest(incoming_sig, calc_b64):
+    key = webhook_key.encode("utf-8")
+
+    # 1) HMAC atas raw body apa adanya
+    mac = hmac.new(key, raw_body, hashlib.sha256).digest()
+    if _match(mac):
         return True
 
-    # ---------- DEBUG LOG (ringan & aman) ----------
+    # 2) Coba varian tanpa newline di akhir (mengatasi test console yang kadang append '\n' / '\r\n')
+    if raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n"):
+        rb = raw_body.rstrip(b"\r\n")
+        mac2 = hmac.new(key, rb, hashlib.sha256).digest()
+        if _match(mac2):
+            return True
+
+    # --- DEBUG aman (tanpa bocorkan nilai lengkap) ---
     try:
-        # Jangan log full signature (hanya prefix)
-        dbg = {
-            "header_used": ("X-Shopee-Signature" if headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
-                            else ("Authorization" if headers.get("Authorization") or headers.get("authorization") else "unknown")),
-            "incoming_len": len(incoming_sig),
-            "incoming_prefix": incoming_sig[:16],
-            "calc_hex_len": len(calc_hex),
-            "calc_hex_prefix": calc_hex[:16],
-            "calc_b64_len": len(calc_b64),
-            "calc_b64_prefix": calc_b64[:16],
-            "raw_len": len(raw_body),
-        }
-        frappe.logger().info({"ShopeeWebhookSigDebug": dbg})
+        calc_hex_prefix = mac.hex()[:16]
+        calc_b64_prefix = base64.b64encode(mac).decode("ascii").strip()[:16]
+        frappe.logger().info({
+            "ShopeeWebhookSigDebug": {
+                "header_used": ("X-Shopee-Signature" if headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
+                                else ("Authorization" if headers.get("Authorization") or headers.get("authorization") else "unknown")),
+                "content_type": headers.get("Content-Type") or headers.get("content-type"),
+                "incoming_len": len(incoming_sig),
+                "incoming_prefix": incoming_sig[:16],
+                "raw_len": len(raw_body),
+                "calc_hex_prefix": calc_hex_prefix,
+                "calc_b64_prefix": calc_b64_prefix,
+                "tried_strip_newline": (raw_body.endswith(b"\n") or raw_body.endswith(b"\r\n")),
+            }
+        })
     except Exception:
         pass
-    # ---------- END DEBUG LOG ----------
 
     return False
-
 
 def _find_si_by_order_sn(order_sn: str) -> str | None:
     # sesuaikan field link order_sn milikmu
