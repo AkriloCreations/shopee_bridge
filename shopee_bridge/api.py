@@ -3658,58 +3658,73 @@ def create_payment_entry_from_shopee(
 # 2) Webhook endpoint (pakai helper _settings dan _sign)
 # -------------------------------------------------------------
 def verify_webhook_signature(raw_body: bytes, headers) -> bool:
-    import base64, hmac, hashlib
-
+    """
+    Verifikasi signature Shopee Push/Webhook.
+    Support:
+      - X-Shopee-Signature atau Authorization
+      - Format hex atau base64
+      - Prefix: "sha256=<sig>", "hmac <sig>", dll.
+    """
     s = _settings()
     webhook_key = (getattr(s, "webhook_key", "") or "").strip()
+
     if not webhook_key:
         frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
         return False
 
     # Ambil signature dari berbagai kemungkinan header
-    incoming_sig = (
+    incoming_sig_raw = (
         headers.get("X-Shopee-Signature")
         or headers.get("x-shopee-signature")
         or headers.get("Authorization")
         or headers.get("authorization")
         or ""
-    ).strip()
+    )
+    incoming_sig = (incoming_sig_raw or "").strip()
 
     if not incoming_sig:
         frappe.log_error("No signature header present", "Shopee Webhook")
         return False
 
-    # Jika header Authorization berformat "sha256=<sig>" atau "hmac <sig>", ambil bagian akhirnya
-    if "=" in incoming_sig and incoming_sig.lower().startswith(("sha256", "hmac", "signature")):
+    # Normalisasi header Authorization yang punya prefix
+    low = incoming_sig.lower()
+    if low.startswith(("sha256=", "hmac=", "signature=")):
         incoming_sig = incoming_sig.split("=", 1)[1].strip()
-    elif " " in incoming_sig and incoming_sig.lower().startswith(("hmac", "sha256", "signature")):
+    elif low.startswith(("sha256 ", "hmac ", "signature ")):
         incoming_sig = incoming_sig.split(" ", 1)[1].strip()
 
+    # Hitung HMAC dari RAW body
     mac = hmac.new(webhook_key.encode("utf-8"), raw_body, hashlib.sha256)
-    digest_bytes = mac.digest()
     calc_hex = mac.hexdigest()
-    calc_b64 = base64.b64encode(digest_bytes).decode("ascii").strip()
+    calc_b64 = base64.b64encode(mac.digest()).decode("ascii").strip()
 
-    # Coba cocokkan sebagai hex
+    # Cek sebagai hex
     if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
         return True
-    # Coba cocokkan sebagai base64
+    # Cek sebagai base64
     if hmac.compare_digest(incoming_sig, calc_b64):
         return True
 
-    # Log bedanya untuk debugging cepat (panjang & prefix)
+    # ---------- DEBUG LOG (ringan & aman) ----------
     try:
-        frappe.logger().info({
-            "sig_len": len(incoming_sig),
-            "calc_hex_prefix": calc_hex[:12],
-            "calc_b64_prefix": calc_b64[:12],
-            "incoming_prefix": incoming_sig[:12]
-        })
+        # Jangan log full signature (hanya prefix)
+        dbg = {
+            "header_used": ("X-Shopee-Signature" if headers.get("X-Shopee-Signature") or headers.get("x-shopee-signature")
+                            else ("Authorization" if headers.get("Authorization") or headers.get("authorization") else "unknown")),
+            "incoming_len": len(incoming_sig),
+            "incoming_prefix": incoming_sig[:16],
+            "calc_hex_len": len(calc_hex),
+            "calc_hex_prefix": calc_hex[:16],
+            "calc_b64_len": len(calc_b64),
+            "calc_b64_prefix": calc_b64[:16],
+            "raw_len": len(raw_body),
+        }
+        frappe.logger().info({"ShopeeWebhookSigDebug": dbg})
     except Exception:
         pass
+    # ---------- END DEBUG LOG ----------
 
     return False
-
 
 
 def _find_si_by_order_sn(order_sn: str) -> str | None:
@@ -3721,48 +3736,37 @@ def _find_si_by_order_sn(order_sn: str) -> str | None:
     )
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
+@frappe.whitelist(allow_guest=True)
 def shopee_webhook():
     """
-    Endpoint untuk Shopee Partner Console:
+    Set di Shopee Partner Console:
     https://<domain>/api/method/shopee_bridge.api.shopee_webhook
-
-    Menangani: order_status_update, payment_update/escrow_settled/payout
+    Menangani: order_status_update, payment_update/escrow_settled.
     """
     try:
-        # 1) Ambil raw bytes persis dari request
-        raw = frappe.request.get_data(as_text=False) or b""
-
-        # 2) Ambil headers (case-insensitive mapping)
-        headers = dict(frappe.request.headers or {})
-
-        # 3) Verifikasi signature SEBELUM parsing body
-        if not verify_webhook_signature(raw, headers):
-            frappe.local.response.http_status_code = 403
-            return {"success": False, "error": "invalid_signature"}
-
-        # 4) Setelah lolos verifikasi, log dan parse JSON
-        raw_str = ""
-        try:
-            raw_str = raw.decode("utf-8", errors="replace")
-        except Exception:
-            # biarkan kosong jika gagal decode (tetap aman karena sudah diverifikasi)
-            pass
-
-        frappe.logger().info(f"[Shopee Webhook] Raw data: {raw_str or 'No/undecodable raw'}")
+        raw = frappe.request.data or b""
+        headers = dict(frappe.request.headers)
+        
+        # Fix the data parsing
+        if raw:
+            data = frappe.parse_json(raw.decode('utf-8'))
+        else:
+            data = frappe.local.form_dict or {}
+        
+        # Log the incoming data
+        frappe.logger().info(f"[Shopee Webhook] Raw data: {raw.decode('utf-8') if raw else 'No raw data'}")
         frappe.logger().info(f"[Shopee Webhook] Headers: {headers}")
-
-        # Prefer JSON resmi dari request bila tersedia
-        data = frappe.request.get_json(silent=True) or {}
-        if not data and raw_str:
-            # fallback: coba parse manual kalau get_json() silent
-            data = frappe.parse_json(raw_str) or {}
-
         frappe.logger().info(f"[Shopee Webhook] Parsed data: {data}")
-
+        
         event = (data.get("event") or "").strip()
 
+        # Fix signature verification - pass both parameters
+        if not verify_webhook_signature(raw, headers):
+            frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
+            return {"success": False, "error": "invalid_signature"}
+
         if event == "order_status_update":
+            # taruh logika update SO/DN jika diperlukan
             frappe.logger().info(f"[Shopee] order_status_update: {data.get('order_sn')}")
 
         elif event in ("payment_update", "escrow_settled", "payout"):
@@ -3775,25 +3779,23 @@ def shopee_webhook():
             net = _safe_flt(data.get("escrow_amount") or data.get("payout_amount"))
             posting_ts = _safe_int(data.get("payout_time") or data.get("update_time"))
 
+            # bikin Payment Entry (enqueue biar non-blocking)
             create_payment_entry_from_shopee(
                 si_name=si_name,
                 escrow=data,
                 net_amount=net,
                 order_sn=order_sn,
                 posting_ts=posting_ts,
-                enqueue=True,
+                enqueue=True
             )
 
         else:
             frappe.logger().info(f"[Shopee] unhandled event: {event}")
 
         return {"success": True}
-
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Exception")
-        frappe.local.response.http_status_code = 500
         return {"success": False, "error": "server_error"}
-
     
 @frappe.whitelist(allow_guest=True)
 def test_webhook_verification():
