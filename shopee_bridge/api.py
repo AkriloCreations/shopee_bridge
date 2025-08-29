@@ -3842,3 +3842,25 @@ def test_webhook_verification():
     except Exception as e:
         frappe.log_error(f"Test webhook error: {str(e)}", "Shopee Test")
         return {"success": False, "error": str(e)}
+
+@frappe.whitelist(allow_guest=True) 
+def test_shopee_webhook_with_signature():
+    """Test the actual webhook handler"""
+    import json
+    
+    test_payload = {
+        "event": "payment_update", 
+        "order_sn": "TEST123",
+        "escrow_amount": 100.00
+    }
+    
+    raw_body = json.dumps(test_payload).encode('utf-8')
+    
+    # Generate signature
+    s = _settings()
+    webhook_key = getattr(s, "webhook_key", "")
+    if webhook_key:
+        signature = hmac.new(webhook_key.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+        return {"test_payload": test_payload, "signature": signature}
+    else:
+        return {"error": "No webhook key configured"}
