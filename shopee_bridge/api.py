@@ -3658,36 +3658,58 @@ def create_payment_entry_from_shopee(
 # 2) Webhook endpoint (pakai helper _settings dan _sign)
 # -------------------------------------------------------------
 def verify_webhook_signature(raw_body: bytes, headers) -> bool:
-    """
-    Verify Shopee webhook signature using HMAC-SHA256
-    """
+    import base64, hmac, hashlib
+
     s = _settings()
     webhook_key = (getattr(s, "webhook_key", "") or "").strip()
-    
     if not webhook_key:
         frappe.log_error("Webhook Sign Key not configured", "Shopee Webhook")
         return False
 
-    # Get signature from headers
+    # Ambil signature dari berbagai kemungkinan header
     incoming_sig = (
         headers.get("X-Shopee-Signature")
         or headers.get("x-shopee-signature")
+        or headers.get("Authorization")
+        or headers.get("authorization")
         or ""
     ).strip()
-    
+
     if not incoming_sig:
-        frappe.log_error("No signature found in headers", "Shopee Webhook")
+        frappe.log_error("No signature header present", "Shopee Webhook")
         return False
 
-    # Calculate expected signature
-    calculated_sig = hmac.new(
-        webhook_key.encode('utf-8'), 
-        raw_body, 
-        hashlib.sha256
-    ).hexdigest()
-    
-    # Compare signatures (case-insensitive)
-    return hmac.compare_digest(incoming_sig.lower(), calculated_sig.lower())
+    # Jika header Authorization berformat "sha256=<sig>" atau "hmac <sig>", ambil bagian akhirnya
+    if "=" in incoming_sig and incoming_sig.lower().startswith(("sha256", "hmac", "signature")):
+        incoming_sig = incoming_sig.split("=", 1)[1].strip()
+    elif " " in incoming_sig and incoming_sig.lower().startswith(("hmac", "sha256", "signature")):
+        incoming_sig = incoming_sig.split(" ", 1)[1].strip()
+
+    mac = hmac.new(webhook_key.encode("utf-8"), raw_body, hashlib.sha256)
+    digest_bytes = mac.digest()
+    calc_hex = mac.hexdigest()
+    calc_b64 = base64.b64encode(digest_bytes).decode("ascii").strip()
+
+    # Coba cocokkan sebagai hex
+    if hmac.compare_digest(incoming_sig.lower(), calc_hex.lower()):
+        return True
+    # Coba cocokkan sebagai base64
+    if hmac.compare_digest(incoming_sig, calc_b64):
+        return True
+
+    # Log bedanya untuk debugging cepat (panjang & prefix)
+    try:
+        frappe.logger().info({
+            "sig_len": len(incoming_sig),
+            "calc_hex_prefix": calc_hex[:12],
+            "calc_b64_prefix": calc_b64[:12],
+            "incoming_prefix": incoming_sig[:12]
+        })
+    except Exception:
+        pass
+
+    return False
+
 
 
 def _find_si_by_order_sn(order_sn: str) -> str | None:
@@ -3716,7 +3738,6 @@ def shopee_webhook():
 
         # 3) Verifikasi signature SEBELUM parsing body
         if not verify_webhook_signature(raw, headers):
-            frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
             frappe.local.response.http_status_code = 403
             return {"success": False, "error": "invalid_signature"}
 
