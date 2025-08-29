@@ -3724,7 +3724,7 @@ def shopee_webhook():
         event = (data.get("event") or "").strip()
 
         # Fix signature verification - pass both parameters
-        if not verify_webhook_signature(raw, headers):
+        if not verify_webhook_signature(raw):
             frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
             return {"success": False, "error": "invalid_signature"}
 
