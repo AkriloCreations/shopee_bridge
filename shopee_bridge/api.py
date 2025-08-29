@@ -3656,6 +3656,7 @@ def create_payment_entry_from_shopee(
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee PE Creation Error")
         raise
+
 def verify_webhook_signature(raw_body: bytes, headers) -> bool:
     """
     Shopee Push/Test signature verification:
@@ -3678,7 +3679,19 @@ def verify_webhook_signature(raw_body: bytes, headers) -> bool:
     
     if not inc:
         frappe.log_error("No signature header present", "Shopee Webhook")
+        frappe.logger().error("[Shopee Debug] No signature header found")
         return False
+    
+    # Debug: log semua header dan key info
+    frappe.logger().info({
+        "ShopeeDebugStart": {
+            "has_live_key": bool(live_key),
+            "has_test_key": bool(test_key), 
+            "signature_header": inc[:20] + "..." if len(inc) > 20 else inc,
+            "body_length": len(raw_body),
+            "all_headers": list(headers.keys())
+        }
+    })
     
     low = inc.lower()
     if low.startswith(("sha256=", "hmac=", "signature=")):
