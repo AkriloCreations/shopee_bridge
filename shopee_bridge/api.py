@@ -3772,26 +3772,31 @@ def shopee_webhook():
     Menangani: order_status_update, payment_update/escrow_settled.
     """
     try:
-        raw = frappe.request.data or b""
+        # Get raw body - penting untuk signature verification
+        raw = frappe.request.get_data() or b""
         headers = dict(frappe.request.headers)
         
-        # Fix the data parsing
-        if raw:
-            data = frappe.parse_json(raw.decode('utf-8'))
-        else:
-            data = frappe.local.form_dict or {}
-        
-        # Log the incoming data
-        frappe.logger().info(f"[Shopee Webhook] Raw data: {raw.decode('utf-8') if raw else 'No raw data'}")
-        frappe.logger().info(f"[Shopee Webhook] Headers: {headers}")
-        frappe.logger().info(f"[Shopee Webhook] Parsed data: {data}")
-        
-        event = (data.get("event") or "").strip()
-
-        # Fix signature verification - pass both parameters
+        # Signature verification PERTAMA sebelum parsing
         if not verify_webhook_signature(raw, headers):
             frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
             return {"success": False, "error": "invalid_signature"}
+        
+        # Parse data setelah signature valid
+        if raw:
+            try:
+                data = frappe.parse_json(raw.decode('utf-8'))
+            except (ValueError, UnicodeDecodeError) as e:
+                frappe.log_error(f"Failed to parse webhook data: {str(e)}", "Shopee Webhook")
+                return {"success": False, "error": "invalid_json"}
+        else:
+            data = frappe.local.form_dict or {}
+        
+        # Log the incoming data (setelah signature valid)
+        frappe.logger().info(f"[Shopee Webhook] Event: {data.get('event', 'unknown')}")
+        frappe.logger().info(f"[Shopee Webhook] Order SN: {data.get('order_sn', 'N/A')}")
+        frappe.logger().info(f"[Shopee Webhook] Full data: {data}")
+        
+        event = (data.get("event") or "").strip()
 
         if event == "order_status_update":
             # taruh logika update SO/DN jika diperlukan
@@ -3799,6 +3804,10 @@ def shopee_webhook():
 
         elif event in ("payment_update", "escrow_settled", "payout"):
             order_sn = data.get("order_sn")
+            if not order_sn:
+                frappe.logger().warning("[Shopee] payment event missing order_sn")
+                return {"success": False, "error": "missing_order_sn"}
+                
             si_name = _find_si_by_order_sn(order_sn)
             if not si_name:
                 frappe.logger().info(f"[Shopee] no SI for order {order_sn}, skip PE")
@@ -3816,13 +3825,17 @@ def shopee_webhook():
                 posting_ts=posting_ts,
                 enqueue=True
             )
+            
+            frappe.logger().info(f"[Shopee] Created PE for SI {si_name}, amount: {net}")
 
         else:
             frappe.logger().info(f"[Shopee] unhandled event: {event}")
 
         return {"success": True}
-    except Exception:
+        
+    except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Exception")
+        frappe.logger().error(f"[Shopee Webhook] Exception: {str(e)}")
         return {"success": False, "error": "server_error"}
     
 @frappe.whitelist(allow_guest=True)
