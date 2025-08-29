@@ -3814,9 +3814,8 @@ def test_webhook_verification():
         test_data = {"order_id": "TEST123", "status": "test"}
         raw_body = json.dumps(test_data).encode('utf-8')
         
-        # Create a proper signature for testing
-        webhook_key = getattr(s, "webhook_key", "")
-        if webhook_key:
+        if webhook_key_configured:
+            webhook_key = getattr(s, "webhook_key", "")
             test_signature = hmac.new(
                 webhook_key.encode('utf-8'),
                 raw_body,
@@ -3825,16 +3824,20 @@ def test_webhook_verification():
             
             test_headers = {"X-Shopee-Signature": test_signature}
             verification_result = verify_webhook_signature(raw_body, test_headers)
+            
+            return {
+                "success": True,
+                "webhook_key_configured": True,
+                "verification_result": verification_result,
+                "message": "Signature verification working"
+                # Don't return the actual signature
+            }
         else:
-            verification_result = False
-            test_signature = "N/A - no webhook key"
-        
-        return {
-            "success": True,
-            "webhook_key_configured": webhook_key_configured,
-            "test_signature": test_signature,
-            "verification_result": verification_result
-        }
+            return {
+                "success": False,
+                "webhook_key_configured": False,
+                "message": "Webhook key not configured"
+            }
         
     except Exception as e:
         frappe.log_error(f"Test webhook error: {str(e)}", "Shopee Test")
