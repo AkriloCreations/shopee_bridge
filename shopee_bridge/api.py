@@ -3,6 +3,7 @@ from frappe.utils import get_url, flt, nowdate, cint, add_days, now, format_date
 from datetime import datetime, timedelta, timezone
 import json
 from .webhook import create_payment_entry_from_shopee
+from shopee_bridge.webhook import create_payment_entry_from_shopee
 
 try:
     from zoneinfo import ZoneInfo
@@ -744,24 +745,28 @@ def _process_order_to_so(order_sn: str):
     
 # ===== 1. REPLACE _process_order_to_si FUNCTION IN api.py =====
 @frappe.whitelist()
+@frappe.whitelist()
 def _process_order_to_si(order_sn: str):
-    """Process Shopee order → Sales Invoice + Payment Entry (with migration mode support)."""
+    """Process Shopee order → Sales Invoice + (auto) Payment Entry.
+    - Aman untuk historical (migration mode / cutoff)
+    - Anti duplikat SI/PE
+    """
     s = _settings()
 
-    # Skip jika sudah ada SI
+    # === Skip jika SI sudah ada ===
     si_exists = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
     if si_exists:
         frappe.logger().info(f"[Shopee] SI {si_exists} for {order_sn} already exists, skipping")
         return {"ok": True, "status": "already_exists", "sales_invoice": si_exists}
 
     try:
-        # --- Get order detail ---
+        # === Detail order ===
         det = _call(
             "/api/v2/order/get_order_detail",
             str(s.partner_id).strip(), s.partner_key,
             s.shop_id, s.access_token,
             {
-                "order_sn_list": order_sn,
+                "order_sn_list": order_sn,  # string, bukan list
                 "response_optional_fields": (
                     "buyer_user_id,buyer_username,recipient_address,"
                     "item_list,create_time,ship_by_date,days_to_ship,order_status"
@@ -770,29 +775,28 @@ def _process_order_to_si(order_sn: str):
         )
         if det.get("error"):
             return {"ok": False, "error": det.get("message")}
-        orders = (det.get("response") or {}).get("order_list", []) or []
+        orders = (det.get("response") or {}).get("order_list") or []
         if not orders:
             return {"ok": False, "error": "No order data"}
         od = orders[0]
 
-        # --- Migration logic ---
+        # === Migration logic (hindari stock movement untuk data lama) ===
         update_stock = 1
-        migration_mode_enabled = cint(getattr(s, "migration_mode", 0)) == 1
-        if migration_mode_enabled:
+        if cint(getattr(s, "migration_mode", 0)) == 1:
             update_stock = 0
         elif getattr(s, "migration_cutoff_date", None):
-            create_time = od.get("create_time")
-            if create_time:
+            ct = od.get("create_time")
+            if ct:
                 from datetime import datetime
-                order_date = datetime.fromtimestamp(int(create_time)).date()
+                order_date = datetime.fromtimestamp(int(ct)).date()
                 cutoff = frappe.utils.getdate(s.migration_cutoff_date)
                 if order_date < cutoff:
                     update_stock = 0
 
-        # --- Customer ---
+        # === Customer ===
         customer = _create_or_get_customer(od, order_sn)
 
-        # --- Build Sales Invoice ---
+        # === Build Sales Invoice ===
         si = frappe.new_doc("Sales Invoice")
         si.customer = customer
         si.posting_date = nowdate()
@@ -807,34 +811,40 @@ def _process_order_to_si(order_sn: str):
 
         default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
 
-        for it in od.get("item_list") or []:
-            sku = (it.get("model_sku") or "").strip() or \
-                  (it.get("item_sku") or "").strip() or \
-                  f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
+        for it in (od.get("item_list") or []):
+            sku = (it.get("model_sku") or "").strip() \
+                  or (it.get("item_sku") or "").strip() \
+                  or f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
 
-            qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-            rate = float(it.get("model_discounted_price") or it.get("model_original_price") or it.get("order_price") or it.get("item_price") or 0)
+            qty = _safe_int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"), 1)
+            rate = (
+                flt(it.get("model_discounted_price"))
+                or flt(it.get("model_original_price"))
+                or flt(it.get("order_price"))
+                or flt(it.get("item_price"))
+            )
+            # guard bila harga format 100000x
             if rate > 1_000_000:
-                rate = rate / 100000
+                rate = rate / 100000.0
 
             item_code = _ensure_item_exists(sku, it, rate)
 
             row = si.append("items", {})
             row.item_code = item_code
-            row.qty = qty
-            row.rate = rate
+            row.qty = flt(qty)
+            row.rate = flt(rate)
+            row.amount = flt(qty) * flt(rate)
             if default_wh:
                 row.warehouse = default_wh
 
         if not si.items:
             return {"ok": False, "error": "No items"}
 
-        # --- Save + submit SI ---
+        # === Insert + submit SI (fallback tanpa stock jika negative stock) ===
         try:
             si.insert(ignore_permissions=True)
             si.submit()
         except Exception as e:
-            # fallback kalau negative stock
             if "needed in" in str(e) and update_stock:
                 si.reload()
                 si.update_stock = 0
@@ -846,18 +856,52 @@ def _process_order_to_si(order_sn: str):
 
         frappe.logger().info(f"[Shopee] SI {si.name} created for {order_sn}")
 
-        # --- Payment Entry dari escrow ---
-        esc = _call(
+        # === Escrow → Payment Entry ===
+        # helper normalisasi escrow payload (flat atau response.order_income)
+        def _norm_esc(esc: dict) -> dict:
+            r = (esc or {}).get("response") or (esc or {})
+            oi = r.get("order_income") or {}
+            # net amount: payout kalau ada, else escrow/after_adjustment
+            payout_amount = flt(r.get("payout_amount") or oi.get("payout_amount"))
+            escrow_amount = flt(oi.get("escrow_amount_after_adjustment") or oi.get("escrow_amount") or r.get("escrow_amount"))
+            net = payout_amount or escrow_amount
+            ts = r.get("payout_time") or r.get("update_time")
+
+            # fees (gabungkan transaksi ke service)
+            commission_fee = flt(oi.get("commission_fee"))
+            service_fee = flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee"))
+            protection = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
+            shipdiff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
+            voucher_seller = flt(oi.get("voucher_from_seller"))
+            coin_cash_back = flt(oi.get("coins"))
+            return {
+                "net_amount": net,
+                "escrow_amount": escrow_amount,
+                "payout_amount": payout_amount,
+                "commission_fee": commission_fee,
+                "service_fee": service_fee,
+                "shipping_seller_protection_fee_amount": protection,
+                "shipping_fee_difference": shipdiff,
+                "voucher_seller": voucher_seller,
+                "coin_cash_back": coin_cash_back,
+                "voucher_code_seller": 0.0,
+                "payout_time": ts,
+            }
+
+        esc_raw = _call(
             "/api/v2/payment/get_escrow_detail",
             str(s.partner_id).strip(), s.partner_key,
             s.shop_id, s.access_token,
             {"order_sn": order_sn}
         )
-        escrow = (esc.get("response") or {}) if not esc.get("error") else {}
-        net_amount = flt(escrow.get("escrow_amount") or escrow.get("payout_amount") or 0)
+        if esc_raw.get("error"):
+            frappe.logger().warning(f"[Shopee] escrow_detail fail {order_sn}: {esc_raw.get('message')}")
+            return {"ok": True, "sales_invoice": si.name, "note": "No payment entry created"}
 
+        esc_n = _norm_esc(esc_raw)
+        net_amount = flt(esc_n.get("net_amount"))
         if net_amount > 0:
-            # cek kalau sudah ada PE untuk SI ini
+            # sudah ada PE untuk SI ini?
             pe_exists = frappe.db.exists(
                 "Payment Entry Reference",
                 {"reference_doctype": "Sales Invoice", "reference_name": si.name}
@@ -865,10 +909,10 @@ def _process_order_to_si(order_sn: str):
             if not pe_exists:
                 pe_name = create_payment_entry_from_shopee(
                     si_name=si.name,
-                    escrow=escrow,
+                    escrow=esc_n,  # kirim normalized map (boleh juga kirim esc_raw; fungsi kamu siap terima dua2nya)
                     net_amount=net_amount,
                     order_sn=order_sn,
-                    posting_ts=_safe_int(escrow.get("payout_time") or escrow.get("update_time")),
+                    posting_ts=_safe_int(esc_n.get("payout_time") or 0),
                     enqueue=False
                 )
                 return {"ok": True, "sales_invoice": si.name, "payment_entry": pe_name}
@@ -2365,109 +2409,180 @@ def sync_recent_orders(hours: int = 24):
     }
 
 @frappe.whitelist()
-def diagnose_order(order_sn: str, hours: int = 72):
-    """Diagnosa cepat: detail, escrow, dan apakah order muncul di get_order_list dalam window waktu."""
-    import time, json
-    now = int(time.time())
+def sync_recent_orders(hours: int = 24, page_size: int = 50):
+    """Sync Shopee orders by update_time → SO (READY_TO_SHIP), SI+PE (COMPLETED), cancel docs (CANCELLED)."""
     s = _settings()
+    if not getattr(s, "access_token", ""):
+        frappe.throw("Access token required. Please authenticate with Shopee first.")
 
-    # detail
-    detail = _call(
-        "/api/v2/order/get_order_detail",
-        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-        {"order_sn_list": str(order_sn), "response_optional_fields": "item_list,recipient_address,buyer_info"}
-    )
+    # Refresh token jika perlu (abaikan error)
+    try:
+        if callable(globals().get("refresh_if_needed")):
+            refresh_if_needed()
+    except Exception:
+        pass
 
-    # escrow
-    escrow = _call(
-        "/api/v2/payment/get_escrow_detail",
-        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-        {"order_sn": str(order_sn)}
-    )
+    now = int(time.time())
+    last = int(getattr(s, "last_success_update_time", 0) or 0)
+    overlap = int(getattr(s, "overlap_seconds", 600) or 600)
 
-    # visibility di list
-    ol = _call(
-        "/api/v2/order/get_order_list",
-        str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-        {
-            "time_range_field": "update_time",
-            "time_from": now - int(hours) * 3600,
-            "time_to": now,
-            "page_size": 50,
-            "offset": 0
-        }
-    )
+    # first run → pakai hours; next runs → pakai last + overlap
+    if last == 0:
+        time_from = now - int(hours) * 3600
+    else:
+        time_from = max(0, last - overlap)
+    time_to = now
 
-    visible_in_list = False
-    status_hits = []
-    if isinstance(ol, dict) and not ol.get("error"):
-        for o in (ol.get("response") or {}).get("order_list", []) or []:
-            if o.get("order_sn") == order_sn:
-                visible_in_list = True
-                status_hits.append(o.get("order_status"))
+    STATUSES = ("READY_TO_SHIP", "COMPLETED", "CANCELLED")
+    highest_ut = last
+    processed = {"SO": 0, "SI": 0, "PE": 0, "CANCELLED": 0}
+    errors = 0
 
-    # ringkas detail
-    summary = {}
-    if isinstance(detail, dict) and not detail.get("error"):
-        lst = (detail.get("response") or {}).get("order_list", []) or []
-        if lst:
-            od = lst[0]
-            # GUNAKAN fungsi utama _safe_int yang sudah ada
-            ct  = _safe_int(od.get("create_time"))
-            sbd = _safe_int(od.get("ship_by_date"))
-            dts = _safe_int(od.get("days_to_ship"))
-            if not sbd and ct and dts:
-                sbd = ct + dts * 86400
-
-            def _hum(ts):
-                try:
-                    return _hum_epoch(ts)
-                except: 
-                    return None
-
-            items = []
-            for it in (od.get("item_list") or []):
-                items.append({
-                    "item_id": it.get("item_id"),
-                    "model_id": it.get("model_id"),
-                    "item_name": it.get("item_name"),
-                    "model_name": it.get("model_name"),
-                    "qty": it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"),
-                    "price": it.get("model_discounted_price") or it.get("order_price") or it.get("item_price")
-                })
-
-            summary = {
-                "order_sn": od.get("order_sn"),
-                "status": od.get("order_status"),
-                "create_time": ct, "create_time_human": _hum(ct),
-                "ship_by": sbd,    "ship_by_human": _hum(sbd),
-                "buyer_username": od.get("buyer_username"),
-                "recipient_name": (od.get("recipient_address") or {}).get("name"),
-                "items": items
+    def _pull(status: str) -> list[dict]:
+        items, cursor, page = [], "", 0
+        while True:
+            params = {
+                "time_range_field": "update_time",
+                "time_from": time_from,
+                "time_to": time_to,
+                "page_size": int(page_size),
+                "order_status": status,
             }
+            if cursor:
+                params["cursor"] = cursor
 
-    esc_summary = {}
-    if isinstance(escrow, dict) and not escrow.get("error"):
-        er = (escrow.get("response") or {}) or {}
-        # GUNAKAN fungsi utama _safe_flt yang sudah ada
-        esc_summary = {
-            "net": _safe_flt(er.get("escrow_amount") or er.get("payout_amount") or er.get("net_amount")),
-            "commission": _safe_flt(er.get("seller_commission_fee") or er.get("commission_fee")),
-            "service": _safe_flt(er.get("seller_service_fee") or er.get("service_fee")),
-            "protection": _safe_flt(er.get("shipping_seller_protection_fee_amount")),
-            "shipdiff": _safe_flt(er.get("shipping_fee_difference")),
-            "voucher": _safe_flt(er.get("voucher_seller")) + _safe_flt(er.get("coin_cash_back")) + _safe_flt(er.get("voucher_code_seller")),
-        }
+            resp = _call(
+                "/api/v2/order/get_order_list",
+                str(s.partner_id).strip(), s.partner_key,
+                s.shop_id, s.access_token, params
+            )
+            if resp.get("error"):
+                frappe.log_error(f"get_order_list[{status}] {resp.get('error')} - {resp.get('message')}", "Shopee Sync")
+                raise Exception(resp.get("message") or resp.get("error"))
+
+            body = resp.get("response") or {}
+            batch = body.get("order_list", []) or []
+            items.extend(batch)
+
+            if body.get("more"):
+                cursor = body.get("next_cursor") or ""
+                if not cursor:
+                    break
+            else:
+                break
+            page += 1
+        return items
+
+    def _ensure_payment_for(order_sn: str, si_name: str):
+        """Buat Payment Entry dari escrow; skip jika sudah ada PE untuk SI tsb."""
+        # sudah ada PE yang refer ke SI ini?
+        pe_exists = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si_name}
+        )
+        if pe_exists:
+            return False
+
+        esc = _call(
+            "/api/v2/payment/get_escrow_detail",
+            str(s.partner_id).strip(), s.partner_key,
+            s.shop_id, s.access_token,
+            {"order_sn": order_sn}
+        )
+        if esc.get("error"):
+            frappe.logger().warning(f"[Shopee Sync] escrow_detail fail {order_sn}: {esc.get('message')}")
+            return False
+
+        escrow = esc.get("response") or {}
+        net_amount = flt(escrow.get("payout_amount") or escrow.get("escrow_amount") or 0)
+        if net_amount <= 0:
+            return False
+
+        # buat PE
+        pe_name = create_payment_entry_from_shopee(
+            si_name=si_name,
+            escrow=escrow,
+            net_amount=net_amount,
+            order_sn=order_sn,
+            posting_ts=int(escrow.get("payout_time") or escrow.get("update_time") or 0),
+            enqueue=False
+        )
+        processed["PE"] += 1
+        frappe.logger().info(f"[Shopee Sync] PE {pe_name} created for SI {si_name}")
+        return True
+
+    for status in STATUSES:
+        try:
+            orders = _pull(status)
+        except Exception:
+            errors += 1
+            continue
+
+        for o in orders:
+            order_sn = o.get("order_sn")
+            if not order_sn:
+                continue
+            try:
+                # track max update_time
+                ut = int(o.get("update_time") or 0)
+                if ut > highest_ut:
+                    highest_ut = ut
+
+                if status == "READY_TO_SHIP":
+                    # SO only (anti-dupe ada di fungsi)
+                    res = _process_order_to_so(order_sn)
+                    if (res or {}).get("status") in ("created", "already_exists"):
+                        processed["SO"] += 1
+
+                elif status == "COMPLETED":
+                    # buat/cek SI; fungsi kamu sudah anti-dupe
+                    res = _process_order_to_si(order_sn) or {}
+                    si_name = res.get("sales_invoice") or frappe.db.get_value(
+                        "Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name"
+                    )
+                    if si_name:
+                        processed["SI"] += 1
+                        # pastikan PE ada
+                        _ensure_payment_for(order_sn, si_name)
+
+                elif status == "CANCELLED":
+                    # cancel SO/SI yang ada
+                    so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+                    if so_name:
+                        try:
+                            so = frappe.get_doc("Sales Order", so_name)
+                            if so.docstatus == 1:
+                                so.cancel()
+                                processed["CANCELLED"] += 1
+                        except Exception as e:
+                            frappe.log_error(f"Cancel SO {so_name} error: {e}")
+                    si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+                    if si_name:
+                        try:
+                            si = frappe.get_doc("Sales Invoice", si_name)
+                            if si.docstatus == 1:
+                                si.cancel()
+                                processed["CANCELLED"] += 1
+                        except Exception as e:
+                            frappe.log_error(f"Cancel SI {si_name} error: {e}")
+
+            except Exception as e:
+                errors += 1
+                frappe.log_error(f"Process {order_sn} [{status}] fail: {e}", "Shopee Sync Loop")
+
+    # update watermark hanya jika ada aktivitas
+    if highest_ut > (getattr(s, "last_success_update_time", 0) or 0):
+        s.last_success_update_time = highest_ut
+        s.save(ignore_permissions=True)
+        frappe.db.commit()
 
     return {
-        "ok": bool(summary),
-        "order_sn": order_sn,
-        "visible_in_list": visible_in_list,
-        "visible_status_hits": status_hits,
-        "detail_error": detail if detail.get("error") else None,
-        "escrow_error": escrow if escrow.get("error") else None,
-        "detail": summary if summary else None,
-        "escrow": esc_summary if esc_summary else None,
+        "from": time_from,
+        "to": time_to,
+        "processed": processed,   # {"SO": n, "SI": n, "PE": n, "CANCELLED": n}
+        "errors": errors,
+        "last_update_time": highest_ut,
+        "success": True if (processed["SO"] + processed["SI"] + processed["CANCELLED"]) > 0 else (errors == 0),
     }
 
 @frappe.whitelist()

@@ -398,6 +398,64 @@ def handle_order_created(data: Dict[str, Any]) -> Dict[str, Any]:
     
     return result
 
+def _normalize_escrow_payload(payload: dict) -> dict:
+    """
+    Normalisasi berbagai bentuk payload escrow Shopee (flat vs. response.order_income).
+    Mengembalikan dict dengan key yang dipakai kode kita saat bikin Payment Entry.
+    """
+    # payload bisa: {"response": {...}} atau langsung {...}
+    root = (payload or {}).get("response") or (payload or {})
+    oi = root.get("order_income") or {}
+    bpi = root.get("buyer_payment_info") or {}
+
+    # Net amount yg kita terima:
+    # - prioritas payout_amount (kalau Shopee sudah settle), 
+    # - fallback escrow_amount_after_adjustment, 
+    # - lalu escrow_amount.
+    payout_amount = flt(root.get("payout_amount") or oi.get("payout_amount"))
+    escrow_amount = flt(
+        oi.get("escrow_amount_after_adjustment")
+        or oi.get("escrow_amount")
+        or root.get("escrow_amount")
+    )
+    net_amount = payout_amount or escrow_amount
+
+    # Fee yang jadi beban seller:
+    commission_fee = flt(oi.get("commission_fee"))
+    service_fee = flt(oi.get("service_fee"))
+    # Shopee sering memecah fee transaksi:
+    seller_txn_fee = flt(oi.get("seller_transaction_fee"))
+    cc_txn_fee = flt(oi.get("credit_card_transaction_fee"))
+
+    # Proteksi & ongkir selisih:
+    protection_fee = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
+    # reverse_shipping_fee = biaya pengembalian ke seller; shopee_shipping_rebate = reimbursenya
+    ship_diff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
+
+    # Voucher yang jadi beban seller (bukan voucher Shopee)
+    voucher_seller = flt(oi.get("voucher_from_seller"))
+    # coin cashback yang jadi beban seller → biasanya 0; kalau mau, ambil dari oi.get("coins")
+    coin_cash_back = flt(oi.get("coins"))  # treat as seller-side if policy kamu begitu
+    voucher_code_seller = 0.0  # tidak ada di payload contoh
+
+    # Timestamp untuk posting
+    payout_time = root.get("payout_time") or root.get("update_time")
+
+    normalized = {
+        "net_amount": net_amount,                       # ← inilah yang dipakai utk PE.paid_amount
+        "escrow_amount": escrow_amount,
+        "payout_amount": payout_amount,
+        "commission_fee": commission_fee,
+        "service_fee": service_fee + seller_txn_fee + cc_txn_fee,  # gabungkan fee transaksi ke service
+        "shipping_seller_protection_fee_amount": protection_fee,
+        "shipping_fee_difference": ship_diff,
+        "voucher_seller": voucher_seller,
+        "coin_cash_back": coin_cash_back,
+        "voucher_code_seller": voucher_code_seller,
+        "payout_time": payout_time,
+    }
+    return normalized
+
 
 def create_payment_entry_from_shopee(
     si_name: str,
@@ -408,9 +466,15 @@ def create_payment_entry_from_shopee(
     enqueue: bool = False
 ) -> str | None:
     """
-    Create Payment Entry for Shopee escrow settlement
-    This function can be called from webhook or manually
+    Create Payment Entry for Shopee escrow settlement (support payload baru dengan response.order_income).
     """
+
+    # === NEW: normalisasi payload ===
+    norm = _normalize_escrow_payload(escrow or {})
+    # override net_amount & posting_ts pakai hasil normalisasi kalau ada
+    net = flt(norm.get("net_amount") or net_amount)
+    posting_ts = posting_ts or norm.get("payout_time")
+
     if enqueue:
         return frappe.enqueue(
             "shopee_bridge.webhook.create_payment_entry_from_shopee",
@@ -418,7 +482,7 @@ def create_payment_entry_from_shopee(
             job_name=f"PE Shopee {order_sn}",
             si_name=si_name,
             escrow=escrow,
-            net_amount=net_amount,
+            net_amount=float(net),
             order_sn=order_sn,
             posting_ts=posting_ts,
             enqueue=False
@@ -429,38 +493,41 @@ def create_payment_entry_from_shopee(
         if si.docstatus != 1:
             frappe.throw(f"Sales Invoice {si.name} not submitted")
 
-        # Import helper functions from api.py
+        # === NEW: anti-duplikat Payment Entry untuk SI yang sama ===
+        pe_exists = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
+        )
+        if pe_exists:
+            frappe.logger().info(f"[Shopee] Skip PE; reference already exists for SI {si.name}")
+            return frappe.db.get_value("Payment Entry Reference", pe_exists, "parent")
+
+        # Import helpers…
         from .api import _get_or_create_account, _get_or_create_mode_of_payment, _insert_submit_with_retry
 
-        # Account setup
         paid_from = si.debit_to
         paid_to = _get_or_create_account("Shopee (Escrow)", "Bank")
         mop = _get_or_create_mode_of_payment("Shopee")
 
-        # Calculate fees
+        # === NEW: gunakan nilai fee dari 'norm' (sudah bersih) ===
         fees = {
-            "commission": _safe_flt(escrow.get("commission_fee")),
-            "service": _safe_flt(escrow.get("service_fee")),
-            "protection": _safe_flt(escrow.get("shipping_seller_protection_fee_amount")),
-            "shipdiff": _safe_flt(escrow.get("shipping_fee_difference")),
-            "voucher": (_safe_flt(escrow.get("voucher_seller")) + 
-                       _safe_flt(escrow.get("coin_cash_back")) +
-                       _safe_flt(escrow.get("voucher_code_seller")))
+            "commission": flt(norm.get("commission_fee")),
+            "service": flt(norm.get("service_fee")),
+            "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
+            "shipdiff": flt(norm.get("shipping_fee_difference")),
+            "voucher": flt(norm.get("voucher_seller")) + flt(norm.get("coin_cash_back")) + flt(norm.get("voucher_code_seller")),
         }
 
-        # Fee accounts
         fee_accounts = {
             "commission": _get_or_create_account("Komisi Shopee", "Expense Account"),
             "service": _get_or_create_account("Biaya Layanan Shopee", "Expense Account"),
             "protection": _get_or_create_account("Proteksi Pengiriman Shopee", "Expense Account"),
             "shipdiff": _get_or_create_account("Selisih Ongkir Shopee", "Expense Account"),
-            "voucher": _get_or_create_account("Voucher Shopee", "Expense Account")
+            "voucher": _get_or_create_account("Voucher Shopee", "Expense Account"),
         }
 
-        net = _safe_flt(net_amount)
         posting_date = _date_iso_from_epoch(posting_ts)
 
-        # Create Payment Entry
         pe = frappe.new_doc("Payment Entry")
         pe.company = si.company
         pe.payment_type = "Receive"
@@ -474,26 +541,22 @@ def create_payment_entry_from_shopee(
         pe.paid_amount = flt(net)
         pe.received_amount = flt(net)
 
-        # Link to Sales Invoice
         ref = pe.append("references", {})
         ref.reference_doctype = "Sales Invoice"
         ref.reference_name = si.name
-        ref.allocated_amount = net + sum(v for v in fees.values() if v > 0)
+        ref.allocated_amount = flt(net)  # ⬅️ allocated = net (fee ditaruh di deductions)
 
-        # Add fee deductions
         for fee_type, amount in fees.items():
-            if amount > 0:
+            if flt(amount) > 0:
                 row = pe.append("deductions", {})
                 row.account = fee_accounts[fee_type]
                 row.amount = flt(amount)
 
-        # Save and submit
         pe = _insert_submit_with_retry(pe)
-        
         frappe.logger().info(f"[Shopee] Payment Entry {pe.name} created for SI {si.name}")
         return pe.name
 
-    except Exception as e:
+    except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
         raise
 
