@@ -67,7 +67,9 @@ def shopee_webhook():
                 return result
         
         # Signature verification
-        if not verify_webhook_signature(raw_body, headers):
+        partner_key = getattr(_settings(), "partner_key", "").strip()
+        url_path = frappe.request.path  # sesuai Shopee config
+        if not verify_webhook_signature(url_path, raw_body, headers, partner_key):
             processing_time = (time.time() - start_time) * 1000
             result = {"success": False, "error": "invalid_signature"}
             log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
