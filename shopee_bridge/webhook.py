@@ -32,10 +32,10 @@ def _date_iso_from_epoch(ts: int | None) -> str:
 
 @frappe.whitelist(allow_guest=True, methods=["POST", "GET", "OPTIONS"])
 def shopee_webhook():
-    """
-    Main Shopee webhook handler
-    URL: https://<domain>/api/method/shopee_bridge.webhook.shopee_webhook
-    """
+    """Main Shopee webhook handler"""
+    import time
+    start_time = time.time()
+    
     try:
         # Handle CORS preflight
         if frappe.request.method == "OPTIONS":
@@ -54,55 +54,52 @@ def shopee_webhook():
         frappe.local.response.headers = frappe.local.response.headers or {}
         frappe.local.response.headers["Expect"] = ""
         
-        # Enhanced logging
-        frappe.logger().info(f"[Shopee Webhook] Method: {frappe.request.method}")
-        frappe.logger().info(f"[Shopee Webhook] Body length: {len(raw_body)}")
-        frappe.logger().info(f"[Shopee Webhook] Headers: {list(headers.keys())}")
-        
-        # Log signature headers for debugging
-        sig_headers = {k: v[:30] + "..." if len(str(v)) > 30 else str(v)
-                      for k, v in headers.items() 
-                      if any(x in k.lower() for x in ['signature', 'auth'])}
-        if sig_headers:
-            frappe.logger().info(f"[Shopee Webhook] Signature headers: {sig_headers}")
-        
         # Parse webhook data
         webhook_data = None
         if raw_body:
             try:
                 body_text = raw_body.decode('utf-8')
                 webhook_data = json.loads(body_text)
-                frappe.logger().info(f"[Shopee Webhook] Parsed data: {webhook_data}")
             except Exception as e:
-                frappe.logger().error(f"[Shopee Webhook] Parse error: {str(e)}")
-                frappe.local.response.http_status_code = 400
-                return {"success": False, "error": "invalid_json", "details": str(e)}
+                processing_time = (time.time() - start_time) * 1000
+                result = {"success": False, "error": "invalid_json", "details": str(e)}
+                log_webhook_activity(None, headers, raw_body, result, processing_time)
+                return result
         
-        # Signature verification (enhanced with multiple fallbacks)
+        # Signature verification
         if not verify_webhook_signature(raw_body, headers):
-            frappe.log_error("Invalid Shopee signature", "Shopee Webhook")
-            frappe.local.response.http_status_code = 401
-            return {"success": False, "error": "invalid_signature"}
+            processing_time = (time.time() - start_time) * 1000
+            result = {"success": False, "error": "invalid_signature"}
+            log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
+            return result
         
         # Process webhook event
         if webhook_data and isinstance(webhook_data, dict):
-            return process_webhook_event(webhook_data)
+            result = process_webhook_event(webhook_data)
+        else:
+            result = {
+                "success": True,
+                "message": "Webhook received but no data to process",
+                "timestamp": frappe.utils.now()
+            }
         
-        # Default response untuk empty webhooks
-        return {
-            "success": True,
-            "message": "Webhook received but no data to process",
-            "timestamp": frappe.utils.now()
-        }
+        # Log activity
+        processing_time = (time.time() - start_time) * 1000
+        log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
+        
+        return result
         
     except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Shopee Webhook Critical Error")
-        frappe.logger().error(f"[Shopee Webhook] Exception: {str(e)}")
+        processing_time = (time.time() - start_time) * 1000
+        result = {"success": False, "error": "server_error", "details": str(e)}
+        log_webhook_activity(webhook_data if 'webhook_data' in locals() else None, 
+                           headers if 'headers' in locals() else {}, 
+                           raw_body if 'raw_body' in locals() else b"", 
+                           result, processing_time)
         
-        frappe.local.response.http_status_code = 500
-        return {"success": False, "error": "server_error", "details": str(e)}
-
-
+        frappe.log_error(frappe.get_traceback(), "Shopee Webhook Critical Error")
+        return result
+    
 def verify_webhook_signature(raw_body: bytes, headers: Dict[str, str]) -> bool:
     """
     Enhanced signature verification with multiple fallbacks
@@ -611,3 +608,35 @@ def health_check():
         "timestamp": frappe.utils.now(),
         "url": f"{frappe.utils.get_url()}/api/method/shopee_bridge.webhook.health_check"
     }
+
+def log_webhook_activity(webhook_data, headers, raw_body, result, processing_time, source="Shopee Live"):
+    """Log webhook activity to database"""
+    try:
+        # Extract order info
+        order_data = webhook_data.get('data', {}) if webhook_data else {}
+        
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Webhook Log",
+            "timestamp": frappe.utils.now(),
+            "order_sn": order_data.get('ordersn', ''),
+            "shop_id": str(webhook_data.get('shop_id', '')) if webhook_data else '',
+            "status": order_data.get('status', ''),
+            "event_type": order_data.get('status', ''),
+            "raw_data": json.dumps(webhook_data, indent=2) if webhook_data else str(raw_body),
+            "headers": json.dumps(headers, indent=2),
+            "response_status": "Success" if result.get('success') else "Error",
+            "error_message": result.get('error', '') if not result.get('success') else '',
+            "processing_time": processing_time,
+            "source": source,
+            "ip_address": frappe.request.environ.get('REMOTE_ADDR', 'Unknown')
+        })
+        
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        
+        # Print summary untuk terminal
+        status_icon = "✅" if result.get('success') else "❌"
+        print(f"{status_icon} Webhook: {log_doc.order_sn or 'No Order'} | {log_doc.status or 'No Status'} | {processing_time:.1f}ms")
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to log webhook activity: {str(e)}")
