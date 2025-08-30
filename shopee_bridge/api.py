@@ -491,14 +491,16 @@ def _process_order(order_sn: str):
         return
 
     det = _call(
-        "/api/v2/order/get_order_detail",
-        str(s.partner_id).strip(), s.partner_key,
-        s.shop_id, s.access_token,
-        {
-            "order_sn_list": [order_sn],
-            "response_optional_fields": "buyer_username,item_list,recipient_address,order_status,update_time,total_amount,escrow_amount,payout_amount"
-        }
-    )
+    "/api/v2/order/get_order_detail",
+    str(s.partner_id).strip(),
+    s.partner_key,
+    s.shop_id,
+    s.access_token,
+    {
+        "order_sn_list": order_sn,  # ✅ jangan list, harus string
+        "response_optional_fields": "buyer_username,item_list,recipient_address,order_status,update_time,total_amount,escrow_amount,payout_amount"
+    }
+)
     if det.get("error"):
         frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
         return
