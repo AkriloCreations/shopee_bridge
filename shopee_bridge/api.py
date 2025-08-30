@@ -2278,151 +2278,24 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         "errors": errors,
         "success": errors == 0,
     }
-
-@frappe.whitelist()
-def sync_recent_orders(hours: int = 24):
-    """Sync Shopee orders → Sales Order / Sales Invoice / Payment Entry sesuai status"""
-    s = _settings()
-
-    if not s.access_token:
-        frappe.throw("Access token required. Please authenticate with Shopee first.")
-
-    # refresh token kalau perlu
-    try:
-        refresh_if_needed()
-    except Exception:
-        pass
-
-    now = int(time.time())
-    last = int(s.last_success_update_time or 0)
-    overlap = 600  # 10 menit overlap
-
-    if last == 0:
-        time_from = now - hours * 3600
-    else:
-        time_from = max(0, last - overlap)
-
-    time_to = now
-
-    statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED"]
-    page_size = 50
-    highest = last
-    processed = 0
-    errors = 0
-
-    for status in statuses:
-        offset = 0
-        while True:
-            ol = _call(
-                "/api/v2/order/get_order_list",
-                str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token,
-                {
-                    "time_range_field": "update_time",
-                    "time_from": time_from,
-                    "time_to": time_to,
-                    "page_size": page_size,
-                    "order_status": status,
-                    "offset": offset
-                }
-            )
-
-            if ol.get("error"):
-                errors += 1
-                frappe.log_error(
-                    f"get_order_list error [{status}]: {ol.get('error')} - {ol.get('message')}",
-                    "Shopee Sync"
-                )
-                break
-
-            resp = ol.get("response") or {}
-            orders = resp.get("order_list", [])
-
-            for order in orders:
-                order_sn = order.get("order_sn")
-                if not order_sn:
-                    continue
-
-                try:
-                    if status == "READY_TO_SHIP":
-                        # buat Sales Order
-                        _process_order_to_so(order_sn)
-                        processed += 1
-
-                    elif status == "COMPLETED":
-                        # buat Sales Invoice + Payment Entry
-                        _process_order(order_sn)
-                        processed += 1
-
-                    elif status == "CANCELLED":
-                        # cancel SO / SI kalau ada
-                        so_name = frappe.db.get_value(
-                            "Sales Order", {"custom_shopee_order_sn": order_sn}, "name"
-                        )
-                        if so_name:
-                            try:
-                                so = frappe.get_doc("Sales Order", so_name)
-                                if so.docstatus == 1:
-                                    so.cancel()
-                                    processed += 1
-                            except Exception as e:
-                                frappe.log_error(f"Cancel SO error {order_sn}: {e}")
-
-                        si_name = frappe.db.get_value(
-                            "Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name"
-                        )
-                        if si_name:
-                            try:
-                                si = frappe.get_doc("Sales Invoice", si_name)
-                                if si.docstatus == 1:
-                                    si.cancel()
-                                    processed += 1
-                            except Exception as e:
-                                frappe.log_error(f"Cancel SI error {order_sn}: {e}")
-
-                    # track update_time tertinggi
-                    ut = int(order.get("update_time") or 0)
-                    if ut > highest:
-                        highest = ut
-
-                except Exception as e:
-                    errors += 1
-                    frappe.log_error(f"Failed to process order {order_sn} [{status}]: {e}", "Shopee Sync")
-
-            if not resp.get("has_next_page"):
-                break
-            offset = resp.get("next_offset", offset + page_size)
-
-    # update last sync time
-    if highest > (s.last_success_update_time or 0):
-        s.last_success_update_time = highest
-        s.save(ignore_permissions=True)
-        frappe.db.commit()
-
-    return {
-        "from": time_from,
-        "to": time_to,
-        "processed_orders": processed,
-        "errors": errors,
-        "last_update_time": highest,
-        "success": errors == 0
-    }
-
 @frappe.whitelist()
 def sync_recent_orders(hours: int = 24, page_size: int = 50):
-    """Sync Shopee orders by update_time → SO (READY_TO_SHIP), SI+PE (COMPLETED), cancel docs (CANCELLED)."""
+    """Sync Shopee orders → SO (READY_TO_SHIP/PROCESSED), SI+PE (COMPLETED), cancel docs (CANCELLED).
+    Menggunakan cursor pagination (v2) & multi-status. Ada fallback pakai create_time jika update_time tidak mengembalikan data.
+    """
     s = _settings()
     if not getattr(s, "access_token", ""):
         frappe.throw("Access token required. Please authenticate with Shopee first.")
 
-    # Refresh token jika perlu (abaikan error)
+    # Refresh token bila ada helper-nya
     try:
         if callable(globals().get("refresh_if_needed")):
             refresh_if_needed()
     except Exception:
         pass
 
-    now = int(time.time())
+    import time as _t
+    now = int(_t.time())
     last = int(getattr(s, "last_success_update_time", 0) or 0)
     overlap = int(getattr(s, "overlap_seconds", 600) or 600)
 
@@ -2433,16 +2306,35 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
         time_from = max(0, last - overlap)
     time_to = now
 
-    STATUSES = ("READY_TO_SHIP", "COMPLETED", "CANCELLED")
-    highest_ut = last
-    processed = {"SO": 0, "SI": 0, "PE": 0, "CANCELLED": 0}
-    errors = 0
+    # Debug waktu human-readable
+    try:
+        from datetime import datetime, timezone
+        human_from = datetime.fromtimestamp(time_from, tz=timezone.utc).isoformat()
+        human_to = datetime.fromtimestamp(time_to, tz=timezone.utc).isoformat()
+    except Exception:
+        human_from = str(time_from)
+        human_to = str(time_to)
 
-    def _pull(status: str) -> list[dict]:
-        items, cursor, page = [], "", 0
+    frappe.logger().info(f"[Shopee Sync] Window update_time: {time_from} → {time_to} ({human_from} → {human_to})")
+
+    STATUSES = ("READY_TO_SHIP", "PROCESSED", "COMPLETED", "CANCELLED")
+
+    stats = {
+        "SO": 0,           # created/exists count for SO
+        "SI": 0,           # created/exists count for SI
+        "PE": 0,           # created PE
+        "CANCELLED": 0,    # cancelled docs count
+        "errors": 0,
+        "api_calls": 0,
+    }
+    highest_ut = last
+
+    def _pull(status: str, time_field: str) -> list[dict]:
+        """Tarik order list dengan cursor pagination."""
+        items, cursor, round_ = [], "", 0
         while True:
             params = {
-                "time_range_field": "update_time",
+                "time_range_field": time_field,  # "update_time" atau "create_time"
                 "time_from": time_from,
                 "time_to": time_to,
                 "page_size": int(page_size),
@@ -2456,66 +2348,79 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
                 str(s.partner_id).strip(), s.partner_key,
                 s.shop_id, s.access_token, params
             )
+            stats["api_calls"] += 1
+
             if resp.get("error"):
-                frappe.log_error(f"get_order_list[{status}] {resp.get('error')} - {resp.get('message')}", "Shopee Sync")
+                frappe.log_error(
+                    f"get_order_list[{status},{time_field}] {resp.get('error')} - {resp.get('message')}",
+                    "Shopee Sync"
+                )
                 raise Exception(resp.get("message") or resp.get("error"))
 
             body = resp.get("response") or {}
             batch = body.get("order_list", []) or []
             items.extend(batch)
 
+            # Shopee v2: pagination pakai 'more' + 'next_cursor'
             if body.get("more"):
                 cursor = body.get("next_cursor") or ""
                 if not cursor:
                     break
             else:
                 break
-            page += 1
+            round_ += 1
+        frappe.logger().info(f"[Shopee Sync] Pulled {len(items)} orders [{status}] with {time_field}")
         return items
 
-    def _ensure_payment_for(order_sn: str, si_name: str):
-        """Buat Payment Entry dari escrow; skip jika sudah ada PE untuk SI tsb."""
-        # sudah ada PE yang refer ke SI ini?
+    # Helper: pastikan PE dibuat jika fungsi SI tidak sempat membuatnya
+    def _ensure_payment(order_sn: str):
+        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+        if not si_name:
+            return
+        # sudah ada PE utk SI ini?
         pe_exists = frappe.db.exists(
             "Payment Entry Reference",
             {"reference_doctype": "Sales Invoice", "reference_name": si_name}
         )
         if pe_exists:
-            return False
+            return
 
+        # tarik escrow & buat PE
         esc = _call(
             "/api/v2/payment/get_escrow_detail",
             str(s.partner_id).strip(), s.partner_key,
             s.shop_id, s.access_token,
             {"order_sn": order_sn}
         )
+        stats["api_calls"] += 1
         if esc.get("error"):
             frappe.logger().warning(f"[Shopee Sync] escrow_detail fail {order_sn}: {esc.get('message')}")
-            return False
+            return
 
-        escrow = esc.get("response") or {}
-        net_amount = flt(escrow.get("payout_amount") or escrow.get("escrow_amount") or 0)
-        if net_amount <= 0:
-            return False
+        # gunakan normalisasi di create_payment_entry_from_shopee (atau kirim raw)
+        try:
+            from .webhook import create_payment_entry_from_shopee
+            pe_name = create_payment_entry_from_shopee(
+                si_name=si_name,
+                escrow=esc,
+                net_amount=0,                 # biarkan fungsi normalisasi menentukan
+                order_sn=order_sn,
+                posting_ts=None,
+                enqueue=False
+            )
+            if pe_name:
+                stats["PE"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+            frappe.log_error(f"Ensure payment {order_sn} fail: {e}", "Shopee Sync Payment")
 
-        # buat PE
-        pe_name = create_payment_entry_from_shopee(
-            si_name=si_name,
-            escrow=escrow,
-            net_amount=net_amount,
-            order_sn=order_sn,
-            posting_ts=int(escrow.get("payout_time") or escrow.get("update_time") or 0),
-            enqueue=False
-        )
-        processed["PE"] += 1
-        frappe.logger().info(f"[Shopee Sync] PE {pe_name} created for SI {si_name}")
-        return True
-
+    # Pass utama: pakai update_time
     for status in STATUSES:
         try:
-            orders = _pull(status)
-        except Exception:
-            errors += 1
+            orders = _pull(status, "update_time")
+        except Exception as e:
+            stats["errors"] += 1
+            frappe.logger().warning(f"[Shopee Sync] Skip status {status} due to error: {e}")
             continue
 
         for o in orders:
@@ -2523,38 +2428,35 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
             if not order_sn:
                 continue
             try:
-                # track max update_time
                 ut = int(o.get("update_time") or 0)
                 if ut > highest_ut:
                     highest_ut = ut
 
-                if status == "READY_TO_SHIP":
-                    # SO only (anti-dupe ada di fungsi)
-                    res = _process_order_to_so(order_sn)
-                    if (res or {}).get("status") in ("created", "already_exists"):
-                        processed["SO"] += 1
+                if status in ("READY_TO_SHIP", "PROCESSED"):
+                    res = _process_order_to_so(order_sn) or {}
+                    if res.get("status") in ("created", "already_exists", "ok"):
+                        stats["SO"] += 1
 
                 elif status == "COMPLETED":
-                    # buat/cek SI; fungsi kamu sudah anti-dupe
+                    # fungsi SI kamu sudah sekaligus coba bikin PE; kalau belum, _ensure_payment akan backup
                     res = _process_order_to_si(order_sn) or {}
-                    si_name = res.get("sales_invoice") or frappe.db.get_value(
-                        "Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name"
-                    )
-                    if si_name:
-                        processed["SI"] += 1
-                        # pastikan PE ada
-                        _ensure_payment_for(order_sn, si_name)
+                    if res.get("ok") or res.get("sales_invoice") or frappe.db.exists(
+                        "Sales Invoice", {"custom_shopee_order_sn": order_sn}
+                    ):
+                        stats["SI"] += 1
+                        _ensure_payment(order_sn)
 
                 elif status == "CANCELLED":
-                    # cancel SO/SI yang ada
+                    # cancel SO/SI jika ada
                     so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
                     if so_name:
                         try:
                             so = frappe.get_doc("Sales Order", so_name)
                             if so.docstatus == 1:
                                 so.cancel()
-                                processed["CANCELLED"] += 1
+                                stats["CANCELLED"] += 1
                         except Exception as e:
+                            stats["errors"] += 1
                             frappe.log_error(f"Cancel SO {so_name} error: {e}")
                     si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
                     if si_name:
@@ -2562,27 +2464,91 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
                             si = frappe.get_doc("Sales Invoice", si_name)
                             if si.docstatus == 1:
                                 si.cancel()
-                                processed["CANCELLED"] += 1
+                                stats["CANCELLED"] += 1
                         except Exception as e:
+                            stats["errors"] += 1
                             frappe.log_error(f"Cancel SI {si_name} error: {e}")
 
             except Exception as e:
-                errors += 1
+                stats["errors"] += 1
                 frappe.log_error(f"Process {order_sn} [{status}] fail: {e}", "Shopee Sync Loop")
 
-    # update watermark hanya jika ada aktivitas
+    # Fallback: kalau sama sekali tidak ada order dan tidak ada error, coba pakai create_time
+    if stats["SO"] + stats["SI"] + stats["CANCELLED"] == 0 and stats["errors"] == 0:
+        frappe.logger().info("[Shopee Sync] No orders via update_time, retrying with create_time window...")
+        for status in STATUSES:
+            try:
+                orders = _pull(status, "create_time")
+            except Exception as e:
+                stats["errors"] += 1
+                frappe.logger().warning(f"[Shopee Sync] (fallback) Skip status {status}: {e}")
+                continue
+
+            for o in orders:
+                order_sn = o.get("order_sn")
+                if not order_sn:
+                    continue
+                try:
+                    ct = int(o.get("create_time") or 0)
+                    if ct > highest_ut:
+                        highest_ut = ct
+
+                    if status in ("READY_TO_SHIP", "PROCESSED"):
+                        res = _process_order_to_so(order_sn) or {}
+                        if res.get("status") in ("created", "already_exists", "ok"):
+                            stats["SO"] += 1
+
+                    elif status == "COMPLETED":
+                        res = _process_order_to_si(order_sn) or {}
+                        if res.get("ok") or res.get("sales_invoice") or frappe.db.exists(
+                            "Sales Invoice", {"custom_shopee_order_sn": order_sn}
+                        ):
+                            stats["SI"] += 1
+                            _ensure_payment(order_sn)
+
+                    elif status == "CANCELLED":
+                        so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+                        if so_name:
+                            try:
+                                so = frappe.get_doc("Sales Order", so_name)
+                                if so.docstatus == 1:
+                                    so.cancel()
+                                    stats["CANCELLED"] += 1
+                            except Exception as e:
+                                stats["errors"] += 1
+                                frappe.log_error(f"(fallback) Cancel SO {so_name} error: {e}")
+                        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+                        if si_name:
+                            try:
+                                si = frappe.get_doc("Sales Invoice", si_name)
+                                if si.docstatus == 1:
+                                    si.cancel()
+                                    stats["CANCELLED"] += 1
+                            except Exception as e:
+                                stats["errors"] += 1
+                                frappe.log_error(f"(fallback) Cancel SI {si_name} error: {e}")
+
+                except Exception as e:
+                    stats["errors"] += 1
+                    frappe.log_error(f"(fallback) Process {order_sn} [{status}] fail: {e}", "Shopee Sync Loop")
+
+    # update watermark hanya jika bergerak maju
     if highest_ut > (getattr(s, "last_success_update_time", 0) or 0):
         s.last_success_update_time = highest_ut
         s.save(ignore_permissions=True)
         frappe.db.commit()
 
+    total_processed = stats["SO"] + stats["SI"] + stats["CANCELLED"]
+    frappe.logger().info(f"[Shopee Sync] DONE processed={total_processed} errors={stats['errors']} api_calls={stats['api_calls']}")
     return {
         "from": time_from,
         "to": time_to,
-        "processed": processed,   # {"SO": n, "SI": n, "PE": n, "CANCELLED": n}
-        "errors": errors,
+        "processed": {"SO": stats["SO"], "SI": stats["SI"], "PE": stats["PE"], "CANCELLED": stats["CANCELLED"]},
+        "errors": stats["errors"],
         "last_update_time": highest_ut,
-        "success": True if (processed["SO"] + processed["SI"] + processed["CANCELLED"]) > 0 else (errors == 0),
+        "api_calls": stats["api_calls"],
+        "success": (total_processed > 0 and stats["errors"] == 0) or (stats["errors"] == 0),
+        "window": {"from_iso": human_from, "to_iso": human_to}
     }
 
 @frappe.whitelist()
