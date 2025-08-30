@@ -88,8 +88,6 @@ def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_k
         incoming_sig = (
             headers.get("Authorization")
             or headers.get("authorization")
-            or headers.get("X-Shopee-Signature")
-            or headers.get("x-shopee-signature")
             or ""
         ).strip()
 
@@ -98,7 +96,7 @@ def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_k
             frappe.logger().info(f"[Shopee Webhook Debug] Headers available: {list(headers.keys())}")
             return False
 
-        # Pastikan body tetap raw string persis
+        # Base string = url|raw_body (raw_body harus persis sama dengan yang Shopee kirim)
         body_str = raw_body.decode("utf-8")
         base_string = f"{url}|{body_str}"
 
@@ -111,12 +109,11 @@ def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_k
 
         # Debug log untuk perbandingan
         frappe.logger().info(
-            f"[Shopee Webhook Debug] "
-            f"url={url}, raw_body_len={len(raw_body)} "
-            f"incoming={incoming_sig[:16]}... calc={digest[:16]}..."
+            f"[Shopee Webhook Debug] url={url}, len={len(raw_body)}, "
+            f"incoming={incoming_sig[:16]}..., calc={digest[:16]}..."
         )
 
-        if incoming_sig == digest:
+        if hmac.compare_digest(incoming_sig, digest):
             frappe.logger().info("[Shopee Webhook] ✓ Signature verified successfully")
             return True
         else:
@@ -572,6 +569,36 @@ def health_check():
     }
 
 def log_webhook_activity(webhook_data, headers, raw_body, result, processing_time, source="Shopee Live"):
+    """Log webhook activity to database"""
+    try:
+        # Extract order info
+        order_data = webhook_data.get('data', {}) if webhook_data else {}
+        
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Webhook Log",
+            "timestamp": frappe.utils.now(),
+            "order_sn": order_data.get('ordersn', '') or webhook_data.get('order_sn', '') if webhook_data else '',
+            "shop_id": str(webhook_data.get('shop_id', '')) if webhook_data else '',
+            "status": order_data.get('status', ''),
+            "event_type": webhook_data.get('event', ''),   # <<-- fix di sini
+            "raw_data": json.dumps(webhook_data, indent=2) if webhook_data else str(raw_body),
+            "headers": json.dumps(headers, indent=2),
+            "response_status": "Success" if result.get('success') else "Error",
+            "error_message": result.get('error', '') if not result.get('success') else '',
+            "processing_time": processing_time,
+            "source": source,
+            "ip_address": frappe.request.environ.get('REMOTE_ADDR', 'Unknown')
+        })
+        
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        
+        status_icon = "✅" if result.get('success') else "❌"
+        print(f"{status_icon} Webhook: {log_doc.order_sn or 'No Order'} | "
+              f"{log_doc.event_type or 'No Event'} | {processing_time:.1f}ms")
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to log webhook activity: {str(e)}")
     """Log webhook activity to database"""
     try:
         # Extract order info
