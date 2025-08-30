@@ -466,12 +466,13 @@ def create_payment_entry_from_shopee(
     enqueue: bool = False
 ) -> str | None:
     """
-    Create Payment Entry for Shopee escrow settlement (support payload baru dengan response.order_income).
+    Create Payment Entry for Shopee escrow settlement (mendukung payload flat & response.order_income).
+    - Anti duplikat PE (cek Payment Entry Reference ke SI yang sama)
+    - Allocated amount = net + total_deductions (aturan ERPNext)
     """
 
-    # === NEW: normalisasi payload ===
+    # --- Normalisasi payload escrow ---
     norm = _normalize_escrow_payload(escrow or {})
-    # override net_amount & posting_ts pakai hasil normalisasi kalau ada
     net = flt(norm.get("net_amount") or net_amount)
     posting_ts = posting_ts or norm.get("payout_time")
 
@@ -493,23 +494,25 @@ def create_payment_entry_from_shopee(
         if si.docstatus != 1:
             frappe.throw(f"Sales Invoice {si.name} not submitted")
 
-        # === NEW: anti-duplikat Payment Entry untuk SI yang sama ===
-        pe_exists = frappe.db.exists(
+        # --- Anti duplikat PE untuk SI yang sama ---
+        pe_ref_row = frappe.db.exists(
             "Payment Entry Reference",
             {"reference_doctype": "Sales Invoice", "reference_name": si.name}
         )
-        if pe_exists:
-            frappe.logger().info(f"[Shopee] Skip PE; reference already exists for SI {si.name}")
-            return frappe.db.get_value("Payment Entry Reference", pe_exists, "parent")
+        if pe_ref_row:
+            parent_pe = frappe.db.get_value("Payment Entry Reference", pe_ref_row, "parent")
+            frappe.logger().info(f"[Shopee] Skip PE; already exists {parent_pe} for SI {si.name}")
+            return parent_pe
 
-        # Import helpers…
+        # --- Helpers dari api.py ---
         from .api import _get_or_create_account, _get_or_create_mode_of_payment, _insert_submit_with_retry
 
-        paid_from = si.debit_to
-        paid_to = _get_or_create_account("Shopee (Escrow)", "Bank")
+        # Akun & MOP
+        paid_from = si.debit_to                                     # piutang
+        paid_to = _get_or_create_account("Shopee (Escrow)", "Bank") # kas/bank
         mop = _get_or_create_mode_of_payment("Shopee")
 
-        # === NEW: gunakan nilai fee dari 'norm' (sudah bersih) ===
+        # --- Biaya (deductions) dari payload yang sudah dinormalisasi ---
         fees = {
             "commission": flt(norm.get("commission_fee")),
             "service": flt(norm.get("service_fee")),
@@ -517,6 +520,7 @@ def create_payment_entry_from_shopee(
             "shipdiff": flt(norm.get("shipping_fee_difference")),
             "voucher": flt(norm.get("voucher_seller")) + flt(norm.get("coin_cash_back")) + flt(norm.get("voucher_code_seller")),
         }
+        total_fees = sum(v for v in fees.values() if flt(v) > 0)
 
         fee_accounts = {
             "commission": _get_or_create_account("Komisi Shopee", "Expense Account"),
@@ -528,6 +532,7 @@ def create_payment_entry_from_shopee(
 
         posting_date = _date_iso_from_epoch(posting_ts)
 
+        # --- Build Payment Entry ---
         pe = frappe.new_doc("Payment Entry")
         pe.company = si.company
         pe.payment_type = "Receive"
@@ -536,22 +541,26 @@ def create_payment_entry_from_shopee(
         pe.party = si.customer
         pe.posting_date = posting_date
         pe.reference_no = order_sn
-        pe.paid_from = paid_from
-        pe.paid_to = paid_to
+
+        pe.paid_from = paid_from            # Debtors (piutang)
+        pe.paid_to = paid_to                # Shopee (Escrow) - Bank
         pe.paid_amount = flt(net)
         pe.received_amount = flt(net)
 
+        # Link ke SI — allocated harus = paid_amount + total_deductions
         ref = pe.append("references", {})
         ref.reference_doctype = "Sales Invoice"
         ref.reference_name = si.name
-        ref.allocated_amount = flt(net)  # ⬅️ allocated = net (fee ditaruh di deductions)
+        ref.allocated_amount = flt(net) + flt(total_fees)
 
+        # Tambahkan deductions untuk tiap fee
         for fee_type, amount in fees.items():
             if flt(amount) > 0:
                 row = pe.append("deductions", {})
                 row.account = fee_accounts[fee_type]
                 row.amount = flt(amount)
 
+        # Simpan & submit
         pe = _insert_submit_with_retry(pe)
         frappe.logger().info(f"[Shopee] Payment Entry {pe.name} created for SI {si.name}")
         return pe.name
