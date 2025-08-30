@@ -358,41 +358,33 @@ def handle_order_status_update(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_payment_update(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle payment/escrow/payout events dengan guard refund/net=0 (soft-skip)."""
+    """Handle payment/escrow/payout events (refund aware + soft-skip)."""
+    # dukung push v2 & event lama
     order_sn = data.get("order_sn", "") or (data.get("data", {}) or {}).get("ordersn", "")
     event_type = data.get("event", "") or (data.get("data", {}) or {}).get("status", "")
 
     if not order_sn:
         return {"success": False, "error": "missing_order_sn"}
 
-    # Cari SI terkait
     si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
     if not si_name:
         frappe.logger().info(f"[Shopee] No Sales Invoice found for order {order_sn}")
-        return {
-            "success": True,
-            "message": "no_invoice_found",
-            "order_sn": order_sn,
-            "event_type": event_type
-        }
+        return {"success": True, "message": "no_invoice_found", "order_sn": order_sn, "event_type": event_type}
 
-    # Normalisasi payload untuk ambil net/fees/flags
     norm = _normalize_escrow_payload(data)
+    net_amount = flt(norm.get("net_amount"))
     escrow_amount = flt(norm.get("escrow_amount"))
     payout_amount = flt(norm.get("payout_amount"))
     refund_amount = flt(norm.get("refund_amount"))
-    net_amount = flt(norm.get("net_amount"))
     is_refund = bool(norm.get("is_refund"))
-
     commission_fee = flt(norm.get("commission_fee"))
     service_fee = flt(norm.get("service_fee"))
 
     frappe.logger().info(
-        f"[Shopee] Payment event for SI {si_name} | net={net_amount} escrow={escrow_amount} "
-        f"payout={payout_amount} refund={refund_amount} is_refund={is_refund}"
+        f"[Shopee] Payment event for SI {si_name} | net={net_amount} escrow={escrow_amount} payout={payout_amount} refund={refund_amount} is_refund={is_refund}"
     )
 
-    # Soft-skip jika net <= 0 (umumnya refund/void/belum settle)
+    # SOFT-SKIP jika net tidak ada / refund
     if net_amount <= 0:
         note = "refund_or_not_settled" if is_refund or refund_amount > 0 else "not_settled_yet"
         frappe.logger().info(f"[Shopee] Skip enqueue PE: net_amount<=0 ({note}) for order {order_sn}")
@@ -412,10 +404,9 @@ def handle_payment_update(data: Dict[str, Any]) -> Dict[str, Any]:
             "note": f"skip_create_pe:{note}"
         }
 
-    # Jika ada net > 0 → buat/enqueue PE
+    # net > 0 → enqueue pembuatan Payment Entry
     try:
         posting_ts = _safe_int(norm.get("payout_time") or data.get("payout_time") or data.get("update_time"))
-
         pe_job = create_payment_entry_from_shopee(
             si_name=si_name,
             escrow=data,
@@ -424,7 +415,6 @@ def handle_payment_update(data: Dict[str, Any]) -> Dict[str, Any]:
             posting_ts=posting_ts,
             enqueue=True
         )
-
         return {
             "success": True,
             "message": "payment_event_processed",
@@ -433,19 +423,11 @@ def handle_payment_update(data: Dict[str, Any]) -> Dict[str, Any]:
             "sales_invoice": si_name,
             "payment_entry_job": pe_job,
             "note": "Payment Entry creation enqueued",
-            "amounts": {
-                "net_amount": net_amount,
-                "escrow_amount": escrow_amount,
-                "payout_amount": payout_amount,
-                "refund_amount": refund_amount,
-                "commission_fee": commission_fee,
-                "service_fee": service_fee
-            }
         }
-
     except Exception as e:
         frappe.log_error(f"Payment Entry creation failed for {order_sn}: {str(e)}", "Shopee Payment")
         return {"success": False, "error": str(e), "order_sn": order_sn, "event_type": event_type}
+
 
 def handle_order_created(data: Dict[str, Any]) -> Dict[str, Any]:
     """Handle new order creation events"""
@@ -502,46 +484,31 @@ def _normalize_escrow_payload(payload: dict) -> dict:
     root = (payload or {}).get("response") or (payload or {})
     oi = root.get("order_income") or {}
 
-    # Nilai-nilai dasar
     payout_amount = flt(root.get("payout_amount") or oi.get("payout_amount"))
     escrow_amount = flt(
         oi.get("escrow_amount_after_adjustment")
         or oi.get("escrow_amount")
         or root.get("escrow_amount")
     )
-
-    # Komponen refund/adjustment (opsional; tergantung versi payload)
-    refund_amount = flt(
-        root.get("refund_amount")
-        or oi.get("refund_amount")
-        or oi.get("refund_to_buyer_amount")
-    )
+    refund_amount = flt(root.get("refund_amount") or oi.get("refund_amount") or oi.get("refund_to_buyer_amount"))
     reverse_shipping_fee = flt(oi.get("reverse_shipping_fee"))
+    shipping_rebate = flt(oi.get("shopee_shipping_rebate"))
     return_to_seller = flt(oi.get("return_to_seller_amount"))
 
-    # Net default: payout > escrow; kalau kosong keduanya, jatuh 0
-    net_amount = payout_amount or escrow_amount
-
-    # Bila refund ada dan positif → kecilkan net
+    # net default + kurangi refund bila ada
+    net_amount = (payout_amount or escrow_amount)
     if refund_amount > 0:
         net_amount = flt(net_amount - refund_amount)
 
-    # Fees/komponen lain
     commission_fee = flt(oi.get("commission_fee"))
-    # service_fee = layanan + biaya transaksi + cc fee
     service_fee = flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee"))
-
     protection_fee = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
-    shipping_rebate = flt(oi.get("shopee_shipping_rebate"))
     shipping_fee_difference = reverse_shipping_fee - shipping_rebate
-
     voucher_seller = flt(oi.get("voucher_from_seller"))
     coin_cash_back = flt(oi.get("coins"))
     voucher_code_seller = flt(oi.get("voucher_code_seller"))
 
     payout_time = root.get("payout_time") or root.get("update_time")
-
-    # Flag refund (kasus net <= 0 atau refund_amount > 0)
     is_refund = (refund_amount > 0) or (net_amount <= 0)
 
     return {
@@ -584,25 +551,9 @@ def create_payment_entry_from_shopee(
     net = flt(norm.get("net_amount") or net_amount)
     posting_ts = posting_ts or norm.get("payout_time")
 
-    # SOFT-SKIP: net <= 0 (refund / belum settle)
-    if net <= 0:
-        frappe.logger().info(f"[Shopee PE] Skip: net_amount=0 untuk order {order_sn}; tidak buat Payment Entry")
-        try:
-            _norm_preview = {
-                "net_amount": norm.get("net_amount"),
-                "escrow_amount": norm.get("escrow_amount"),
-                "payout_amount": norm.get("payout_amount"),
-                "refund_amount": norm.get("refund_amount"),
-                "commission_fee": norm.get("commission_fee"),
-                "service_fee": norm.get("service_fee"),
-                "payout_time": norm.get("payout_time"),
-                "is_refund": norm.get("is_refund"),
-            }
-            frappe.logger().info(f"[Shopee PE] norm={_norm_preview}")
-        except Exception:
-            pass
-        return None
-
+    if net <= 0:  # NEW
+        #frappe.throw(f"[Shopee PE] Net amount is 0 untuk order {order_sn}, Payment Entry tidak dibuat")  # NEW
+        return None  # NEW
     if enqueue:
         return frappe.enqueue(
             "shopee_bridge.webhook.create_payment_entry_from_shopee",
@@ -677,17 +628,16 @@ def create_payment_entry_from_shopee(
 
         precision = _pe_precision(pe)
 
-        # Cegah rounding ke 0
         rounded_net = flt(net, precision)
         if rounded_net <= 0:
             frappe.logger().info(f"[Shopee PE] Skip: rounded net {net} -> 0 @precision {precision} untuk {order_sn}")
             return None
-
+        
         # Uang yang diterima (ke escrow) = NET (dibulatkan ke presisi PE)
         pe.paid_from = paid_from
         pe.paid_to = paid_to
-        pe.paid_amount = rounded_net
-        pe.received_amount = rounded_net
+        pe.paid_amount = flt(net, precision)
+        pe.received_amount = flt(net, precision)
 
         # Build deductions dengan presisi PE
         total_deductions = 0.0
@@ -709,7 +659,7 @@ def create_payment_entry_from_shopee(
             row.cost_center = default_cc
             total_deductions += diff_fee
 
-        # allocated_amount = paid_amount + total_deductions (dibulatkan)
+        # allocated_amount harus = paid_amount + total_deductions (dibulatkan) → sama dengan GROSS setelah rounding
         allocated = flt(pe.paid_amount + total_deductions, precision)
 
         ref = pe.append("references", {})
@@ -717,6 +667,7 @@ def create_payment_entry_from_shopee(
         ref.reference_name = si.name
         ref.allocated_amount = allocated
 
+        # (Opsional) Log kalau alokasi ≠ gross setelah rounding → hanya warning
         gross_r = flt(gross, precision)
         if allocated != gross_r:
             frappe.logger().warning(
@@ -729,6 +680,7 @@ def create_payment_entry_from_shopee(
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
         raise
+
 
 def _get_or_create_expense_account(account_name: str) -> str:
     """Pastikan akun Expense untuk deductions ada & valid."""
@@ -857,10 +809,10 @@ def test_webhook():
 
 @frappe.whitelist()
 def webhook_info():
-    """Get webhook configuration info"""
     try:
         s = _settings()
-        
+        has_live_push = bool(getattr(s, "live_push_partner_key", "") or getattr(s, "webhook_key", ""))
+
         return {
             "success": True,
             "webhook_configuration": {
@@ -873,7 +825,8 @@ def webhook_info():
                 "partner_id": getattr(s, "partner_id", ""),
                 "shop_id": getattr(s, "shop_id", ""),
                 "has_access_token": bool(getattr(s, "access_token", "")),
-                "has_partner_key": bool(getattr(s, "partner_key", ""))
+                "has_partner_key": bool(getattr(s, "partner_key", "")),
+                "has_live_push_partner_key": has_live_push,  # NEW
             },
             "development_notes": [
                 "Signature verification currently bypassed in Test environment",
@@ -882,10 +835,8 @@ def webhook_info():
                 "Monitor logs with: docker logs -f erpnext_app | grep Webhook"
             ]
         }
-        
     except Exception as e:
         return {"success": False, "error": str(e)}
-
 
 @frappe.whitelist(allow_guest=True)
 def health_check():
