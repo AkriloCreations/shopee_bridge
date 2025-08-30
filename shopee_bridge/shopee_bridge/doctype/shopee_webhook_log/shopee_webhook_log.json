@@ -1,0 +1,118 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-08-30 22:18:01.459543",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "timestamp",
+  "order_sn",
+  "shop_id",
+  "status",
+  "event_type",
+  "raw_data",
+  "headers",
+  "response_status",
+  "error_message",
+  "processing_time",
+  "source",
+  "ip_address"
+ ],
+ "fields": [
+  {
+   "fieldname": "timestamp",
+   "fieldtype": "Datetime",
+   "label": "Timestamp",
+   "reqd": 1
+  },
+  {
+   "fieldname": "order_sn",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Order SN"
+  },
+  {
+   "fieldname": "shop_id",
+   "fieldtype": "Data",
+   "label": "Shop ID"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "PROCESSED\nREADY_TO_SHIP\nSHIPPED\nCANCELLED"
+  },
+  {
+   "fieldname": "event_type",
+   "fieldtype": "Data",
+   "label": "Event Type"
+  },
+  {
+   "fieldname": "raw_data",
+   "fieldtype": "Long Text",
+   "label": "Raw Data"
+  },
+  {
+   "fieldname": "headers",
+   "fieldtype": "Long Text",
+   "label": "Headers"
+  },
+  {
+   "fieldname": "response_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Response Status",
+   "options": "Success\nFailed\nError"
+  },
+  {
+   "fieldname": "error_message",
+   "fieldtype": "Long Text",
+   "label": "Error Message"
+  },
+  {
+   "fieldname": "processing_time",
+   "fieldtype": "Float",
+   "label": "Processing Time (ms)"
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Source",
+   "options": "Shopee Test\nShopee Live\nPostman Test"
+  },
+  {
+   "fieldname": "ip_address",
+   "fieldtype": "Data",
+   "label": "IP Address"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-08-30 23:12:17.675327",
+ "modified_by": "Administrator",
+ "module": "Shopee Bridge",
+ "name": "Shopee Webhook Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
