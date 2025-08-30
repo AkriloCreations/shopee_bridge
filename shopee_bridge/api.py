@@ -3,7 +3,7 @@ from frappe.utils import get_url, flt, nowdate, cint, add_days, now, format_date
 from datetime import datetime, timedelta, timezone
 import json
 from .webhook import create_payment_entry_from_shopee
-from shopee_bridge.webhook import create_payment_entry_from_shopee
+from shopee_bridge.webhook import create_payment_entry_from_shopee, _get_or_create_bank_account
 
 try:
     from zoneinfo import ZoneInfo
@@ -1325,6 +1325,22 @@ def _extract_dates_from_order(order_detail):
         delivery_date = add_days(transaction_date, 3)
     
     return transaction_date, delivery_date
+
+def _get_or_create_mode_of_payment(name: str) -> str:
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    mop_name = name if frappe.db.exists("Mode of Payment", name) else \
+        frappe.get_doc({"doctype": "Mode of Payment", "mode_of_payment": name}).insert(ignore_permissions=True).name
+
+    # map akun ke company
+    exists = frappe.db.exists("Mode of Payment Account", {"parent": mop_name, "company": company})
+    if not exists:
+        bank_acc = _get_or_create_bank_account("Shopee (Escrow)", "Bank")
+        mop = frappe.get_doc("Mode of Payment", mop_name)
+        row = mop.append("accounts", {})
+        row.company = company
+        row.default_account = bank_acc
+        mop.save(ignore_permissions=True)
+    return mop_name
 
 @frappe.whitelist()
 def debug_sign():

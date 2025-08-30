@@ -11,11 +11,68 @@ from frappe.utils import flt, nowdate # pyright: ignore[reportMissingImports]
 def _settings():
     return frappe.get_single("Shopee Settings")
 
+def _extract_push_info(payload: dict) -> dict:
+    """Ekstrak field penting dari format Shopee Push (root: code, shop_id, timestamp; data: ordersn, status, update_time)."""
+    d = (payload or {}).get("data") or {}
+    return {
+        "order_sn": d.get("ordersn") or payload.get("order_sn") or "",
+        "status": d.get("status") or payload.get("status") or "",
+        "update_time": d.get("update_time") or payload.get("update_time"),
+        "code": payload.get("code"),
+        "shop_id": payload.get("shop_id"),
+        "timestamp": payload.get("timestamp"),
+        "completed_scenario": d.get("completed_scenario"),
+    }
+
 def _safe_flt(v, d=0.0):
     try:
         return float(v) if v not in (None, "") else d
     except Exception:
         return d
+def _get_live_push_key() -> str:
+    s = _settings()
+    # sesuaikan nama field di Doctype Settings kamu
+    return (getattr(s, "live_push_partner_key", "") or getattr(s, "webhook_key", "") or "").strip()
+
+def _consteq(a: bytes, b: bytes) -> bool:
+    try:
+        import hmac
+        return hmac.compare_digest(a, b)
+    except Exception:
+        return False
+
+def _decode_sig_variants(sig_str: str) -> list[bytes]:
+    import base64, binascii
+    s = sig_str.strip()
+    low = s.lower()
+    for pref in ("sha256=", "hmac=", "signature="):
+        if low.startswith(pref):
+            s = s[len(pref):].strip()
+            break
+    outs = []
+    # hex
+    try: outs.append(binascii.unhexlify(s))
+    except Exception: pass
+    # base64
+    try: outs.append(base64.b64decode(s, validate=False))
+    except Exception: pass
+    # base64url (+ padding)
+    try:
+        pad = '=' * (-len(s) % 4)
+        outs.append(base64.urlsafe_b64decode(s + pad))
+    except Exception: pass
+    return [x for x in outs if x]
+
+def _get_default_cost_center_for_si(si) -> str:
+    """Cari Cost Center default (item SI → Accounts Settings → leaf company)."""
+    for it in getattr(si, "items", []):
+        if getattr(it, "cost_center", None):
+            return it.cost_center
+    cc = frappe.db.get_single_value("Accounts Settings", "default_cost_center")
+    if cc: return cc
+    cc = frappe.db.get_value("Cost Center", {"company": si.company, "is_group": 0}, "name")
+    if cc: return cc
+    frappe.throw("No Cost Center found. Set default in Accounts Settings or on Sales Invoice items.")
 
 def _safe_int(v, d=0):
     try:
@@ -47,12 +104,8 @@ def shopee_webhook():
             return {"success": True, "message": "CORS handled"}
         
         # Get request data
-        raw_body = frappe.request.get_data() or b""
+        raw_body = frappe.request.get_data(as_text=False) or b""
         headers = dict(frappe.request.headers or {})
-        
-        # Fix 417 error by handling Expect header
-        frappe.local.response.headers = frappe.local.response.headers or {}
-        frappe.local.response.headers["Expect"] = ""
         
         # Parse webhook data
         webhook_data = None
@@ -102,54 +155,61 @@ def shopee_webhook():
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Critical Error")
         return result
     
-def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_key: str) -> bool:
+def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_key_unused: str) -> bool:
     """
-    Shopee Webhook Signature Verification (Push Mechanism v2)
-    Docs: https://open.shopee.com
-    - Signature = HMAC-SHA256(partner_key, url + '|' + request_body).hexdigest()
-    - Shopee sends signature in 'Authorization' header.
+    Shopee Push v2:
+      Signature = HMAC-SHA256( LIVE_PUSH_PARTNER_KEY, RAW_BODY )
+      Header   = Authorization  (umumnya hex lowercase; antisipasi base64/base64url)
+    NOTE: 'url' TIDAK dipakai dalam perhitungan signature untuk push.
     """
     try:
-        # Ambil signature dari header
-        incoming_sig = (
-            headers.get("Authorization")
-            or headers.get("authorization")
-            or ""
-        ).strip()
-
-        if not incoming_sig:
+        incoming = (headers.get("Authorization") or headers.get("authorization") or "").strip()
+        if not incoming:
             frappe.logger().error("[Shopee Webhook] No signature header found")
-            frappe.logger().info(f"[Shopee Webhook Debug] Headers available: {list(headers.keys())}")
             return False
 
-        # Base string = url|raw_body (raw_body harus persis sama dengan yang Shopee kirim)
-        body_str = raw_body.decode("utf-8")
-        base_string = f"{url}|{body_str}"
-
-        # Hitung HMAC-SHA256 pakai partner_key
-        digest = hmac.new(
-            partner_key.encode("utf-8"),
-            base_string.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
-        # Debug log untuk perbandingan
-        frappe.logger().info(
-            f"[Shopee Webhook Debug] url={url}, len={len(raw_body)}, "
-            f"incoming={incoming_sig[:16]}..., calc={digest[:16]}..."
-        )
-
-        if hmac.compare_digest(incoming_sig, digest):
-            frappe.logger().info("[Shopee Webhook] ✓ Signature verified successfully")
-            return True
-        else:
-            frappe.logger().warning("[Shopee Webhook] ✗ Invalid signature")
+        key = _get_live_push_key()
+        if not key:
+            frappe.logger().error("[Shopee Webhook] Live Push Partner Key not configured")
             return False
+
+        # coba body apa adanya, dan varian rstrip CR/LF
+        bodies = [raw_body]
+        if raw_body.endswith((b"\r", b"\n")):
+            bodies.append(raw_body.rstrip(b"\r\n"))
+
+        incoming_candidates = _decode_sig_variants(incoming)
+
+        for b in bodies:
+            digest = hmac.new(key.encode("utf-8"), b, hashlib.sha256).digest()
+
+            # match semua kandidat (hex/base64/base64url)
+            for inc in incoming_candidates:
+                if inc and _consteq(digest, inc):
+                    frappe.logger().info("[Shopee Webhook] ✓ Signature verified")
+                    return True
+
+            # juga coba perbandingan langsung hex lowercase (format paling sering)
+            if _consteq(digest.hex().encode(), incoming.lower().encode()):
+                frappe.logger().info("[Shopee Webhook] ✓ Signature verified (hex)")
+                return True
+
+        # debug singkat
+        try:
+            calc_hex = hmac.new(key.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+            calc_hex_trim = hmac.new(key.encode("utf-8"), raw_body.rstrip(b"\r\n"), hashlib.sha256).hexdigest()
+            frappe.logger().warning(
+                f"[Shopee Webhook] ✗ Invalid signature; got={incoming[:16]}..., "
+                f"calc={calc_hex[:16]}..., calc_trim={calc_hex_trim[:16]}..., len={len(raw_body)}"
+            )
+        except Exception:
+            pass
+
+        return False
 
     except Exception as e:
         frappe.logger().error(f"[Shopee Webhook] Signature verification error: {e}")
         return False
-
 
 def _normalize_signature(sig_raw: str) -> str:
     """Remove common prefixes from signature"""
@@ -218,13 +278,37 @@ def _verify_with_key(signature: str, raw_body: bytes, key: str, key_name: str) -
 
 
 def process_webhook_event(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Process webhook event based on type"""
-    event = data.get("event", "").strip().lower()
+    """Process webhook event untuk 2 format:
+       1) Shopee Push v2 (tanpa 'event', pakai root+data)
+       2) Event-based lama (punya 'event', 'order_sn')
+    """
+    # 1) Format Shopee Push v2 (punya root 'data' dan 'ordersn' di dalamnya)
+    if isinstance(data, dict) and isinstance(data.get("data"), dict) and "ordersn" in data["data"]:
+        info = _extract_push_info(data)
+        frappe.logger().info(
+            f"[Shopee Push] ordersn={info['order_sn']} status={info['status']} code={info['code']} shop_id={info['shop_id']}"
+        )
+
+        # Di sini kamu bisa memetakan status push -> handler spesifik kalau mau
+        # Untuk sekarang: log dulu sebagai 'push_logged'
+        return {
+            "success": True,
+            "message": "push_logged",
+            "order_sn": info["order_sn"],
+            "status": info["status"],
+            "code": info["code"],
+            "shop_id": info["shop_id"],
+            "update_time": info["update_time"],
+            "timestamp": info["timestamp"],
+            "completed_scenario": info["completed_scenario"],
+        }
+
+    # 2) Fallback: event-based payload (seperti versi lama kamu)
+    event = (data.get("event") or "").strip().lower()
     order_sn = data.get("order_sn", "")
-    
-    frappe.logger().info(f"[Shopee Webhook] Processing event: {event} for order: {order_sn}")
-    
-    # Route to specific handlers
+
+    frappe.logger().info(f"[Shopee Webhook] Processing event: {event or '—'} for order: {order_sn or '—'}")
+
     if event == "order_status_update":
         return handle_order_status_update(data)
     elif event in ["payment_update", "escrow_settled", "payout"]:
@@ -232,14 +316,12 @@ def process_webhook_event(data: Dict[str, Any]) -> Dict[str, Any]:
     elif event == "order_created":
         return handle_order_created(data)
     else:
-        frappe.logger().info(f"[Shopee Webhook] Unhandled event type: {event}")
         return {
             "success": True,
-            "message": f"Event '{event}' logged but not processed",
-            "event_type": event,
+            "message": f"Event '{event or 'unknown'}' logged",
+            "event_type": event or "unknown",
             "order_sn": order_sn
         }
-
 
 def handle_order_status_update(data: Dict[str, Any]) -> Dict[str, Any]:
     """Handle order status update events"""
@@ -399,19 +481,10 @@ def handle_order_created(data: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 def _normalize_escrow_payload(payload: dict) -> dict:
-    """
-    Normalisasi berbagai bentuk payload escrow Shopee (flat vs. response.order_income).
-    Mengembalikan dict dengan key yang dipakai kode kita saat bikin Payment Entry.
-    """
-    # payload bisa: {"response": {...}} atau langsung {...}
+    """Normalisasi payload escrow Shopee (flat / response.order_income)."""
     root = (payload or {}).get("response") or (payload or {})
     oi = root.get("order_income") or {}
-    bpi = root.get("buyer_payment_info") or {}
 
-    # Net amount yg kita terima:
-    # - prioritas payout_amount (kalau Shopee sudah settle), 
-    # - fallback escrow_amount_after_adjustment, 
-    # - lalu escrow_amount.
     payout_amount = flt(root.get("payout_amount") or oi.get("payout_amount"))
     escrow_amount = flt(
         oi.get("escrow_amount_after_adjustment")
@@ -420,42 +493,21 @@ def _normalize_escrow_payload(payload: dict) -> dict:
     )
     net_amount = payout_amount or escrow_amount
 
-    # Fee yang jadi beban seller:
-    commission_fee = flt(oi.get("commission_fee"))
-    service_fee = flt(oi.get("service_fee"))
-    # Shopee sering memecah fee transaksi:
-    seller_txn_fee = flt(oi.get("seller_transaction_fee"))
-    cc_txn_fee = flt(oi.get("credit_card_transaction_fee"))
-
-    # Proteksi & ongkir selisih:
-    protection_fee = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
-    # reverse_shipping_fee = biaya pengembalian ke seller; shopee_shipping_rebate = reimbursenya
-    ship_diff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
-
-    # Voucher yang jadi beban seller (bukan voucher Shopee)
-    voucher_seller = flt(oi.get("voucher_from_seller"))
-    # coin cashback yang jadi beban seller → biasanya 0; kalau mau, ambil dari oi.get("coins")
-    coin_cash_back = flt(oi.get("coins"))  # treat as seller-side if policy kamu begitu
-    voucher_code_seller = 0.0  # tidak ada di payload contoh
-
-    # Timestamp untuk posting
-    payout_time = root.get("payout_time") or root.get("update_time")
-
-    normalized = {
-        "net_amount": net_amount,                       # ← inilah yang dipakai utk PE.paid_amount
+    data = {
+        "net_amount": net_amount,
         "escrow_amount": escrow_amount,
         "payout_amount": payout_amount,
-        "commission_fee": commission_fee,
-        "service_fee": service_fee + seller_txn_fee + cc_txn_fee,  # gabungkan fee transaksi ke service
-        "shipping_seller_protection_fee_amount": protection_fee,
-        "shipping_fee_difference": ship_diff,
-        "voucher_seller": voucher_seller,
-        "coin_cash_back": coin_cash_back,
-        "voucher_code_seller": voucher_code_seller,
-        "payout_time": payout_time,
+        "commission_fee": flt(oi.get("commission_fee")),
+        "service_fee": flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee")),
+        "shipping_seller_protection_fee_amount": flt(oi.get("delivery_seller_protection_fee_premium_amount")),
+        # shipdiff ± (reverse shipping - rebate)
+        "shipping_fee_difference": flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate")),
+        "voucher_seller": flt(oi.get("voucher_from_seller")),
+        "coin_cash_back": flt(oi.get("coins")),
+        "voucher_code_seller": 0.0,
+        "payout_time": root.get("payout_time") or root.get("update_time"),
     }
-    return normalized
-
+    return data
 
 def create_payment_entry_from_shopee(
     si_name: str,
@@ -466,12 +518,14 @@ def create_payment_entry_from_shopee(
     enqueue: bool = False
 ) -> str | None:
     """
-    Create Payment Entry for Shopee escrow settlement (mendukung payload flat & response.order_income).
-    - Anti duplikat PE (cek Payment Entry Reference ke SI yang sama)
-    - Allocated amount = net + total_deductions (aturan ERPNext)
+    Buat Payment Entry settlement Shopee:
+    - allocate = NET + total_deductions (== GROSS after rounding) → SI = Paid
+    - deductions = (GROSS - NET) (breakdown dari payload + satu baris 'Selisih Biaya Shopee' bila perlu)
+    - isi Cost Center (header & deductions)
+    - Reference Date wajib
+    - anti-duplikat PE per SI
+    - semua angka dibulatkan ke presisi PE → Difference Amount = 0
     """
-
-    # --- Normalisasi payload escrow ---
     norm = _normalize_escrow_payload(escrow or {})
     net = flt(norm.get("net_amount") or net_amount)
     posting_ts = posting_ts or norm.get("payout_time")
@@ -494,33 +548,35 @@ def create_payment_entry_from_shopee(
         if si.docstatus != 1:
             frappe.throw(f"Sales Invoice {si.name} not submitted")
 
-        # --- Anti duplikat PE untuk SI yang sama ---
-        pe_ref_row = frappe.db.exists(
+        # Anti-duplikat PE untuk SI ini
+        pe_ref = frappe.db.exists(
             "Payment Entry Reference",
             {"reference_doctype": "Sales Invoice", "reference_name": si.name}
         )
-        if pe_ref_row:
-            parent_pe = frappe.db.get_value("Payment Entry Reference", pe_ref_row, "parent")
-            frappe.logger().info(f"[Shopee] Skip PE; already exists {parent_pe} for SI {si.name}")
-            return parent_pe
+        if pe_ref:
+            return frappe.db.get_value("Payment Entry Reference", pe_ref, "parent")
 
-        # --- Helpers dari api.py ---
-        from .api import _insert_submit_with_retry
+        # Helpers
+        from .api import _get_or_create_mode_of_payment, _insert_submit_with_retry
 
-        # Akun & MOP
-        paid_from = si.debit_to                                     # piutang
+        paid_from = si.debit_to
         paid_to = _get_or_create_bank_account("Shopee (Escrow)")
         mop = _get_or_create_mode_of_payment("Shopee")
 
-        # --- Biaya (deductions) dari payload yang sudah dinormalisasi ---
-        fees = {
+        # Gross vs Net
+        gross = flt(si.grand_total)
+        expected_total_fees_raw = max(0, gross - net)
+
+        # Breakdown fees dari payload (raw, belum dibulatkan)
+        fees_raw = {
             "commission": flt(norm.get("commission_fee")),
             "service": flt(norm.get("service_fee")),
             "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
             "shipdiff": flt(norm.get("shipping_fee_difference")),
             "voucher": flt(norm.get("voucher_seller")) + flt(norm.get("coin_cash_back")) + flt(norm.get("voucher_code_seller")),
         }
-        total_fees = sum(v for v in fees.values() if flt(v) > 0)
+        payload_total_fees_raw = sum(v for v in fees_raw.values() if v > 0)
+        diff_fee_raw = expected_total_fees_raw - payload_total_fees_raw  # bisa +/- karena rounding/kelengkapan payload
 
         fee_accounts = {
             "commission": _get_or_create_expense_account("Komisi Shopee"),
@@ -529,9 +585,12 @@ def create_payment_entry_from_shopee(
             "shipdiff": _get_or_create_expense_account("Selisih Ongkir Shopee"),
             "voucher": _get_or_create_expense_account("Voucher Shopee"),
         }
-        posting_date = _date_iso_from_epoch(posting_ts)
+        diff_account = _get_or_create_expense_account("Selisih Biaya Shopee")
 
-        # --- Build Payment Entry ---
+        posting_date = _date_iso_from_epoch(posting_ts)
+        ref_date = posting_date
+        default_cc = _get_default_cost_center_for_si(si)
+
         pe = frappe.new_doc("Payment Entry")
         pe.company = si.company
         pe.payment_type = "Receive"
@@ -540,76 +599,87 @@ def create_payment_entry_from_shopee(
         pe.party = si.customer
         pe.posting_date = posting_date
         pe.reference_no = order_sn
+        pe.reference_date = ref_date
+        pe.cost_center = default_cc
 
-        pe.paid_from = paid_from            # Debtors (piutang)
-        pe.paid_to = paid_to                # Shopee (Escrow) - Bank
-        pe.paid_amount = flt(net)
-        pe.received_amount = flt(net)
+        precision = _pe_precision(pe)
 
-        # Link ke SI — allocated harus = paid_amount + total_deductions
+        # Uang yang diterima (ke escrow) = NET (dibulatkan ke presisi PE)
+        pe.paid_from = paid_from
+        pe.paid_to = paid_to
+        pe.paid_amount = flt(net, precision)
+        pe.received_amount = flt(net, precision)
+
+        # Build deductions dengan presisi PE
+        total_deductions = 0.0
+        for k, v in fees_raw.items():
+            v = flt(v, precision)
+            if v > 0:
+                row = pe.append("deductions", {})
+                row.account = fee_accounts[k]
+                row.amount = v
+                row.cost_center = default_cc
+                total_deductions += v
+
+        # Tambahkan 1 baris selisih supaya balance pas di presisi PE
+        diff_fee = flt(diff_fee_raw, precision)
+        if abs(diff_fee) >= (1 / (10 ** max(precision, 0))):
+            row = pe.append("deductions", {})
+            row.account = diff_account
+            row.amount = diff_fee
+            row.cost_center = default_cc
+            total_deductions += diff_fee
+
+        # allocated_amount harus = paid_amount + total_deductions (dibulatkan) → sama dengan GROSS setelah rounding
+        allocated = flt(pe.paid_amount + total_deductions, precision)
+
         ref = pe.append("references", {})
         ref.reference_doctype = "Sales Invoice"
         ref.reference_name = si.name
-        ref.allocated_amount = flt(net) + flt(total_fees)
+        ref.allocated_amount = allocated
 
-        # Tambahkan deductions untuk tiap fee
-        for fee_type, amount in fees.items():
-            if flt(amount) > 0:
-                row = pe.append("deductions", {})
-                row.account = fee_accounts[fee_type]
-                row.amount = flt(amount)
+        # (Opsional) Log kalau alokasi ≠ gross setelah rounding → hanya warning
+        gross_r = flt(gross, precision)
+        if allocated != gross_r:
+            frappe.logger().warning(
+                f"[Shopee PE] allocated({allocated}) != gross({gross_r}) @precision {precision} for SI {si.name}"
+            )
 
-        # Simpan & submit
         pe = _insert_submit_with_retry(pe)
-        frappe.logger().info(f"[Shopee] Payment Entry {pe.name} created for SI {si.name}")
         return pe.name
 
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
         raise
-
 def _get_or_create_expense_account(account_name: str) -> str:
-    """Pastikan akun biaya (Expense) ada & valid untuk Payment Entry deductions."""
+    """Pastikan akun Expense untuk deductions ada & valid."""
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
 
-    # Cek existing by (account_name, company)
-    acc_name = frappe.db.get_value(
-        "Account",
-        {"account_name": account_name, "company": company},
-        "name",
-    )
+    acc_name = frappe.db.get_value("Account", {"company": company, "account_name": account_name}, "name")
     if acc_name:
         acc = frappe.get_doc("Account", acc_name)
         changed = False
-        if acc.is_group:
-            acc.is_group = 0; changed = True
-        if acc.root_type != "Expense":
-            acc.root_type = "Expense"; changed = True
-        if acc.account_type != "Expense Account":
-            acc.account_type = "Expense Account"; changed = True
-        # currency optional; set kalau field ada
+        if acc.is_group: acc.is_group = 0; changed = True
+        if acc.root_type != "Expense": acc.root_type = "Expense"; changed = True
+        if acc.account_type != "Expense Account": acc.account_type = "Expense Account"; changed = True
         if getattr(acc, "account_currency", None) and acc.account_currency != cur:
             acc.account_currency = cur; changed = True
-        if acc.disabled:
-            acc.disabled = 0; changed = True
-        if changed:
-            acc.save(ignore_permissions=True)
+        if acc.disabled: acc.disabled = 0; changed = True
+        if changed: acc.save(ignore_permissions=True)
         return acc.name
 
-    # Cari parent group untuk biaya: “Indirect Expenses” → “Direct Expenses” → root Expense
     parent = (
         frappe.db.get_value("Account", {"company": company, "account_name": "Indirect Expenses", "is_group": 1}, "name")
         or frappe.db.get_value("Account", {"company": company, "account_name": "Direct Expenses", "is_group": 1}, "name")
         or frappe.db.get_value("Account", {"company": company, "root_type": "Expense", "is_group": 1}, "name")
     )
-
     acc = frappe.get_doc({
         "doctype": "Account",
         "company": company,
         "account_name": account_name,
-        "is_group": 0,
         "parent_account": parent,
+        "is_group": 0,
         "root_type": "Expense",
         "account_type": "Expense Account",
         "account_currency": cur,
@@ -618,48 +688,33 @@ def _get_or_create_expense_account(account_name: str) -> str:
     return acc.name
 
 def _get_or_create_bank_account(account_name: str) -> str:
-    """Pastikan akun escrow Shopee ada & valid sebagai Bank Account."""
+    """Pastikan akun escrow Bank ada & valid."""
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
 
-    acc_name = frappe.db.get_value(
-        "Account",
-        {"account_name": account_name, "company": company},
-        "name",
-    )
+    acc_name = frappe.db.get_value("Account", {"company": company, "account_name": account_name}, "name")
     if acc_name:
         acc = frappe.get_doc("Account", acc_name)
         changed = False
-        if acc.is_group:
-            acc.is_group = 0; changed = True
-        if acc.root_type != "Asset":
-            acc.root_type = "Asset"; changed = True
-        if acc.account_type != "Bank":
-            acc.account_type = "Bank"; changed = True
+        if acc.is_group: acc.is_group = 0; changed = True
+        if acc.root_type != "Asset": acc.root_type = "Asset"; changed = True
+        if acc.account_type != "Bank": acc.account_type = "Bank"; changed = True
         if getattr(acc, "account_currency", None) and acc.account_currency != cur:
             acc.account_currency = cur; changed = True
-        if acc.disabled:
-            acc.disabled = 0; changed = True
-        if changed:
-            acc.save(ignore_permissions=True)
+        if acc.disabled: acc.disabled = 0; changed = True
+        if changed: acc.save(ignore_permissions=True)
         return acc.name
 
-    parent = frappe.db.get_value(
-        "Account",
-        {"company": company, "root_type": "Asset", "is_group": 1, "account_type": "Bank"},
-        "name",
-    ) or frappe.db.get_value(
-        "Account",
-        {"company": company, "root_type": "Asset", "is_group": 1},
-        "name",
+    parent = (
+        frappe.db.get_value("Account", {"company": company, "account_type": "Bank", "is_group": 1}, "name")
+        or frappe.db.get_value("Account", {"company": company, "root_type": "Asset", "is_group": 1}, "name")
     )
-
     acc = frappe.get_doc({
         "doctype": "Account",
         "company": company,
         "account_name": account_name,
-        "is_group": 0,
         "parent_account": parent,
+        "is_group": 0,
         "root_type": "Asset",
         "account_type": "Bank",
         "account_currency": cur,
@@ -667,21 +722,6 @@ def _get_or_create_bank_account(account_name: str) -> str:
     acc.insert(ignore_permissions=True)
     return acc.name
 
-def _get_or_create_mode_of_payment(name: str) -> str:
-    company = frappe.db.get_single_value("Global Defaults", "default_company")
-    mop_name = name if frappe.db.exists("Mode of Payment", name) else \
-        frappe.get_doc({"doctype": "Mode of Payment", "mode_of_payment": name}).insert(ignore_permissions=True).name
-
-    # map akun ke company
-    exists = frappe.db.exists("Mode of Payment Account", {"parent": mop_name, "company": company})
-    if not exists:
-        bank_acc = _get_or_create_bank_account("Shopee (Escrow)", "Bank")
-        mop = frappe.get_doc("Mode of Payment", mop_name)
-        row = mop.append("accounts", {})
-        row.company = company
-        row.default_account = bank_acc
-        mop.save(ignore_permissions=True)
-    return mop_name
 # =============================================================================
 # DEVELOPMENT & TEST FUNCTIONS
 # =============================================================================
@@ -781,17 +821,20 @@ def health_check():
 def log_webhook_activity(webhook_data, headers, raw_body, result, processing_time, source="Shopee Live"):
     """Log webhook activity to database"""
     try:
-        # Extract order info
         order_data = webhook_data.get('data', {}) if webhook_data else {}
-        
+        event_type = ""
+        if webhook_data:
+            # event-based atau push (pakai status)
+            event_type = (webhook_data.get('event') or "") or (order_data.get('status') or "")
+
         log_doc = frappe.get_doc({
             "doctype": "Shopee Webhook Log",
             "timestamp": frappe.utils.now(),
-            "order_sn": order_data.get('ordersn', '') or webhook_data.get('order_sn', '') if webhook_data else '',
+            "order_sn": (order_data.get('ordersn') or (webhook_data.get('order_sn') if webhook_data else "")) or "",
             "shop_id": str(webhook_data.get('shop_id', '')) if webhook_data else '',
             "status": order_data.get('status', ''),
-            "event_type": webhook_data.get('event', ''),   # <<-- fix di sini
-            "raw_data": json.dumps(webhook_data, indent=2) if webhook_data else str(raw_body),
+            "event_type": event_type,
+            "raw_data": json.dumps(webhook_data, indent=2) if webhook_data else (raw_body.decode(errors="replace") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body)),
             "headers": json.dumps(headers, indent=2),
             "response_status": "Success" if result.get('success') else "Error",
             "error_message": result.get('error', '') if not result.get('success') else '',
@@ -799,13 +842,110 @@ def log_webhook_activity(webhook_data, headers, raw_body, result, processing_tim
             "source": source,
             "ip_address": frappe.request.environ.get('REMOTE_ADDR', 'Unknown')
         })
-        
+
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
-        
+
         status_icon = "✅" if result.get('success') else "❌"
         print(f"{status_icon} Webhook: {log_doc.order_sn or 'No Order'} | "
               f"{log_doc.event_type or 'No Event'} | {processing_time:.1f}ms")
-        
+
     except Exception as e:
         frappe.logger().error(f"Failed to log webhook activity: {str(e)}")
+
+@frappe.whitelist(allow_guest=True)
+def repair_shopee_payment_entries(limit: int = 200):
+    """Perbaiki Payment Entry Shopee lama yang bikin SI 'Partly Paid'."""
+    fixed, skipped, errors = 0, 0, 0
+
+    sinvs = frappe.get_all(
+        "Sales Invoice",
+        filters={"docstatus": 1, "outstanding_amount": [">", 0], "custom_shopee_order_sn": ["!=", ""]},
+        fields=["name", "grand_total", "outstanding_amount", "customer", "company", "custom_shopee_order_sn"],
+        limit=limit,
+        order_by="modified desc",
+    )
+
+    for si_row in sinvs:
+        try:
+            ref = frappe.get_all(
+                "Payment Entry Reference",
+                filters={"reference_doctype": "Sales Invoice", "reference_name": si_row.name},
+                fields=["parent"],
+                limit=1,
+            )
+            if not ref:
+                skipped += 1
+                continue
+
+            pe = frappe.get_doc("Payment Entry", ref[0].parent)
+            if pe.docstatus != 1:
+                skipped += 1
+                continue
+
+            # kalau sudah allocate = gross, skip
+            alloc = 0
+            for r in pe.references:
+                if r.reference_doctype == "Sales Invoice" and r.reference_name == si_row.name:
+                    alloc = flt(r.allocated_amount); break
+            if abs(alloc - flt(si_row.grand_total)) < 0.01:
+                skipped += 1
+                continue
+
+            # cancel & amend
+            pe.cancel()
+            new_pe = frappe.copy_doc(pe)
+            new_pe.amended_from = pe.name
+            new_pe.docstatus = 0
+
+            # set allocate = GROSS
+            gross = flt(si_row.grand_total)
+            net = flt(new_pe.paid_amount)
+
+            for r in new_pe.references:
+                if r.reference_doctype == "Sales Invoice" and r.reference_name == si_row.name:
+                    r.allocated_amount = gross
+
+            # pastikan deductions total = gross - net
+            need = round(gross - net, 2)
+            have = round(sum(flt(d.amount) for d in new_pe.deductions), 2)
+            diff = round(need - have, 2)
+            if abs(diff) >= 0.01:
+                si_doc = frappe.get_doc("Sales Invoice", si_row.name)
+                cc = _get_default_cost_center_for_si(si_doc)
+                acc = _get_or_create_expense_account("Selisih Biaya Shopee")
+                row = new_pe.append("deductions", {})
+                row.account = acc
+                row.amount = flt(diff)
+                row.cost_center = cc
+
+            if not new_pe.reference_date:
+                new_pe.reference_date = new_pe.posting_date
+
+            from .api import _insert_submit_with_retry
+            _insert_submit_with_retry(new_pe)
+            fixed += 1
+
+        except Exception as e:
+            frappe.log_error(f"Repair PE for {si_row.name} failed: {e}", "Shopee Repair PE")
+            errors += 1
+
+    return {"fixed": fixed, "skipped": skipped, "errors": errors}
+
+def _pe_precision(pe) -> int:
+    # presisi angka uang pada Payment Entry (ikut company/currency)
+    try:
+        return pe.precision("paid_amount") or 2
+    except Exception:
+        return 2
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def dbg_verify_signature():
+    """
+    Kirim body mentah + Authorization header, endpoint ini hanya mem-verifikasi signature
+    TANPA memproses data. Gunakan untuk debug.
+    """
+    raw_body = frappe.request.get_data(as_text=False) or b""
+    headers = dict(frappe.request.headers or {})
+    ok = verify_webhook_signature(frappe.request.path, raw_body, headers, partner_key_unused="")
+    return {"ok": bool(ok), "len": len(raw_body)}
