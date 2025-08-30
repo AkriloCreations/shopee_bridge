@@ -1,14 +1,8 @@
 import time, hmac, hashlib, requests, frappe # pyright: ignore[reportMissingImports]
-from frappe.utils import get_url, nowdate # pyright: ignore[reportMissingImports]
+from frappe.utils import get_url, nowdate, flt # pyright: ignore[reportMissingImports]
 
 def _settings():
     return frappe.get_single("Shopee Settings")
-
-def _safe_int(v, d=0):
-    try:
-        return int(v) if v not in (None, "") else d
-    except Exception:
-        return d
 
 def _base():
     """Host Shopee sesuai Environment di Shopee Settings."""
@@ -18,9 +12,36 @@ def _base():
         return "https://partner.shopeemobile.com"
     return "https://partner.test-stable.shopeemobile.com"
 
-def _safe_flt(v, d=0.0):
+def _safe_flt(v, d: float = 0.0) -> float:
+    """Convert ke float aman.
+    - None / "" → default
+    - string angka → float
+    - invalid → default
+    """
     try:
-        return float(v) if v not in (None, "") else d
+        if v is None:
+            return d
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s:
+            return d
+        return float(s)
+    except Exception:
+        return d
+
+
+def _safe_int(v, d: int = 0) -> int:
+    """Convert ke int aman."""
+    try:
+        if v is None:
+            return d
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).strip()
+        if not s:
+            return d
+        return int(float(s))  # handle string float
     except Exception:
         return d
 
@@ -469,27 +490,36 @@ def _process_order(order_sn: str):
     if frappe.db.exists("Sales Invoice", {"shopee_order_sn": order_sn}):
         return
 
-    det = _call("/api/v2/order/get_order_detail", str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token, {"order_sn_list": order_sn})
-    
+    det = _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(), s.partner_key,
+        s.shop_id, s.access_token,
+        {
+            "order_sn_list": [order_sn],
+            "response_optional_fields": "buyer_username,item_list,recipient_address,order_status,update_time,total_amount,escrow_amount,payout_amount"
+        }
+    )
     if det.get("error"):
         frappe.log_error(f"Failed to get order detail for {order_sn}: {det.get('message')}")
         return
-        
+
     order_list = det.get("response", {}).get("order_list", [])
     if not order_list:
         return
     det = order_list[0]
 
-    esc = _call("/api/v2/payment/get_escrow_detail", str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token, {"order_sn": order_sn})
-    
+    esc = _call(
+        "/api/v2/payment/get_escrow_detail",
+        str(s.partner_id).strip(), s.partner_key,
+        s.shop_id, s.access_token,
+        {"order_sn": order_sn}
+    )
     if esc.get("error"):
         frappe.log_error(f"Failed to get escrow detail for {order_sn}: {esc.get('message')}")
         esc = {"response": {}}
-        
     esc = esc.get("response", {}) or {}
 
+    # --- Customer ---
     customer = f"SHP-{det.get('buyer_username') or 'UNKNOWN'}"
     if not frappe.db.exists("Customer", {"customer_name": customer}):
         c = frappe.new_doc("Customer")
@@ -498,6 +528,7 @@ def _process_order(order_sn: str):
         c.customer_type = "Individual"
         c.insert(ignore_permissions=True)
 
+    # --- Sales Invoice ---
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
     si.posting_date = nowdate()
@@ -508,30 +539,39 @@ def _process_order(order_sn: str):
     si.remarks = f"Shopee order SN {order_sn}"
 
     for it in det.get("item_list", []):
-        # SKU fallback priority: model_sku -> item_sku -> item_id-model_id
-        sku = (it.get("model_sku") or "").strip() or \
-              (it.get("item_sku") or "").strip() or \
-              f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
-        
-        # Ensure SKU is not empty
+        sku = (it.get("model_sku") or "").strip() \
+              or (it.get("item_sku") or "").strip() \
+              or f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
         if not sku:
             sku = f"SHP-UNKNOWN-{order_sn}-{it.get('item_id', 'NOITEM')}"
-        
-        qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
-        rate = float(it.get("model_original_price") or it.get("model_discounted_price") or it.get("order_price") or 0)
-        
-        # Auto-create item if not exists
+
+        qty = _safe_int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"), 1)
+        rate = _safe_flt(it.get("model_original_price")) \
+               or _safe_flt(it.get("model_discounted_price")) \
+               or _safe_flt(it.get("order_price"))
+
         item_code = _ensure_item_exists(sku, it, rate)
-        
+
         row = si.append("items", {})
         row.item_code = item_code
         row.qty = qty
         row.rate = rate
+        row.amount = flt(qty) * flt(rate)
+
+    # safety: set totals supaya tidak None
+    si.base_net_total = flt(sum([d.amount for d in si.items]))
+    si.base_grand_total = si.base_net_total
+    si.base_rounded_total = si.base_net_total
+    si.grand_total = si.base_net_total
+    si.rounded_total = si.base_net_total
 
     si.insert(ignore_permissions=True)
     si.submit()
 
-    net = float(esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount") or 0)
+    # --- Payment Entry ---
+    net = _safe_flt(
+        esc.get("escrow_amount") or esc.get("net_amount") or esc.get("payout_amount")
+    )
     if net <= 0:
         return
 
@@ -544,13 +584,13 @@ def _process_order(order_sn: str):
     }
 
     fees = {
-        "commission": float(esc.get("commission_fee") or esc.get("seller_commission_fee") or 0),
-        "service":    float(esc.get("service_fee") or esc.get("seller_service_fee") or 0),
-        "protection": float(esc.get("shipping_seller_protection_fee_amount") or 0),
-        "shipdiff":   float(esc.get("shipping_fee_difference") or 0),
-        "voucher":    float(esc.get("voucher_seller") or 0)
-                      + float(esc.get("coin_cash_back") or 0)
-                      + float(esc.get("voucher_code_seller") or 0),
+        "commission": _safe_flt(esc.get("commission_fee") or esc.get("seller_commission_fee")),
+        "service":    _safe_flt(esc.get("service_fee") or esc.get("seller_service_fee")),
+        "protection": _safe_flt(esc.get("shipping_seller_protection_fee_amount")),
+        "shipdiff":   _safe_flt(esc.get("shipping_fee_difference")),
+        "voucher":    _safe_flt(esc.get("voucher_seller"))
+                      + _safe_flt(esc.get("coin_cash_back"))
+                      + _safe_flt(esc.get("voucher_code_seller")),
     }
 
     paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account") or "Debtors - AC"
@@ -564,19 +604,19 @@ def _process_order(order_sn: str):
     pe.mode_of_payment = "Shopee"
     pe.paid_from = paid_from
     pe.paid_to = paid_to
-    pe.paid_amount = net
-    pe.received_amount = net
+    pe.paid_amount = flt(net)
+    pe.received_amount = flt(net)
 
     r = pe.append("references", {})
     r.reference_doctype = "Sales Invoice"
     r.reference_name = si.name
-    r.allocated_amount = net + sum(fees.values())
+    r.allocated_amount = flt(net)   # ✅ allocated = net saja
 
     for k, v in fees.items():
-        if v:
+        if v > 0:
             d = pe.append("deductions", {})
             d.account = ACC[k]
-            d.amount  = v
+            d.amount  = flt(v)
 
     pe.insert(ignore_permissions=True)
     pe.submit()
