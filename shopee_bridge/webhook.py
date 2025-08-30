@@ -505,11 +505,11 @@ def create_payment_entry_from_shopee(
             return parent_pe
 
         # --- Helpers dari api.py ---
-        from .api import _get_or_create_account, _get_or_create_mode_of_payment, _insert_submit_with_retry
+        from .api import _insert_submit_with_retry
 
         # Akun & MOP
         paid_from = si.debit_to                                     # piutang
-        paid_to = _get_or_create_account("Shopee (Escrow)", "Bank") # kas/bank
+        paid_to = _get_or_create_bank_account("Shopee (Escrow)")
         mop = _get_or_create_mode_of_payment("Shopee")
 
         # --- Biaya (deductions) dari payload yang sudah dinormalisasi ---
@@ -523,13 +523,12 @@ def create_payment_entry_from_shopee(
         total_fees = sum(v for v in fees.values() if flt(v) > 0)
 
         fee_accounts = {
-            "commission": _get_or_create_account("Komisi Shopee", "Expense Account"),
-            "service": _get_or_create_account("Biaya Layanan Shopee", "Expense Account"),
-            "protection": _get_or_create_account("Proteksi Pengiriman Shopee", "Expense Account"),
-            "shipdiff": _get_or_create_account("Selisih Ongkir Shopee", "Expense Account"),
-            "voucher": _get_or_create_account("Voucher Shopee", "Expense Account"),
+            "commission": _get_or_create_expense_account("Komisi Shopee"),
+            "service": _get_or_create_expense_account("Biaya Layanan Shopee"),
+            "protection": _get_or_create_expense_account("Proteksi Pengiriman Shopee"),
+            "shipdiff": _get_or_create_expense_account("Selisih Ongkir Shopee"),
+            "voucher": _get_or_create_expense_account("Voucher Shopee"),
         }
-
         posting_date = _date_iso_from_epoch(posting_ts)
 
         # --- Build Payment Entry ---
@@ -569,7 +568,120 @@ def create_payment_entry_from_shopee(
         frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
         raise
 
+def _get_or_create_expense_account(account_name: str) -> str:
+    """Pastikan akun biaya (Expense) ada & valid untuk Payment Entry deductions."""
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
 
+    # Cek existing by (account_name, company)
+    acc_name = frappe.db.get_value(
+        "Account",
+        {"account_name": account_name, "company": company},
+        "name",
+    )
+    if acc_name:
+        acc = frappe.get_doc("Account", acc_name)
+        changed = False
+        if acc.is_group:
+            acc.is_group = 0; changed = True
+        if acc.root_type != "Expense":
+            acc.root_type = "Expense"; changed = True
+        if acc.account_type != "Expense Account":
+            acc.account_type = "Expense Account"; changed = True
+        # currency optional; set kalau field ada
+        if getattr(acc, "account_currency", None) and acc.account_currency != cur:
+            acc.account_currency = cur; changed = True
+        if acc.disabled:
+            acc.disabled = 0; changed = True
+        if changed:
+            acc.save(ignore_permissions=True)
+        return acc.name
+
+    # Cari parent group untuk biaya: “Indirect Expenses” → “Direct Expenses” → root Expense
+    parent = (
+        frappe.db.get_value("Account", {"company": company, "account_name": "Indirect Expenses", "is_group": 1}, "name")
+        or frappe.db.get_value("Account", {"company": company, "account_name": "Direct Expenses", "is_group": 1}, "name")
+        or frappe.db.get_value("Account", {"company": company, "root_type": "Expense", "is_group": 1}, "name")
+    )
+
+    acc = frappe.get_doc({
+        "doctype": "Account",
+        "company": company,
+        "account_name": account_name,
+        "is_group": 0,
+        "parent_account": parent,
+        "root_type": "Expense",
+        "account_type": "Expense Account",
+        "account_currency": cur,
+    })
+    acc.insert(ignore_permissions=True)
+    return acc.name
+
+def _get_or_create_bank_account(account_name: str) -> str:
+    """Pastikan akun escrow Shopee ada & valid sebagai Bank Account."""
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
+
+    acc_name = frappe.db.get_value(
+        "Account",
+        {"account_name": account_name, "company": company},
+        "name",
+    )
+    if acc_name:
+        acc = frappe.get_doc("Account", acc_name)
+        changed = False
+        if acc.is_group:
+            acc.is_group = 0; changed = True
+        if acc.root_type != "Asset":
+            acc.root_type = "Asset"; changed = True
+        if acc.account_type != "Bank":
+            acc.account_type = "Bank"; changed = True
+        if getattr(acc, "account_currency", None) and acc.account_currency != cur:
+            acc.account_currency = cur; changed = True
+        if acc.disabled:
+            acc.disabled = 0; changed = True
+        if changed:
+            acc.save(ignore_permissions=True)
+        return acc.name
+
+    parent = frappe.db.get_value(
+        "Account",
+        {"company": company, "root_type": "Asset", "is_group": 1, "account_type": "Bank"},
+        "name",
+    ) or frappe.db.get_value(
+        "Account",
+        {"company": company, "root_type": "Asset", "is_group": 1},
+        "name",
+    )
+
+    acc = frappe.get_doc({
+        "doctype": "Account",
+        "company": company,
+        "account_name": account_name,
+        "is_group": 0,
+        "parent_account": parent,
+        "root_type": "Asset",
+        "account_type": "Bank",
+        "account_currency": cur,
+    })
+    acc.insert(ignore_permissions=True)
+    return acc.name
+
+def _get_or_create_mode_of_payment(name: str) -> str:
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    mop_name = name if frappe.db.exists("Mode of Payment", name) else \
+        frappe.get_doc({"doctype": "Mode of Payment", "mode_of_payment": name}).insert(ignore_permissions=True).name
+
+    # map akun ke company
+    exists = frappe.db.exists("Mode of Payment Account", {"parent": mop_name, "company": company})
+    if not exists:
+        bank_acc = _get_or_create_bank_account("Shopee (Escrow)", "Bank")
+        mop = frappe.get_doc("Mode of Payment", mop_name)
+        row = mop.append("accounts", {})
+        row.company = company
+        row.default_account = bank_acc
+        mop.save(ignore_permissions=True)
+    return mop_name
 # =============================================================================
 # DEVELOPMENT & TEST FUNCTIONS
 # =============================================================================
