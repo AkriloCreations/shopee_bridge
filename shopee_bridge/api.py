@@ -4,6 +4,12 @@ from frappe.utils import get_url, nowdate # pyright: ignore[reportMissingImports
 def _settings():
     return frappe.get_single("Shopee Settings")
 
+def _safe_int(v, d=0):
+    try:
+        return int(v) if v not in (None, "") else d
+    except Exception:
+        return d
+
 def _base():
     """Host Shopee sesuai Environment di Shopee Settings."""
     s = _settings()
@@ -148,40 +154,40 @@ def refresh_if_needed():
     return {"status": "no_new_token"}
 
 @frappe.whitelist()
-def sync_recent_orders(hours: int = 24):
+def sync_recent_orders(hours: int = 24, page_size: int = 50, use_create_time_fallback: bool = True):
     """
-    Pull recent orders via update_time and sync to ERPNext:
-      - READY_TO_SHIP / PROCESSED -> ensure SO (and whatever _process_order does)
-      - CANCELLED                 -> cancel SO / SI if exist
-      - COMPLETED                 -> ensure SI, ensure Payment Entry
-    Uses Shopee v2 cursor pagination (no offsets).
+    Sinkronisasi order Shopee berdasarkan update_time (fallback: create_time):
+      - READY_TO_SHIP / PROCESSED -> proses _process_order (SO/logic kamu)
+      - CANCELLED                 -> cancel SO/SI kalau ada
+      - COMPLETED                 -> pastikan SI ada + buat Payment Entry jika belum ada
+    v2 cursor pagination, satu status per panggilan (Shopee tidak menerima list status di satu call).
     """
-    import time
+    import time as _t
     s = _settings()
-
-    if not s.access_token:
+    if not getattr(s, "access_token", ""):
         frappe.throw("Access token required. Please authenticate with Shopee first.")
 
-    now = int(time.time())
-    last = int(s.last_success_update_time or 0)
-    overlap = int(getattr(s, "overlap_seconds", 600) or 600)
-    time_from = (now - hours * 3600) if last == 0 else max(0, last - overlap)
+    # hours dari UI SELALU dipakai (override high-water), biar user kontrol rentang
+    now = int(_t.time())
+    time_from = now - int(hours) * 3600
     time_to = now
 
-    # Shopee v2 expects a single order_status per call. We iterate.
     STATUSES = ("READY_TO_SHIP", "PROCESSED", "COMPLETED", "CANCELLED")
 
-    highest = last
+    highest_ut = 0
     total_processed = 0
+    errors = 0
+    by_status_counts = {st: 0 for st in STATUSES}
 
-    for status in STATUSES:
-        cursor = ""
+    def _pull_for_status(status: str, time_field: str) -> list[dict]:
+        """Tarik semua halaman untuk satu status & time_field (update_time/create_time)."""
+        items, cursor, page_idx = [], "", 0
         while True:
             params = {
-                "time_range_field": "update_time",
+                "time_range_field": time_field,     # "update_time" atau "create_time"
                 "time_from": time_from,
                 "time_to": time_to,
-                "page_size": 50,
+                "page_size": int(page_size),
                 "order_status": status,
             }
             if cursor:
@@ -195,29 +201,138 @@ def sync_recent_orders(hours: int = 24):
                 s.access_token,
                 params
             )
-
             if resp.get("error"):
-                # surface exactly what Shopee returned
-                frappe.throw(f"Failed to get orders: {resp.get('error')} - {resp.get('message')} (status={status})")
+                raise Exception(f"get_order_list error={resp.get('error')} msg={resp.get('message')} status={status} page={page_idx}")
 
             body = resp.get("response") or {}
-            order_list = body.get("order_list", []) or []
+            lst = body.get("order_list", []) or []
+            items.extend(lst)
 
-            for o in order_list:
+            frappe.logger().info(f"[Shopee Sync] status={status} time_field={time_field} page={page_idx} got={len(lst)} more={body.get('more')}")
+            page_idx += 1
+
+            if body.get("more"):
+                cursor = body.get("next_cursor") or ""
+                if not cursor:  # sanity
+                    break
+            else:
+                break
+        return items
+
+    def _get_detail_light(order_sn: str) -> dict:
+        """Ambil detail minimal untuk jumlah/fee dari get_order_detail (lebih cepat dari payment detail)."""
+        r = _call(
+            "/api/v2/order/get_order_detail",
+            str(s.partner_id).strip(),
+            s.partner_key,
+            s.shop_id,
+            s.access_token,
+            {
+                "order_sn_list": [order_sn],
+                "response_optional_fields": "order_status,update_time,total_amount,escrow_amount,payout_amount"
+            }
+        )
+        if r.get("error"):
+            frappe.logger().warning(f"[Shopee Sync] get_order_detail error {order_sn}: {r.get('error')} {r.get('message')}")
+            return {}
+        ol = (r.get("response") or {}).get("order_list") or []
+        return ol[0] if ol else {}
+
+    def _get_escrow_detail(order_sn: str) -> dict:
+        """Ambil payment/escrow detail untuk fee breakdown akurat."""
+        r = _call(
+            "/api/v2/payment/get_escrow_detail",
+            str(s.partner_id).strip(),
+            s.partner_key,
+            s.shop_id,
+            s.access_token,
+            {"order_sn": order_sn}
+        )
+        if r.get("error"):
+            frappe.logger().warning(f"[Shopee Sync] get_escrow_detail error {order_sn}: {r.get('error')} {r.get('message')}")
+            return {}
+        return r.get("response") or {}
+
+    def _ensure_payment_entry(order_sn: str):
+        """Pastikan ada PE untuk order COMPLETED: coba get_order_detail dulu, kalau kosong, pakai escrow_detail."""
+        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+        if not si_name:
+            # Pastikan SI ada (jalankan _process_order sekali lagi sebagai jaring pengaman)
+            _process_order(order_sn)
+            si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+            if not si_name:
+                frappe.logger().info(f"[Shopee Sync] No Sales Invoice for COMPLETED order {order_sn}")
+                return
+
+        if frappe.db.exists("Payment Entry", {"reference_no": order_sn}):
+            return  # sudah ada
+
+        # 1) coba dari get_order_detail (cepat)
+        d = _get_detail_light(order_sn)
+        net_amount = _safe_flt(d.get("escrow_amount")) or _safe_flt(d.get("payout_amount"))
+
+        escrow_payload = {}
+        if net_amount <= 0:
+            # 2) fallback ke escrow detail untuk fee & net yang akurat
+            escrow_detail = _get_escrow_detail(order_sn)
+            # map beberapa field yang dipakai create_payment_entry_from_shopee()
+            escrow_payload = {
+                "commission_fee": _safe_flt(escrow_detail.get("commission_fee")),
+                "service_fee": _safe_flt(escrow_detail.get("service_fee")),
+                "shipping_seller_protection_fee_amount": _safe_flt(escrow_detail.get("shipping_seller_protection_fee_amount")),
+                "shipping_fee_difference": _safe_flt(escrow_detail.get("shipping_fee_difference")),
+                "voucher_seller": _safe_flt(escrow_detail.get("voucher_seller")),
+                "coin_cash_back": _safe_flt(escrow_detail.get("coin_cash_back")),
+                "voucher_code_seller": _safe_flt(escrow_detail.get("voucher_code_seller")),
+            }
+            # net:
+            net_amount = _safe_flt(
+                escrow_detail.get("payout_amount") or escrow_detail.get("escrow_amount")
+            )
+
+        posting_ts = _safe_int(d.get("update_time"))
+        from .webhook import create_payment_entry_from_shopee
+        create_payment_entry_from_shopee(
+            si_name=si_name,
+            escrow=escrow_payload or d,  # kalau d punya angka, pakai itu; kalau tidak, escrow_payload
+            net_amount=net_amount or 0,
+            order_sn=order_sn,
+            posting_ts=posting_ts,
+            enqueue=True
+        )
+        frappe.logger().info(f"[Shopee Sync] Payment Entry enqueued for {si_name} (order {order_sn})")
+
+    # --------- eksekusi utama ----------
+    frappe.logger().info(f"[Shopee Sync] partner={s.partner_id} shop={s.shop_id} range={time_from}->{time_to} hours={hours}")
+
+    try_order_time_fields = ["update_time"]
+    if use_create_time_fallback:
+        try_order_time_fields.append("create_time")
+
+    for time_field in try_order_time_fields:
+        loop_processed_before = total_processed
+
+        for status in STATUSES:
+            try:
+                orders = _pull_for_status(status, time_field)
+            except Exception as e:
+                errors += 1
+                frappe.log_error(frappe.get_traceback(), f"Shopee pull failed status={status} time_field={time_field}")
+                continue
+
+            by_status_counts[status] += len(orders)
+
+            for o in orders:
                 order_sn = o.get("order_sn")
-                order_status = o.get("order_status")
+                order_status = o.get("order_status") or status
                 if not order_sn:
                     continue
 
-                frappe.logger().info(f"[Shopee Sync] {order_sn} status={order_status}")
-
                 try:
                     if order_status in ("READY_TO_SHIP", "PROCESSED"):
-                        # Build/update SO etc. (your existing logic)
                         _process_order(order_sn)
 
                     elif order_status == "CANCELLED":
-                        # Cancel existing SO/SI if submitted
                         so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
                         si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
                         for doctype, name in (("Sales Order", so_name), ("Sales Invoice", si_name)):
@@ -229,68 +344,42 @@ def sync_recent_orders(hours: int = 24):
                                     doc.cancel()
                                     frappe.logger().info(f"[Shopee Sync] Cancelled {doctype} {name} for {order_sn}")
                             except Exception:
+                                errors += 1
                                 frappe.log_error(frappe.get_traceback(), f"Cancel {doctype} error for {order_sn}")
 
                     elif order_status == "COMPLETED":
-                        # Ensure SI exists
-                        _process_order(order_sn)
-                        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
-                        if si_name:
-                            # If Payment Entry not present, enqueue creation.
-                            # Note: get_order_list doesn't return payout/escrow numbers.
-                            # We can still create PE with zero and patch later, or better: query payment API/get_order_detail.
-                            pe_exists = frappe.db.exists("Payment Entry", {"reference_no": order_sn})
-                            if not pe_exists:
-                                posting_ts = int(o.get("update_time") or 0)
-                                # Best-effort net_amount; you likely want to enrich using /payment/get_escrow_detail.
-                                net_amount = _safe_flt(o.get("escrow_amount") or o.get("payout_amount"))
-                                if net_amount > 0:
-                                    from .webhook import create_payment_entry_from_shopee
-                                    create_payment_entry_from_shopee(
-                                        si_name=si_name,
-                                        escrow=o,               # lightweight; for full fees use escrow_detail
-                                        net_amount=net_amount,
-                                        order_sn=order_sn,
-                                        posting_ts=posting_ts,
-                                        enqueue=True
-                                    )
-                                    frappe.logger().info(f"[Shopee Sync] PE enqueued for SI {si_name}")
-                                else:
-                                    frappe.logger().info(
-                                        f"[Shopee Sync] No net_amount in list view for {order_sn}; "
-                                        f"consider calling /api/v2/payment/get_escrow_detail to create PE accurately."
-                                    )
+                        _process_order(order_sn)  # pastikan SO/SI terbentuk sesuai logic kamu
+                        _ensure_payment_entry(order_sn)
 
-                    # Track latest update_time seen
-                    ut = int(o.get("update_time") or 0)
-                    if ut > highest:
-                        highest = ut
+                    # track latest update_time bila tersedia
+                    ut = _safe_int(o.get("update_time"))
+                    if ut > highest_ut:
+                        highest_ut = ut
 
                     total_processed += 1
 
                 except Exception:
+                    errors += 1
                     frappe.log_error(frappe.get_traceback(), f"Process order error {order_sn}")
 
-            # cursor-based paging
-            if body.get("more"):
-                cursor = body.get("next_cursor") or ""
-                if not cursor:
-                    break
-            else:
-                break
+        # kalau di time_field pertama (update_time) tidak ada yang diproses dan kita punya fallback create_time, lanjut; kalau sudah ada, tidak perlu fallback
+        if total_processed > loop_processed_before:
+            break  # sudah ada hasil di update_time; tak perlu coba create_time
 
-    # Persist high-water mark
-    if highest > (s.last_success_update_time or 0):
-        s.last_success_update_time = highest
+    # update high-water mark hanya jika ada yang diproses
+    if highest_ut > 0 and total_processed > 0:
+        s.last_success_update_time = highest_ut
         s.save(ignore_permissions=True)
         frappe.db.commit()
 
     return {
         "from": time_from,
         "to": time_to,
-        "max_update_time": highest,
         "processed": total_processed,
-        "statuses": STATUSES
+        "errors": errors,
+        "by_status": by_status_counts,
+        "max_update_time": highest_ut,
+        "used_fallback": (try_order_time_fields[-1] == "create_time" and total_processed == 0)
     }
 
 def _ensure_item_exists(sku: str, item_data: dict, rate: float) -> str:
