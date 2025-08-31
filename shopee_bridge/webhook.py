@@ -81,6 +81,84 @@ def _safe_int(v, d=0):
     except Exception:
         return d
 
+def _find_so_by_sn(order_sn: str) -> Dict[str, Any]:
+    """Find Sales Order by order_sn, checking both po_no and custom_shopee_order_sn fields."""
+    if not order_sn:
+        return {"exists": False}
+        
+    # Check po_no first
+    so_name = frappe.db.get_value("Sales Order", 
+        {"po_no": order_sn}, 
+        ["name", "po_no", "custom_shopee_order_sn", "modified"], 
+        as_dict=True
+    )
+    if so_name:
+        return {
+            "exists": True,
+            "name": so_name.name,
+            "po_no": so_name.po_no,
+            "custom_shopee_order_sn": so_name.custom_shopee_order_sn,
+            "modified": so_name.modified,
+            "match_field": "po_no"
+        }
+    
+    # Then check custom field
+    so_name = frappe.db.get_value("Sales Order",
+        {"custom_shopee_order_sn": order_sn},
+        ["name", "po_no", "custom_shopee_order_sn", "modified"],
+        as_dict=True
+    )
+    if so_name:
+        return {
+            "exists": True,
+            "name": so_name.name, 
+            "po_no": so_name.po_no,
+            "custom_shopee_order_sn": so_name.custom_shopee_order_sn,
+            "modified": so_name.modified,
+            "match_field": "custom_shopee_order_sn"
+        }
+        
+    return {"exists": False}
+
+def _find_si_by_sn(order_sn: str) -> Dict[str, Any]:
+    """Find Sales Invoice by order_sn, checking both po_no and custom_shopee_order_sn fields."""
+    if not order_sn:
+        return {"exists": False}
+        
+    # Check po_no first  
+    si_name = frappe.db.get_value("Sales Invoice",
+        {"po_no": order_sn},
+        ["name", "po_no", "custom_shopee_order_sn", "modified"],
+        as_dict=True
+    )
+    if si_name:
+        return {
+            "exists": True,
+            "name": si_name.name,
+            "po_no": si_name.po_no, 
+            "custom_shopee_order_sn": si_name.custom_shopee_order_sn,
+            "modified": si_name.modified,
+            "match_field": "po_no"
+        }
+
+    # Then check custom field
+    si_name = frappe.db.get_value("Sales Invoice",
+        {"custom_shopee_order_sn": order_sn},
+        ["name", "po_no", "custom_shopee_order_sn", "modified"],
+        as_dict=True
+    )
+    if si_name:
+        return {
+            "exists": True, 
+            "name": si_name.name,
+            "po_no": si_name.po_no,
+            "custom_shopee_order_sn": si_name.custom_shopee_order_sn,
+            "modified": si_name.modified,
+            "match_field": "custom_shopee_order_sn"
+        }
+        
+    return {"exists": False}
+
 def _date_iso_from_epoch(ts: int | None) -> str:
     """Epoch detik → 'YYYY-MM-DD' (UTC baseline, cukup untuk tanggal dokumen)."""
     from datetime import datetime, timezone
@@ -469,24 +547,29 @@ def handle_payment_update(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_order_created(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle new order creation events"""
+    """Handle new order creation events with duplicate prevention"""
     order_sn = data.get("order_sn", "")
     
     if not order_sn:
         return {"success": False, "error": "missing_order_sn"}
     
-    # Check if order already exists
-    existing_so = frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-    existing_si = frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})
+    # Check existing orders with detailed info
+    existing_so = _find_so_by_sn(order_sn)
+    existing_si = _find_si_by_sn(order_sn)
     
-    if existing_so or existing_si:
-        frappe.logger().info(f"[Shopee] Order {order_sn} already exists in system")
+    if existing_so["exists"] or existing_si["exists"]:
+        frappe.logger().info(
+            f"[Shopee] Order {order_sn} already exists: " +
+            f"SO={existing_so.get('name', '')}({existing_so.get('match_field', '')}), " +
+            f"SI={existing_si.get('name', '')}({existing_si.get('match_field', '')})"
+        )
         return {
             "success": True,
             "message": "order_already_exists",
             "order_sn": order_sn,
-            "existing_so": bool(existing_so),
-            "existing_si": bool(existing_si)
+            "existing_so": existing_so,
+            "existing_si": existing_si,
+            "note": "Order exists, skipping creation"
         }
     
     frappe.logger().info(f"[Shopee] New order creation webhook: {order_sn}")
@@ -494,20 +577,20 @@ def handle_order_created(data: Dict[str, Any]) -> Dict[str, Any]:
     result = {
         "success": True,
         "message": "new_order_logged",
-        "order_sn": order_sn,
-        "note": "Order processing can be implemented here"
+        "order_sn": order_sn
     }
     
-    # TODO: Implement order creation
     try:
         # Import from api.py
         from .api import _process_order
         
         job_id = frappe.enqueue(
-            "_process_order", 
+            "_process_order",
             queue="short",
             timeout=300,
-            order_sn=order_sn
+            order_sn=order_sn,
+            # Add flag to ensure both fields are set
+            set_both_refs=True  
         )
         result["order_processing_job"] = job_id
         result["action"] = "order_processing_enqueued"
