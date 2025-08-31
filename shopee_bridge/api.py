@@ -633,11 +633,13 @@ def _should_make_so(order_status: str) -> bool:
 # --- MAIN: buat Sales Order dari satu order_sn (phase 2) ---------------------
 @frappe.whitelist()
 def _process_order_to_so(order_sn: str):
-    """Ambil detail order Shopee lalu buat Sales Order di ERPNext."""
+    """Ambil detail order Shopee lalu buat Sales Order di ERPNext (dedup by po_no)."""
     s = _settings()
 
-    if frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn}):
-        return {"status": "already_exists"}
+    # --- anti duplikat: cek SO yang punya po_no = order_sn
+    existed_so = _get_so_by_po(order_sn)
+    if existed_so:
+        return {"status": "already_exists", "sales_order": existed_so}
 
     det = _call(
         "/api/v2/order/get_order_detail",
@@ -653,7 +655,6 @@ def _process_order_to_so(order_sn: str):
             ),
         },
     )
-
     if det.get("error"):
         frappe.log_error(
             f"Failed to get order detail for {order_sn}: {det.get('message')}",
@@ -661,66 +662,58 @@ def _process_order_to_so(order_sn: str):
         )
         return {"status": "error", "message": det.get("message")}
 
-    order_list = det.get("response", {}).get("order_list", [])
-    if not order_list:
+    lst = (det.get("response") or {}).get("order_list") or []
+    if not lst:
         return {"status": "no_data"}
-
-    order_detail = order_list[0]
+    od = lst[0]
 
     # Customer
-    customer = _create_or_get_customer(order_detail, order_sn)
+    customer = _create_or_get_customer(od, order_sn)
 
     # Dates
-    transaction_date, delivery_date = _extract_dates_from_order(order_detail)
+    transaction_date, delivery_date = _extract_dates_from_order(od)
 
-    # Sales Order
+    # Build SO
     so = frappe.new_doc("Sales Order")
     so.customer = customer
     so.order_type = "Sales"
     so.transaction_date = transaction_date
     so.delivery_date = delivery_date
-    so.po_no = order_sn
-    so.custom_shopee_order_sn = order_sn
-    so.currency = frappe.db.get_single_value("Global Defaults", "default_currency") or "IDR"
 
+    # PENTING: dedup pakai field standar Customer's Purchase Order
+    so.po_no = order_sn
+
+    # custom field ini tetap boleh diisi hanya sebagai log/reference
+    so.custom_shopee_order_sn = order_sn
+
+    so.currency = frappe.db.get_single_value("Global Defaults", "default_currency") or "IDR"
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     if company:
         so.company = company
-
     default_price_list = frappe.db.get_single_value("Selling Settings", "selling_price_list")
     if default_price_list:
         so.selling_price_list = default_price_list
 
-    order_status = order_detail.get("order_status", "UNKNOWN")
+    order_status = od.get("order_status", "UNKNOWN")
     so.remarks = f"Shopee Order {order_sn} | Status: {order_status}"
 
-    items = order_detail.get("item_list", []) or []
+    items = od.get("item_list") or []
     if not items:
         return {"status": "no_items"}
 
     default_warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-
-    for item_data in items:
-        sku = (item_data.get("model_sku") or "").strip() or \
-              (item_data.get("item_sku") or "").strip() or \
-              f"SHP-{item_data.get('item_id','UNKNOWN')}-{item_data.get('model_id','0')}"
-
-        qty = int(item_data.get("model_quantity_purchased") or
-                  item_data.get("variation_quantity_purchased") or 1)
-
-        raw_rate = (item_data.get("model_discounted_price") or
-                    item_data.get("model_original_price") or
-                    item_data.get("order_price") or
-                    item_data.get("item_price") or "0")
-
-        # di Shopee ID harga sudah pakai rupiah, jadi cukup cast ke float
+    for it in items:
+        sku = (it.get("model_sku") or "").strip() or (it.get("item_sku") or "").strip() \
+              or f"SHP-{it.get('item_id','UNKNOWN')}-{it.get('model_id','0')}"
+        qty = int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased") or 1)
+        raw_rate = (it.get("model_discounted_price") or it.get("model_original_price")
+                    or it.get("order_price") or it.get("item_price") or "0")
         rate = float(raw_rate)
-
-        base_name = (item_data.get("item_name") or "").strip()
-        model_name = (item_data.get("model_name") or "").strip()
+        base_name = (it.get("item_name") or "").strip()
+        model_name = (it.get("model_name") or "").strip()
         item_name = (f"{base_name} - {model_name}".strip(" -") or sku)[:140]
 
-        item_code = _ensure_item_exists(sku, item_data, rate)
+        item_code = _ensure_item_exists(sku, it, rate)
 
         row = so.append("items", {})
         row.item_code = item_code
@@ -738,190 +731,177 @@ def _process_order_to_so(order_sn: str):
     except Exception as e:
         frappe.log_error(
             f"Failed to create Sales Order for {order_sn}: {e}\n"
-            f"Order detail: {frappe.as_json(order_detail)}",
+            f"Order detail: {frappe.as_json(od)}",
             "Sales Order Creation",
         )
         return {"status": "error", "message": str(e)}
-    
+
 # ===== 1. REPLACE _process_order_to_si FUNCTION IN api.py =====
 @frappe.whitelist()
-@frappe.whitelist()
 def _process_order_to_si(order_sn: str):
-    """Process Shopee order → Sales Invoice + (auto) Payment Entry.
-    - Aman untuk historical (migration mode / cutoff)
-    - Anti duplikat SI/PE
-    """
+    """Shopee order → Sales Invoice (+ auto Payment Entry). Dedup by po_no."""
     s = _settings()
 
-    # === Skip jika SI sudah ada ===
-    si_exists = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
-    if si_exists:
-        frappe.logger().info(f"[Shopee] SI {si_exists} for {order_sn} already exists, skipping")
-        return {"ok": True, "status": "already_exists", "sales_invoice": si_exists}
+    # --- anti duplikat: cek SI yang punya po_no = order_sn
+    existed_si = _get_si_by_po(order_sn)
+    if existed_si:
+        frappe.logger().info(f"[Shopee] SI {existed_si} for {order_sn} already exists, skipping")
+        return {"ok": True, "status": "already_exists", "sales_invoice": existed_si}
 
+    # detail order
+    det = _call(
+        "/api/v2/order/get_order_detail",
+        str(s.partner_id).strip(), s.partner_key,
+        s.shop_id, s.access_token,
+        {
+            "order_sn_list": order_sn,
+            "response_optional_fields": (
+                "buyer_user_id,buyer_username,recipient_address,"
+                "item_list,create_time,ship_by_date,days_to_ship,order_status"
+            ),
+        },
+    )
+    if det.get("error"):
+        return {"ok": False, "error": det.get("message")}
+    orders = (det.get("response") or {}).get("order_list") or []
+    if not orders:
+        return {"ok": False, "error": "No order data"}
+    od = orders[0]
+
+    # migration/stock handling (tetap sama)
+    update_stock = 1
+    if cint(getattr(s, "migration_mode", 0)) == 1:
+        update_stock = 0
+    elif getattr(s, "migration_cutoff_date", None):
+        ct = od.get("create_time")
+        if ct:
+            order_date = datetime.fromtimestamp(int(ct)).date()
+            cutoff = frappe.utils.getdate(s.migration_cutoff_date)
+            if order_date < cutoff:
+                update_stock = 0
+
+    # customer
+    customer = _create_or_get_customer(od, order_sn)
+
+    # build SI
+    si = frappe.new_doc("Sales Invoice")
+    si.customer = customer
+    si.posting_date = nowdate()
+    si.set_posting_time = 1
+    si.update_stock = update_stock
+    si.currency = "IDR"
+
+    # PENTING: simpan order_sn ke po_no untuk dedup
+    si.po_no = order_sn
+
+    # custom field tetap diisi sebagai log
+    si.custom_shopee_order_sn = order_sn
+
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    if company:
+        si.company = company
+    default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+
+    for it in (od.get("item_list") or []):
+        sku = (it.get("model_sku") or "").strip() \
+              or (it.get("item_sku") or "").strip() \
+              or f"SHP-{it.get('item_id')}-{it.get('model_id','0')}"
+        qty = _safe_int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"), 1)
+        rate = (
+            flt(it.get("model_discounted_price"))
+            or flt(it.get("model_original_price"))
+            or flt(it.get("order_price"))
+            or flt(it.get("item_price"))
+        )
+        if rate > 1_000_000:
+            rate = rate / 100000.0
+
+        item_code = _ensure_item_exists(sku, it, rate)
+
+        row = si.append("items", {})
+        row.item_code = item_code
+        row.qty = flt(qty)
+        row.rate = flt(rate)
+        row.amount = flt(qty) * flt(rate)
+        if default_wh:
+            row.warehouse = default_wh
+
+    if not si.items:
+        return {"ok": False, "error": "No items"}
+
+    # insert + submit (fallback no-stock sama seperti sebelumnya)
     try:
-        # === Detail order ===
-        det = _call(
-            "/api/v2/order/get_order_detail",
-            str(s.partner_id).strip(), s.partner_key,
-            s.shop_id, s.access_token,
-            {
-                "order_sn_list": order_sn,  # string, bukan list
-                "response_optional_fields": (
-                    "buyer_user_id,buyer_username,recipient_address,"
-                    "item_list,create_time,ship_by_date,days_to_ship,order_status"
-                ),
-            },
-        )
-        if det.get("error"):
-            return {"ok": False, "error": det.get("message")}
-        orders = (det.get("response") or {}).get("order_list") or []
-        if not orders:
-            return {"ok": False, "error": "No order data"}
-        od = orders[0]
-
-        # === Migration logic (hindari stock movement untuk data lama) ===
-        update_stock = 1
-        if cint(getattr(s, "migration_mode", 0)) == 1:
-            update_stock = 0
-        elif getattr(s, "migration_cutoff_date", None):
-            ct = od.get("create_time")
-            if ct:
-                from datetime import datetime
-                order_date = datetime.fromtimestamp(int(ct)).date()
-                cutoff = frappe.utils.getdate(s.migration_cutoff_date)
-                if order_date < cutoff:
-                    update_stock = 0
-
-        # === Customer ===
-        customer = _create_or_get_customer(od, order_sn)
-
-        # === Build Sales Invoice ===
-        si = frappe.new_doc("Sales Invoice")
-        si.customer = customer
-        si.posting_date = nowdate()
-        si.set_posting_time = 1
-        si.update_stock = update_stock
-        si.currency = "IDR"
-        si.custom_shopee_order_sn = order_sn
-
-        company = frappe.db.get_single_value("Global Defaults", "default_company")
-        if company:
-            si.company = company
-
-        default_wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
-
-        for it in (od.get("item_list") or []):
-            sku = (it.get("model_sku") or "").strip() \
-                  or (it.get("item_sku") or "").strip() \
-                  or f"SHP-{it.get('item_id')}-{it.get('model_id', '0')}"
-
-            qty = _safe_int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"), 1)
-            rate = (
-                flt(it.get("model_discounted_price"))
-                or flt(it.get("model_original_price"))
-                or flt(it.get("order_price"))
-                or flt(it.get("item_price"))
-            )
-            # guard bila harga format 100000x
-            if rate > 1_000_000:
-                rate = rate / 100000.0
-
-            item_code = _ensure_item_exists(sku, it, rate)
-
-            row = si.append("items", {})
-            row.item_code = item_code
-            row.qty = flt(qty)
-            row.rate = flt(rate)
-            row.amount = flt(qty) * flt(rate)
-            if default_wh:
-                row.warehouse = default_wh
-
-        if not si.items:
-            return {"ok": False, "error": "No items"}
-
-        # === Insert + submit SI (fallback tanpa stock jika negative stock) ===
-        try:
-            si.insert(ignore_permissions=True)
+        si.insert(ignore_permissions=True)
+        si.submit()
+    except Exception as e:
+        if "needed in" in str(e) and update_stock:
+            si.reload()
+            si.update_stock = 0
+            si.remarks = f"Shopee order SN {order_sn} (Auto: No Stock)"
+            si.save()
             si.submit()
-        except Exception as e:
-            if "needed in" in str(e) and update_stock:
-                si.reload()
-                si.update_stock = 0
-                si.remarks = f"Shopee order SN {order_sn} (Auto: No Stock)"
-                si.save()
-                si.submit()
-            else:
-                raise
+        else:
+            frappe.log_error(f"Create SI fail {order_sn}: {e}", "Shopee SI Flow")
+            return {"ok": False, "error": str(e)}
 
-        frappe.logger().info(f"[Shopee] SI {si.name} created for {order_sn}")
+    # === Escrow → Payment Entry (tetap sama kecuali lookup SI by po_no) ===
+    def _norm_esc(esc: dict) -> dict:
+        r = (esc or {}).get("response") or (esc or {})
+        oi = r.get("order_income") or {}
+        payout_amount = flt(r.get("payout_amount") or oi.get("payout_amount"))
+        escrow_amount = flt(oi.get("escrow_amount_after_adjustment") or oi.get("escrow_amount") or r.get("escrow_amount"))
+        net = payout_amount or escrow_amount
+        ts = r.get("payout_time") or r.get("update_time")
+        commission_fee = flt(oi.get("commission_fee"))
+        service_fee = flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee"))
+        protection = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
+        shipdiff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
+        voucher_seller = flt(oi.get("voucher_from_seller"))
+        coin_cash_back = flt(oi.get("coins"))
+        return {
+            "net_amount": net,
+            "escrow_amount": escrow_amount,
+            "payout_amount": payout_amount,
+            "commission_fee": commission_fee,
+            "service_fee": service_fee,
+            "shipping_seller_protection_fee_amount": protection,
+            "shipping_fee_difference": shipdiff,
+            "voucher_seller": voucher_seller,
+            "coin_cash_back": coin_cash_back,
+            "voucher_code_seller": 0.0,
+            "payout_time": ts,
+        }
 
-        # === Escrow → Payment Entry ===
-        # helper normalisasi escrow payload (flat atau response.order_income)
-        def _norm_esc(esc: dict) -> dict:
-            r = (esc or {}).get("response") or (esc or {})
-            oi = r.get("order_income") or {}
-            # net amount: payout kalau ada, else escrow/after_adjustment
-            payout_amount = flt(r.get("payout_amount") or oi.get("payout_amount"))
-            escrow_amount = flt(oi.get("escrow_amount_after_adjustment") or oi.get("escrow_amount") or r.get("escrow_amount"))
-            net = payout_amount or escrow_amount
-            ts = r.get("payout_time") or r.get("update_time")
-
-            # fees (gabungkan transaksi ke service)
-            commission_fee = flt(oi.get("commission_fee"))
-            service_fee = flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee"))
-            protection = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
-            shipdiff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
-            voucher_seller = flt(oi.get("voucher_from_seller"))
-            coin_cash_back = flt(oi.get("coins"))
-            return {
-                "net_amount": net,
-                "escrow_amount": escrow_amount,
-                "payout_amount": payout_amount,
-                "commission_fee": commission_fee,
-                "service_fee": service_fee,
-                "shipping_seller_protection_fee_amount": protection,
-                "shipping_fee_difference": shipdiff,
-                "voucher_seller": voucher_seller,
-                "coin_cash_back": coin_cash_back,
-                "voucher_code_seller": 0.0,
-                "payout_time": ts,
-            }
-
-        esc_raw = _call(
-            "/api/v2/payment/get_escrow_detail",
-            str(s.partner_id).strip(), s.partner_key,
-            s.shop_id, s.access_token,
-            {"order_sn": order_sn}
-        )
-        if esc_raw.get("error"):
-            frappe.logger().warning(f"[Shopee] escrow_detail fail {order_sn}: {esc_raw.get('message')}")
-            return {"ok": True, "sales_invoice": si.name, "note": "No payment entry created"}
-
-        esc_n = _norm_esc(esc_raw)
-        net_amount = flt(esc_n.get("net_amount"))
-        if net_amount > 0:
-            # sudah ada PE untuk SI ini?
-            pe_exists = frappe.db.exists(
-                "Payment Entry Reference",
-                {"reference_doctype": "Sales Invoice", "reference_name": si.name}
-            )
-            if not pe_exists:
-                pe_name = create_payment_entry_from_shopee(
-                    si_name=si.name,
-                    escrow=esc_n,  # kirim normalized map (boleh juga kirim esc_raw; fungsi kamu siap terima dua2nya)
-                    net_amount=net_amount,
-                    order_sn=order_sn,
-                    posting_ts=_safe_int(esc_n.get("payout_time") or 0),
-                    enqueue=False
-                )
-                return {"ok": True, "sales_invoice": si.name, "payment_entry": pe_name}
-
+    esc_raw = _call(
+        "/api/v2/payment/get_escrow_detail",
+        str(s.partner_id).strip(), s.partner_key,
+        s.shop_id, s.access_token,
+        {"order_sn": order_sn}
+    )
+    if esc_raw.get("error"):
+        frappe.logger().warning(f"[Shopee] escrow_detail fail {order_sn}: {esc_raw.get('message')}")
         return {"ok": True, "sales_invoice": si.name, "note": "No payment entry created"}
 
-    except Exception as e:
-        frappe.log_error(f"Process order fail {order_sn}: {e}", "Shopee SI Flow")
-        return {"ok": False, "error": str(e)}
+    esc_n = _norm_esc(esc_raw)
+    net_amount = flt(esc_n.get("net_amount"))
+    if net_amount > 0:
+        # jangan buat PE kalau sudah ada referensi ke SI ini
+        pe_exists = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
+        )
+        if not pe_exists:
+            pe_name = create_payment_entry_from_shopee(
+                si_name=si.name,
+                escrow=esc_n,
+                net_amount=net_amount,
+                order_sn=order_sn,
+                posting_ts=_safe_int(esc_n.get("payout_time") or 0),
+                enqueue=False
+            )
+            return {"ok": True, "sales_invoice": si.name, "payment_entry": pe_name}
+
+    return {"ok": True, "sales_invoice": si.name, "note": "No payment entry created"}
 
 # ===== 2. ADD THESE NEW FUNCTIONS TO api.py =====
 
@@ -2184,6 +2164,31 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         "errors": errors,
         "success": errors == 0,
     }
+
+def _find_existing_so_by_order_sn(order_sn: str) -> str | None:
+    """Cari Sales Order existing: prioritas po_no (Customer's PO), fallback custom_shopee_order_sn."""
+    if not order_sn:
+        return None
+    so = frappe.db.get_value("Sales Order", {"po_no": order_sn}, "name")
+    if so:
+        return so
+    return frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+
+def _find_existing_si_by_order_sn(order_sn: str) -> str | None:
+    """Cari Sales Invoice existing: prioritas po_no (Customer's PO), fallback custom_shopee_order_sn."""
+    if not order_sn:
+        return None
+    si = frappe.db.get_value("Sales Invoice", {"po_no": order_sn}, "name")
+    if si:
+        return si
+    return frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+
+def _get_so_by_po(order_sn: str) -> str | None:
+    return frappe.db.get_value("Sales Order", {"po_no": order_sn}, "name")
+
+def _get_si_by_po(order_sn: str) -> str | None:
+    return frappe.db.get_value("Sales Invoice", {"po_no": order_sn}, "name")
+
 @frappe.whitelist()
 def sync_recent_orders(hours: int = 24, page_size: int = 50):
     """Sync Shopee orders → SO (READY_TO_SHIP/PROCESSED), SI+PE (COMPLETED), cancel docs (CANCELLED).
@@ -2354,7 +2359,7 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
 
                 elif status == "CANCELLED":
                     # cancel SO/SI jika ada
-                    so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+                    so_name = _get_so_by_po(order_sn)
                     if so_name:
                         try:
                             so = frappe.get_doc("Sales Order", so_name)
@@ -2364,7 +2369,7 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
                         except Exception as e:
                             stats["errors"] += 1
                             frappe.log_error(f"Cancel SO {so_name} error: {e}")
-                    si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+                    si_name = _get_si_by_po(order_sn)
                     if si_name:
                         try:
                             si = frappe.get_doc("Sales Invoice", si_name)

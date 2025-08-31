@@ -29,6 +29,7 @@ def _safe_flt(v, d=0.0):
         return float(v) if v not in (None, "") else d
     except Exception:
         return d
+    
 def _get_live_push_key() -> str:
     s = _settings()
     # sesuaikan nama field di Doctype Settings kamu
