@@ -89,10 +89,10 @@ def _date_iso_from_epoch(ts: int | None) -> str:
 
 @frappe.whitelist(allow_guest=True, methods=["POST", "GET", "OPTIONS"])
 def shopee_webhook():
-    """Main Shopee webhook handler"""
+    """Main Shopee webhook handler (uses live_push_partner_key for signature verification)."""
     import time
     start_time = time.time()
-    
+
     try:
         # Handle CORS preflight
         if frappe.request.method == "OPTIONS":
@@ -102,105 +102,142 @@ def shopee_webhook():
                 "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Shopee-Signature"
             }
             return {"success": True, "message": "CORS handled"}
-        
-        # Get request data
+
+        # Get request data (raw bytes, no decoding)
         raw_body = frappe.request.get_data(as_text=False) or b""
         headers = dict(frappe.request.headers or {})
-        
-        # Parse webhook data
+
+        # Parse webhook data (best effort)
         webhook_data = None
         if raw_body:
             try:
-                body_text = raw_body.decode('utf-8')
-                webhook_data = json.loads(body_text)
+                webhook_data = json.loads(raw_body.decode("utf-8"))
             except Exception as e:
                 processing_time = (time.time() - start_time) * 1000
                 result = {"success": False, "error": "invalid_json", "details": str(e)}
                 log_webhook_activity(None, headers, raw_body, result, processing_time)
                 return result
-        
-        # Signature verification
-        partner_key = getattr(_settings(), "partner_key", "").strip()
-        url_path = frappe.request.path  # sesuai Shopee config
-        if not verify_webhook_signature(url_path, raw_body, headers, partner_key):
+
+        # Signature verification (use live push key)
+        url_path = frappe.request.path  # not used by the hash, but kept for logs/debug
+        live_push_key = (getattr(_settings(), "live_push_partner_key", "") or "").strip()
+        if not verify_webhook_signature(url_path, raw_body, headers, live_push_key):
             processing_time = (time.time() - start_time) * 1000
             result = {"success": False, "error": "invalid_signature"}
             log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
             return result
-        
+
         # Process webhook event
         if webhook_data and isinstance(webhook_data, dict):
             result = process_webhook_event(webhook_data)
         else:
-            result = {
-                "success": True,
-                "message": "Webhook received but no data to process",
-                "timestamp": frappe.utils.now()
-            }
-        
+            result = {"success": True, "message": "Webhook received but no data to process", "timestamp": frappe.utils.now()}
+
         # Log activity
         processing_time = (time.time() - start_time) * 1000
         log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
-        
         return result
-        
+
     except Exception as e:
         processing_time = (time.time() - start_time) * 1000
         result = {"success": False, "error": "server_error", "details": str(e)}
-        log_webhook_activity(webhook_data if 'webhook_data' in locals() else None, 
-                           headers if 'headers' in locals() else {}, 
-                           raw_body if 'raw_body' in locals() else b"", 
-                           result, processing_time)
-        
+        log_webhook_activity(webhook_data if 'webhook_data' in locals() else None,
+                             headers if 'headers' in locals() else {},
+                             raw_body if 'raw_body' in locals() else b"",
+                             result, processing_time)
         frappe.log_error(frappe.get_traceback(), "Shopee Webhook Critical Error")
         return result
-    
-def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_key_unused: str) -> bool:
+
+
+def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, live_push_key: str) -> bool:
     """
-    Shopee Push v2:
-      Signature = HMAC-SHA256( LIVE_PUSH_PARTNER_KEY, RAW_BODY )
-      Header   = Authorization  (umumnya hex lowercase; antisipasi base64/base64url)
-    NOTE: 'url' TIDAK dipakai dalam perhitungan signature untuk push.
+    Verify Shopee Push v2 signature.
+
+    Default (umum):
+        signature = HMAC-SHA256(live_push_key, RAW_BODY)
+
+    Catatan:
+    - Header signature bisa berada di "Authorization" atau "X-Shopee-Signature"
+    - Format signature bisa hex lowercase (paling umum), base64, atau base64url
+    - Untuk robust: kita juga uji varian body yang rstrip CR/LF
+    - DI SINI kita TIDAK mencampur dengan partner_key API
     """
     try:
-        incoming = (headers.get("Authorization") or headers.get("authorization") or "").strip()
+        incoming = (
+            headers.get("Authorization")
+            or headers.get("authorization")
+            or headers.get("X-Shopee-Signature")
+            or headers.get("x-shopee-signature")
+            or ""
+        ).strip()
+
         if not incoming:
             frappe.logger().error("[Shopee Webhook] No signature header found")
             return False
 
-        key = _get_live_push_key()
+        key = (live_push_key or "").strip()
         if not key:
             frappe.logger().error("[Shopee Webhook] Live Push Partner Key not configured")
             return False
 
-        # coba body apa adanya, dan varian rstrip CR/LF
+        # Candidate bodies: raw and CR/LF trimmed (if any)
         bodies = [raw_body]
         if raw_body.endswith((b"\r", b"\n")):
             bodies.append(raw_body.rstrip(b"\r\n"))
 
+        # Decode incoming signature into possible byte forms (hex/base64/base64url)
+        def _decode_sig_variants(sig_str: str) -> list[bytes]:
+            import base64, binascii
+            s = sig_str.strip()
+            low = s.lower()
+            for pref in ("sha256=", "hmac=", "signature="):
+                if low.startswith(pref):
+                    s = s[len(pref):].strip()
+                    break
+            outs = []
+            # hex
+            try:
+                outs.append(binascii.unhexlify(s))
+            except Exception:
+                pass
+            # base64
+            try:
+                outs.append(base64.b64decode(s, validate=False))
+            except Exception:
+                pass
+            # base64url (+ padding)
+            try:
+                pad = '=' * (-len(s) % 4)
+                outs.append(base64.urlsafe_b64decode(s + pad))
+            except Exception:
+                pass
+            return [x for x in outs if x]
+
         incoming_candidates = _decode_sig_variants(incoming)
+        key_bytes = key.encode("utf-8")
 
         for b in bodies:
-            digest = hmac.new(key.encode("utf-8"), b, hashlib.sha256).digest()
+            digest = hmac.new(key_bytes, b, hashlib.sha256).digest()
 
-            # match semua kandidat (hex/base64/base64url)
+            # compare against decoded variants
             for inc in incoming_candidates:
-                if inc and _consteq(digest, inc):
-                    frappe.logger().info("[Shopee Webhook] ✓ Signature verified")
+                if inc and hmac.compare_digest(digest, inc):
+                    frappe.logger().info("[Shopee Webhook] ✓ Signature verified (decoded match)")
                     return True
 
-            # juga coba perbandingan langsung hex lowercase (format paling sering)
-            if _consteq(digest.hex().encode(), incoming.lower().encode()):
-                frappe.logger().info("[Shopee Webhook] ✓ Signature verified (hex)")
+            # direct compare hex string (lowercase) — very common form
+            if hmac.compare_digest(digest.hex().encode(), incoming.lower().encode()):
+                frappe.logger().info("[Shopee Webhook] ✓ Signature verified (hex string match)")
                 return True
 
-        # debug singkat
+        # Debug snippet (first 16 chars) to help diagnose
         try:
-            calc_hex = hmac.new(key.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-            calc_hex_trim = hmac.new(key.encode("utf-8"), raw_body.rstrip(b"\r\n"), hashlib.sha256).hexdigest()
+            calc_hex_raw = hmac.new(key_bytes, raw_body, hashlib.sha256).hexdigest()
+            calc_hex_trim = hmac.new(key_bytes, raw_body.rstrip(b"\r\n"), hashlib.sha256).hexdigest() \
+                if raw_body.endswith((b"\r", b"\n")) else calc_hex_raw
             frappe.logger().warning(
                 f"[Shopee Webhook] ✗ Invalid signature; got={incoming[:16]}..., "
-                f"calc={calc_hex[:16]}..., calc_trim={calc_hex_trim[:16]}..., len={len(raw_body)}"
+                f"calc_raw={calc_hex_raw[:16]}..., calc_trim={calc_hex_trim[:16]}..., len={len(raw_body)}"
             )
         except Exception:
             pass
@@ -210,6 +247,7 @@ def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, partner_k
     except Exception as e:
         frappe.logger().error(f"[Shopee Webhook] Signature verification error: {e}")
         return False
+
 
 def _normalize_signature(sig_raw: str) -> str:
     """Remove common prefixes from signature"""
@@ -972,10 +1010,113 @@ def _pe_precision(pe) -> int:
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def dbg_verify_signature():
     """
-    Kirim body mentah + Authorization header, endpoint ini hanya mem-verifikasi signature
-    TANPA memproses data. Gunakan untuk debug.
+    Debug signature Shopee Push:
+    - Baca header Authorization / X-Shopee-Signature
+    - Hitung HMAC SHA256 untuk 4 kandidat:
+        raw, raw(rstrip CRLF), url|raw, url|raw(rstrip)
+    - Kembalikan ringkasan agar kelihatan beda di mana
     """
+    import base64, hashlib, hmac, binascii
+
+    def first(s, n=16):
+        return (s or "")[:n]
+
     raw_body = frappe.request.get_data(as_text=False) or b""
     headers = dict(frappe.request.headers or {})
-    ok = verify_webhook_signature(frappe.request.path, raw_body, headers, partner_key_unused="")
-    return {"ok": bool(ok), "len": len(raw_body)}
+    url_path = frappe.request.path
+
+    incoming = (
+        headers.get("Authorization")
+        or headers.get("authorization")
+        or headers.get("X-Shopee-Signature")
+        or headers.get("x-shopee-signature")
+        or ""
+    ).strip()
+
+    # sumber key
+    push_key = _get_live_push_key() or (getattr(_settings(), "partner_key", "") or "").strip()
+    key_src = "live_push_partner_key" if _get_live_push_key() else ("partner_key_fallback" if push_key else "none")
+
+    if not incoming or not push_key:
+        return {
+            "ok": False,
+            "reason": "missing_header_or_key",
+            "have_header": bool(incoming),
+            "have_key": bool(push_key),
+            "key_src": key_src,
+            "len": len(raw_body),
+        }
+
+    # decode signature kandidat (hex/base64/base64url)
+    incoming_bytes = []
+    s = incoming
+    # strip prefix
+    low = s.lower()
+    for pref in ("sha256=", "hmac=", "signature="):
+        if low.startswith(pref):
+            s = s[len(pref):].strip()
+            break
+    # hex
+    try:
+        incoming_bytes.append(binascii.unhexlify(s))
+    except Exception:
+        pass
+    # base64
+    try:
+        incoming_bytes.append(base64.b64decode(s, validate=False))
+    except Exception:
+        pass
+    # base64url
+    try:
+        pad = "=" * (-len(s) % 4)
+        incoming_bytes.append(base64.urlsafe_b64decode(s + pad))
+    except Exception:
+        pass
+
+    key = push_key.encode("utf-8")
+    raw = raw_body
+    raw_trim = raw_body.rstrip(b"\r\n") if raw_body.endswith((b"\r", b"\n")) else raw_body
+
+    # kandidat base string
+    bases = [
+        ("raw", raw),
+        ("raw_trim", raw_trim),
+        ("url|raw", f"{url_path}|".encode("utf-8") + raw),
+        ("url|raw_trim", f"{url_path}|".encode("utf-8") + raw_trim),
+    ]
+
+    results = {}
+    ok = False
+    for name, base in bases:
+        dig = hmac.new(key, base, hashlib.sha256).digest()
+        hex_ = dig.hex()
+        b64_ = base64.b64encode(dig).decode()
+
+        # bandingkan ke setiap varian incoming_bytes
+        match_decoded = any(hmac.compare_digest(dig, inc) for inc in incoming_bytes if inc)
+        match_hex = hmac.compare_digest(hex_.encode(), incoming.lower().encode())
+
+        results[name] = {
+            "calc_hex_first16": first(hex_),
+            "calc_b64_first16": first(b64_),
+            "len_base": len(base),
+            "match_decoded": bool(match_decoded),
+            "match_hex": bool(match_hex),
+        }
+        ok = ok or match_decoded or match_hex
+
+    return {
+        "ok": bool(ok),
+        "len": len(raw_body),
+        "used_header": "Authorization" if ("Authorization" in headers or "authorization" in headers) else (
+            "X-Shopee-Signature" if ("X-Shopee-Signature" in headers or "x-shopee-signature" in headers) else "none"
+        ),
+        "key_src": key_src,
+        "incoming_first16": first(incoming),
+        "bodies": {
+            "has_trailing_crlf": raw_body.endswith((b'\r', b'\n')),
+            "raw_len": len(raw),
+            "raw_trim_len": len(raw_trim),
+        },
+        "compare": results,
+    }
