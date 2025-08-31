@@ -739,7 +739,6 @@ def _process_order_to_so(order_sn: str):
         return {"status": "error", "message": str(e)}
 
 # ===== 1. REPLACE _process_order_to_si FUNCTION IN api.py =====
-@frappe.whitelist()
 def _process_order_to_si(order_sn: str):
     """Shopee order → Sales Invoice (+ auto Payment Entry). Dedup by po_no."""
     s = _settings()
@@ -750,7 +749,7 @@ def _process_order_to_si(order_sn: str):
         frappe.logger().info(f"[Shopee] SI {existed_si} for {order_sn} already exists, skipping")
         return {"ok": True, "status": "already_exists", "sales_invoice": existed_si}
 
-    # detail order
+    # --- detail order dari Shopee
     det = _call(
         "/api/v2/order/get_order_detail",
         str(s.partner_id).strip(), s.partner_key,
@@ -770,7 +769,7 @@ def _process_order_to_si(order_sn: str):
         return {"ok": False, "error": "No order data"}
     od = orders[0]
 
-    # migration/stock handling (tetap sama)
+    # --- migration/stock handling
     update_stock = 1
     if cint(getattr(s, "migration_mode", 0)) == 1:
         update_stock = 0
@@ -782,10 +781,10 @@ def _process_order_to_si(order_sn: str):
             if order_date < cutoff:
                 update_stock = 0
 
-    # customer
+    # --- customer
     customer = _create_or_get_customer(od, order_sn)
 
-    # build SI
+    # --- build SI
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
     si.posting_date = nowdate()
@@ -794,8 +793,8 @@ def _process_order_to_si(order_sn: str):
     si.currency = "IDR"
 
     # PENTING: kedua field ini HARUS diisi untuk dedup dan reference
-    si.po_no = order_sn  # field standar untuk dedup
-    si.custom_shopee_order_sn = order_sn  # custom field untuk tracking
+    si.po_no = order_sn                      # field standar untuk dedup
+    si.custom_shopee_order_sn = order_sn     # custom field untuk tracking (UNIQUE)
 
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     if company:
@@ -813,6 +812,7 @@ def _process_order_to_si(order_sn: str):
             or flt(it.get("order_price"))
             or flt(it.get("item_price"))
         )
+        # beberapa payload bisa datang dalam cents
         if rate > 1_000_000:
             rate = rate / 100000.0
 
@@ -829,20 +829,20 @@ def _process_order_to_si(order_sn: str):
     if not si.items:
         return {"ok": False, "error": "No items"}
 
-    # insert + submit (fallback no-stock sama seperti sebelumnya)
+    # --- insert + submit (fallback no-stock)
     try:
-        # Validasi field wajib
         if not si.po_no or not si.custom_shopee_order_sn:
-            raise ValueError(f"Missing required fields. po_no: {si.po_no}, custom_shopee_order_sn: {si.custom_shopee_order_sn}")
-            
+            raise ValueError(
+                f"Missing required fields. po_no: {si.po_no}, custom_shopee_order_sn: {si.custom_shopee_order_sn}"
+            )
         si.insert(ignore_permissions=True)
         si.submit()
     except Exception as e:
-        if "needed in" in str(e) and update_stock:
+        # fallback: kalau gagal karena stok (string error bervariasi)
+        if ("needed in" in str(e) or "insufficient stock" in str(e).lower()) and update_stock:
             si.reload()
             si.update_stock = 0
             si.remarks = f"Shopee order SN {order_sn} (Auto: No Stock)"
-            # Re-validate field wajib
             si.po_no = order_sn
             si.custom_shopee_order_sn = order_sn
             si.save()
@@ -851,8 +851,7 @@ def _process_order_to_si(order_sn: str):
             frappe.log_error(f"Create SI fail {order_sn}: {e}", "Shopee SI Flow")
             return {"ok": False, "error": str(e)}
 
-    # === Escrow → Payment Entry (tetap sama kecuali lookup SI by po_no) ===
-
+    # === Escrow → Payment Entry ===
     esc_raw = _call(
         "/api/v2/payment/get_escrow_detail",
         str(s.partner_id).strip(), s.partner_key,
@@ -866,51 +865,91 @@ def _process_order_to_si(order_sn: str):
     esc_n = _norm_esc(esc_raw)
     net_amount = flt(esc_n.get("net_amount"))
     refund_amount = flt(esc_n.get("refund_amount"))
-    
-    # Check for existing SI and CN first
+
+    # --- idempotency: jika SI dg SN ini sudah ada (harusnya yg baru dibuat di atas)
     si_exists = frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})
     if si_exists:
         existing_si = frappe.get_doc("Sales Invoice", si_exists)
+
+        # --- CREATE CREDIT NOTE (Return) SAFE TANPA NUBRUAK UNIQUE
         if refund_amount > 0:
-            # Check if CN already exists for this SI
-            cn_exists = frappe.db.exists("Sales Invoice", {
-                "custom_shopee_order_sn": order_sn,
-                "return_against": existing_si.name
-            })
+            # cek apakah sudah ada CN untuk SI ini (idempotent by return_against)
+            cn_exists = frappe.db.exists(
+                "Sales Invoice",
+                {"is_return": 1, "return_against": existing_si.name}
+            )
             if not cn_exists:
                 try:
-                    # Create Credit Note
                     cn = frappe.new_doc("Sales Invoice")
                     cn.customer = existing_si.customer
                     cn.posting_date = nowdate()
                     cn.set_posting_time = 1
+                    cn.company = existing_si.company
+                    cn.currency = existing_si.currency
+                    cn.update_stock = existing_si.update_stock
+
+                    # penting untuk return
                     cn.is_return = 1
                     cn.return_against = existing_si.name
-                    cn.currency = existing_si.currency
-                    cn.custom_shopee_order_sn = order_sn
-                    cn.po_no = order_sn
-                    
-                    # Copy items from original SI
+
+                    # JANGAN pakai field UNIQUE di CN → hindari duplikat
+                    # cn.custom_shopee_order_sn = order_sn
+                    try:
+                        # simpan referensi refund di field berbeda
+                        cn.custom_shopee_refund_sn = order_sn
+                    except Exception:
+                        # kalau custom field belum ada, abaikan diam2
+                        pass
+
+                    # po_no untuk CN dibuat unik (hindari bentrok dedup po_no)
+                    base_po = f"{order_sn}-RET"
+                    cn.po_no = base_po
+                    if frappe.db.exists("Sales Invoice", {"po_no": base_po}):
+                        cn.po_no = f"{base_po}-{frappe.utils.random_string(4)}"
+
+                    # Copy items dari SI.
+                    # Catatan: untuk is_return=1, ERPNext akan menghitung tanda/valuasi sendiri.
                     for item in existing_si.items:
                         cn_item = cn.append("items", {})
                         cn_item.item_code = item.item_code
-                        cn_item.qty = -1 * item.qty  # Negative qty for return
+                        # Pola aman: qty positif; ERPNext handle sebagai retur.
+                        cn_item.qty = item.qty
                         cn_item.rate = item.rate
                         if item.warehouse:
                             cn_item.warehouse = item.warehouse
-                    
+
                     cn.insert(ignore_permissions=True)
                     cn.submit()
-                    frappe.db.commit()
-                    
-                    frappe.logger().info(f"[Shopee] Created Credit Note for {order_sn} against {existing_si.name}")
+                    frappe.logger().info(
+                        f"[Shopee] Created Credit Note {cn.name} for {order_sn} against {existing_si.name}"
+                    )
                 except Exception as e:
-                    frappe.log_error(f"Failed to create Credit Note for {order_sn}: {e}", "Shopee CN Creation")
-                    
+                    frappe.log_error(
+                        message=f"Failed to create Credit Note for {order_sn}: {e}",
+                        title="Shopee CN Creation"
+                    )
+
+        # lanjut ke PE idempotent (kalau net > 0)
+        if net_amount > 0:
+            pe_exists = frappe.db.exists(
+                "Payment Entry Reference",
+                {"reference_doctype": "Sales Invoice", "reference_name": existing_si.name}
+            )
+            if not pe_exists:
+                pe_name = create_payment_entry_from_shopee(
+                    si_name=existing_si.name,
+                    escrow=esc_n,
+                    net_amount=net_amount,
+                    order_sn=order_sn,
+                    posting_ts=_safe_int(esc_n.get("payout_time") or 0),
+                    enqueue=False
+                )
+                return {"ok": True, "status": "already_exists", "sales_invoice": existing_si.name, "payment_entry": pe_name}
+
         return {"ok": True, "status": "already_exists", "sales_invoice": existing_si.name}
 
+    # --- jika sampai sini, gunakan SI yang baru dibuat di atas (si)
     if net_amount > 0:
-        # jangan buat PE kalau sudah ada referensi ke SI ini
         pe_exists = frappe.db.exists(
             "Payment Entry Reference",
             {"reference_doctype": "Sales Invoice", "reference_name": si.name}
