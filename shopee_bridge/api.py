@@ -680,11 +680,9 @@ def _process_order_to_so(order_sn: str):
     so.transaction_date = transaction_date
     so.delivery_date = delivery_date
 
-    # PENTING: dedup pakai field standar Customer's Purchase Order
-    so.po_no = order_sn
-
-    # custom field ini tetap boleh diisi hanya sebagai log/reference
-    so.custom_shopee_order_sn = order_sn
+    # PENTING: kedua field ini HARUS diisi untuk dedup dan reference
+    so.po_no = order_sn  # field standar untuk dedup
+    so.custom_shopee_order_sn = order_sn  # custom field untuk tracking
 
     so.currency = frappe.db.get_single_value("Global Defaults", "default_currency") or "IDR"
     company = frappe.db.get_single_value("Global Defaults", "default_company")
@@ -725,6 +723,10 @@ def _process_order_to_so(order_sn: str):
             row.warehouse = default_warehouse
 
     try:
+        # Validasi field wajib
+        if not so.po_no or not so.custom_shopee_order_sn:
+            raise ValueError(f"Missing required fields. po_no: {so.po_no}, custom_shopee_order_sn: {so.custom_shopee_order_sn}")
+            
         so.insert(ignore_permissions=True)
         so.submit()
         return {"status": "created", "sales_order": so.name}
@@ -791,11 +793,9 @@ def _process_order_to_si(order_sn: str):
     si.update_stock = update_stock
     si.currency = "IDR"
 
-    # PENTING: simpan order_sn ke po_no untuk dedup
-    si.po_no = order_sn
-
-    # custom field tetap diisi sebagai log
-    si.custom_shopee_order_sn = order_sn
+    # PENTING: kedua field ini HARUS diisi untuk dedup dan reference
+    si.po_no = order_sn  # field standar untuk dedup
+    si.custom_shopee_order_sn = order_sn  # custom field untuk tracking
 
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     if company:
@@ -831,6 +831,10 @@ def _process_order_to_si(order_sn: str):
 
     # insert + submit (fallback no-stock sama seperti sebelumnya)
     try:
+        # Validasi field wajib
+        if not si.po_no or not si.custom_shopee_order_sn:
+            raise ValueError(f"Missing required fields. po_no: {si.po_no}, custom_shopee_order_sn: {si.custom_shopee_order_sn}")
+            
         si.insert(ignore_permissions=True)
         si.submit()
     except Exception as e:
@@ -838,6 +842,9 @@ def _process_order_to_si(order_sn: str):
             si.reload()
             si.update_stock = 0
             si.remarks = f"Shopee order SN {order_sn} (Auto: No Stock)"
+            # Re-validate field wajib
+            si.po_no = order_sn
+            si.custom_shopee_order_sn = order_sn
             si.save()
             si.submit()
         else:
@@ -845,37 +852,6 @@ def _process_order_to_si(order_sn: str):
             return {"ok": False, "error": str(e)}
 
     # === Escrow → Payment Entry (tetap sama kecuali lookup SI by po_no) ===
-    def _norm_esc(esc: dict) -> dict:
-        r = (esc or {}).get("response") or (esc or {})
-        oi = r.get("order_income") or {}
-        payout_amount = flt(r.get("payout_amount") or oi.get("payout_amount"))
-        escrow_amount = flt(oi.get("escrow_amount_after_adjustment") or oi.get("escrow_amount") or r.get("escrow_amount"))
-        refund_amount = flt(oi.get("refund_amount") or r.get("refund_amount") or 0)
-        reverse_shipping = flt(oi.get("reverse_shipping_fee") or 0)
-        total_refund = refund_amount + reverse_shipping
-        net = payout_amount or escrow_amount
-        ts = r.get("payout_time") or r.get("update_time")
-        commission_fee = flt(oi.get("commission_fee"))
-        service_fee = flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee"))
-        protection = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
-        shipdiff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
-        voucher_seller = flt(oi.get("voucher_from_seller"))
-        coin_cash_back = flt(oi.get("coins"))
-        return {
-            "net_amount": net,
-            "escrow_amount": escrow_amount,
-            "payout_amount": payout_amount,
-            "refund_amount": total_refund,  # Include shipping in refund
-            "commission_fee": commission_fee,
-            "service_fee": service_fee,
-            "shipping_seller_protection_fee_amount": protection,
-            "shipping_fee_difference": shipdiff,
-            "voucher_seller": voucher_seller,
-            "coin_cash_back": coin_cash_back,
-            "voucher_code_seller": 0.0,
-            "payout_time": ts,
-            "order_status": r.get("order_status"),
-        }
 
     esc_raw = _call(
         "/api/v2/payment/get_escrow_detail",
@@ -2238,6 +2214,39 @@ def _get_so_by_po(order_sn: str) -> str | None:
 def _get_si_by_po(order_sn: str) -> str | None:
     return frappe.db.get_value("Sales Invoice", {"po_no": order_sn}, "name")
 
+def _norm_esc(esc: dict) -> dict:
+    """Normalize escrow details from Shopee API response."""
+    r = (esc or {}).get("response") or (esc or {})
+    oi = r.get("order_income") or {}
+    payout_amount = flt(r.get("payout_amount") or oi.get("payout_amount"))
+    escrow_amount = flt(oi.get("escrow_amount_after_adjustment") or oi.get("escrow_amount") or r.get("escrow_amount"))
+    refund_amount = flt(oi.get("refund_amount") or r.get("refund_amount") or 0)
+    reverse_shipping = flt(oi.get("reverse_shipping_fee") or 0)
+    total_refund = refund_amount + reverse_shipping
+    net = payout_amount or escrow_amount
+    ts = r.get("payout_time") or r.get("update_time")
+    commission_fee = flt(oi.get("commission_fee"))
+    service_fee = flt(oi.get("service_fee")) + flt(oi.get("seller_transaction_fee")) + flt(oi.get("credit_card_transaction_fee"))
+    protection = flt(oi.get("delivery_seller_protection_fee_premium_amount"))
+    shipdiff = flt(oi.get("reverse_shipping_fee")) - flt(oi.get("shopee_shipping_rebate"))
+    voucher_seller = flt(oi.get("voucher_from_seller"))
+    coin_cash_back = flt(oi.get("coins"))
+    return {
+        "net_amount": net,
+        "escrow_amount": escrow_amount,
+        "payout_amount": payout_amount,
+        "refund_amount": total_refund,  # Include shipping in refund
+        "commission_fee": commission_fee,
+        "service_fee": service_fee,
+        "shipping_seller_protection_fee_amount": protection,
+        "shipping_fee_difference": shipdiff,
+        "voucher_seller": voucher_seller,
+        "coin_cash_back": coin_cash_back,
+        "voucher_code_seller": 0.0,
+        "payout_time": ts,
+        "order_status": r.get("order_status"),
+    }
+
 @frappe.whitelist()
 def sync_recent_orders(hours: int = 24, page_size: int = 50):
     """Sync Shopee orders → SO (READY_TO_SHIP/PROCESSED), SI+PE (COMPLETED), cancel docs (CANCELLED).
@@ -2377,9 +2386,21 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
 
     # Helper: dedup check for SO/SI
     def _already_exists(order_sn: str):
-        # Cek SO/SI by po_no dan custom_shopee_order_sn
-        so_exists = frappe.db.exists("Sales Order", {"po_no": order_sn}) or frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
-        si_exists = frappe.db.exists("Sales Invoice", {"po_no": order_sn}) or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})
+        """
+        Cek SO/SI berdasarkan po_no ATAU custom_shopee_order_sn.
+        Gunakan OR karena bisa jadi salah satu field belum terisi di data lama.
+        """
+        if not order_sn:
+            return False
+            
+        # Cek SO by po_no atau custom_shopee_order_sn
+        so_exists = frappe.db.exists("Sales Order", {"po_no": order_sn}) or \
+                   frappe.db.exists("Sales Order", {"custom_shopee_order_sn": order_sn})
+                   
+        # Cek SI by po_no atau custom_shopee_order_sn
+        si_exists = frappe.db.exists("Sales Invoice", {"po_no": order_sn}) or \
+                   frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn})
+                   
         return so_exists or si_exists
 
     # Helper: ensure po_no and custom_shopee_order_sn always filled
@@ -2446,7 +2467,19 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
                         _ensure_payment(order_sn)
 
                 elif status in ("CANCELLED", "IN_CANCEL"):
-                    # Cancel SO/SI dan buat CN jika perlu
+                    # Get escrow details untuk cek refund
+                    esc = _call(
+                        "/api/v2/payment/get_escrow_detail",
+                        str(s.partner_id).strip(), s.partner_key,
+                        s.shop_id, s.access_token,
+                        {"order_sn": order_sn}
+                    )
+                    stats["api_calls"] += 1
+
+                    # Normalize escrow untuk dapat refund amount
+                    esc_n = _norm_esc(esc)
+                    refund_amount = flt(esc_n.get("refund_amount"))
+
                     so_name = _get_so_by_po(order_sn)
                     si_name = _get_si_by_po(order_sn)
 
@@ -2461,13 +2494,53 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
                         except Exception as e:
                             stats["errors"] += 1
                             frappe.log_error(f"Cancel SO {so_name} error: {e}")
-                        except Exception as e:
-                            stats["errors"] += 1
-                            frappe.log_error(f"Cancel SO {so_name} error: {e}")
-                    si_name = _get_si_by_po(order_sn)
+
+                    # Handle SI and refund
                     if si_name:
+                        si = frappe.get_doc("Sales Invoice", si_name)
+                        
+                        # If refund exists, create CN first
+                        if refund_amount > 0:
+                            # Check if CN already exists
+                            cn_exists = frappe.db.exists("Sales Invoice", {
+                                "return_against": si_name,
+                                "docstatus": 1
+                            })
+                            
+                            if not cn_exists:
+                                try:
+                                    # Create Credit Note
+                                    cn = frappe.new_doc("Sales Invoice")
+                                    cn.customer = si.customer
+                                    cn.posting_date = nowdate()
+                                    cn.set_posting_time = 1
+                                    cn.is_return = 1
+                                    cn.return_against = si_name
+                                    cn.currency = si.currency
+                                    cn.update_stock = 0  # No stock impact for refunds
+                                    cn.custom_shopee_order_sn = order_sn
+                                    cn.po_no = order_sn
+                                    
+                                    # Copy items from original SI
+                                    for item in si.items:
+                                        cn_item = cn.append("items", {})
+                                        cn_item.item_code = item.item_code
+                                        cn_item.qty = -1 * item.qty  # Negative qty for return
+                                        cn_item.rate = item.rate
+                                        if item.warehouse:
+                                            cn_item.warehouse = item.warehouse
+                                    
+                                    cn.insert(ignore_permissions=True)
+                                    cn.submit()
+                                    frappe.db.commit()
+                                    
+                                    frappe.logger().info(f"[Shopee] Created Credit Note for {order_sn} against {si_name}")
+                                except Exception as e:
+                                    stats["errors"] += 1
+                                    frappe.log_error(f"Create CN for {si_name} error: {e}")
+
+                        # Cancel SI after CN is created
                         try:
-                            si = frappe.get_doc("Sales Invoice", si_name)
                             if si.docstatus == 1:
                                 si.cancel()
                                 stats["CANCELLED"] += 1
