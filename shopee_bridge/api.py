@@ -2171,9 +2171,54 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
     processed = errors = 0
     seen = set()
 
-    # Use same status list as sync_recent_orders if not specified
-    if not statuses or statuses == [None]:
-        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED"]
+    # Always use same status list as sync_recent_orders for consistency
+    statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED"]
+
+    # Initialize helpers for payment and field filling
+    def _ensure_po_no_filled(doc, order_sn: str):
+        """Ensure po_no and custom_shopee_order_sn are filled to prevent duplicates"""
+        if not doc.po_no or not doc.custom_shopee_order_sn:
+            doc.po_no = order_sn
+            doc.custom_shopee_order_sn = order_sn
+            doc.save(ignore_permissions=True)
+
+    def _ensure_payment(order_sn: str):
+        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+        if not si_name:
+            return
+        # Check if PE exists
+        pe_exists = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si_name}
+        )
+        if pe_exists:
+            return
+
+        # Get escrow & create PE
+        esc = _call(
+            "/api/v2/payment/get_escrow_detail",
+            str(s.partner_id).strip(), s.partner_key,
+            s.shop_id, s.access_token,
+            {"order_sn": order_sn}
+        )
+        if esc.get("error"):
+            frappe.logger().warning(f"[Shopee Sync] escrow_detail fail {order_sn}: {esc.get('message')}")
+            return
+
+        try:
+            pe_name = create_payment_entry_from_shopee(
+                si_name=si_name,
+                escrow=esc,
+                net_amount=0,
+                order_sn=order_sn,
+                posting_ts=None,
+                enqueue=False
+            )
+            if pe_name:
+                processed += 1
+        except Exception as e:
+            errors += 1
+            frappe.log_error(f"Ensure payment {order_sn} fail: {e}", "Shopee Sync Payment", _short=True)
 
     for st in statuses:
         offset = 0
@@ -2216,16 +2261,32 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
                     if not _should_make_so(st_now):
                         continue
 
-                # Use same deduplication logic as sync_recent_orders
-                if _find_existing_so_by_order_sn(order_sn) or _find_existing_si_by_order_sn(order_sn):
-                    continue
-
+                # Use exact same order processing logic as sync_recent_orders
                 try:
-                    _process_order(order_sn)
-                    processed += 1
+                    if st == "READY_TO_SHIP":
+                        res = _process_order_to_so(order_sn) or {}
+                        if res.get("sales_order"):
+                            _ensure_po_no_filled(frappe.get_doc("Sales Order", res["sales_order"]), order_sn)
+                        if res.get("status") in ("created", "already_exists", "ok"):
+                            processed += 1
+
+                    elif st == "COMPLETED":
+                        res = _process_order_to_si(order_sn) or {}
+                        if res.get("sales_invoice"):
+                            _ensure_po_no_filled(frappe.get_doc("Sales Invoice", res["sales_invoice"]), order_sn)
+                            # Also ensure PE is created
+                            _ensure_payment(order_sn)
+                        if res.get("ok") or res.get("status") in ("created", "already_exists"):
+                            processed += 1
+
+                    elif st in ("CANCELLED", "IN_CANCEL"):
+                        res = cancel_order(order_sn) or {}
+                        if res.get("ok"):
+                            processed += 1
+                            
                 except Exception as e:
                     errors += 1
-                    frappe.log_error(f"Process {order_sn} failed: {e}", "Shopee Sync Range")
+                    frappe.log_error(f"Process {order_sn} [{st}] fail: {e}", "Shopee Sync Range", _short=True)
                     continue
 
                 ut = int(o.get("update_time") or 0)
