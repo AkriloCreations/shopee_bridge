@@ -2091,12 +2091,29 @@ def webhook_handler():
 
 @frappe.whitelist()
 def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_status: str | None = None):
-    """Sync orders by absolute UNIX seconds window."""
+    """Sync orders by absolute UNIX seconds window.
+    
+    Args:
+        time_from: Start time in UNIX seconds
+        time_to: End time in UNIX seconds
+        page_size: Items per page (default 50)
+        order_status: Filter by specific status, or None/"ALL" for all statuses
+        
+    Maximum range: 15 days (1296000 seconds)
+    Uses same deduplication logic as sync_recent_orders
+    """
     s = _settings()
     if not s.access_token:
         frappe.throw("Access token required. Please authenticate with Shopee first.")
+        
     if not time_from or not time_to or time_from > time_to:
         frappe.throw("Invalid time range")
+        
+    # Enforce 15-day maximum range
+    MAX_DAYS = 15
+    MAX_SECONDS = MAX_DAYS * 24 * 3600
+    if (time_to - time_from) > MAX_SECONDS:
+        frappe.throw(f"Time range cannot exceed {MAX_DAYS} days")
 
     try:
         refresh_if_needed()
@@ -2114,6 +2131,10 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
     highest = int(s.last_success_update_time or 0)
     processed = errors = 0
     seen = set()
+
+    # Use same status list as sync_recent_orders if not specified
+    if not statuses or statuses == [None]:
+        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED"]
 
     for st in statuses:
         offset = 0
@@ -2156,8 +2177,8 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
                     if not _should_make_so(st_now):
                         continue
 
-                if frappe.db.exists("Sales Order",  {"custom_shopee_order_sn": order_sn}) \
-                   or frappe.db.exists("Sales Invoice", {"custom_shopee_order_sn": order_sn}):
+                # Use same deduplication logic as sync_recent_orders
+                if _find_existing_so_by_order_sn(order_sn) or _find_existing_si_by_order_sn(order_sn):
                     continue
 
                 try:
@@ -3657,26 +3678,55 @@ LOCK_ERRORS = (
 
 @frappe.whitelist()
 def complete_order_to_si(order_sn: str):
-    """Convert Sales Order Shopee → Sales Invoice + Payment Entry."""
+    """Convert Sales Order Shopee → Sales Invoice + Payment Entry.
+    
+    1. Find Sales Order by order_sn
+    2. Check for existing SI to prevent duplicates
+    3. Create SI from SO with proper fields
+    4. Get escrow details from Shopee API
+    5. Create Payment Entry if net amount > 0
+    """
     try:
-        # Cari SO dulu
-        so_name = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+        if not order_sn:
+            return {"ok": False, "error": "Order SN is required"}
+
+        # Find SO by either custom_shopee_order_sn or po_no
+        so_name = frappe.db.get_value("Sales Order", 
+            filters=[
+                ["docstatus", "=", 1],
+                [
+                    ["custom_shopee_order_sn", "=", order_sn],
+                    ["po_no", "=", order_sn]
+                ]
+            ], 
+            fieldname="name"
+        )
         if not so_name:
-            return {"ok": False, "error": f"No Sales Order found for {order_sn}"}
+            return {"ok": False, "error": f"No submitted Sales Order found for {order_sn}"}
 
         so = frappe.get_doc("Sales Order", so_name)
 
-        # Kalau sudah ada SI, skip
-        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+        # Check for existing SI by either field to prevent duplicates
+        si_name = frappe.db.get_value("Sales Invoice", 
+            filters=[
+                ["docstatus", "=", 1],
+                [
+                    ["custom_shopee_order_sn", "=", order_sn],
+                    ["po_no", "=", order_sn]
+                ]
+            ], 
+            fieldname="name"
+        )
         if si_name:
             return {"ok": True, "status": "already_invoiced", "sales_invoice": si_name}
 
-        # Buat SI dari SO
+        # Create SI from SO with proper defaults
         si = frappe.get_doc(so).make_sales_invoice()
         si.custom_shopee_order_sn = order_sn
+        si.po_no = order_sn  # Ensure both fields are set
         si.posting_date = nowdate()
         si.set_posting_time = 1
-        si.update_stock = 0  # biar ga bikin negative stock
+        si.update_stock = 0  # Prevent negative stock
         si.insert(ignore_permissions=True)
         si.submit()
 
@@ -3692,19 +3742,29 @@ def complete_order_to_si(order_sn: str):
         )
         escrow = (esc.get("response") or {}) if not esc.get("error") else {}
 
+        # Get net amount from escrow response
         net = flt(escrow.get("escrow_amount") or escrow.get("payout_amount") or 0)
         if net > 0:
+            # Get proper accounts
+            receivable_account = frappe.db.get_single_value("Accounts Settings", "default_receivable_account")
+            if not receivable_account:
+                frappe.throw("Default Receivable Account not configured in Accounts Settings")
+
+            # Create Payment Entry with complete details
             pe = frappe.new_doc("Payment Entry")
             pe.payment_type = "Receive"
             pe.party_type = "Customer"
             pe.party = so.customer
+            pe.company = so.company
             pe.posting_date = nowdate()
             pe.mode_of_payment = "Shopee"
-            pe.paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account") or "Debtors - AC"
-            pe.paid_to = "Bank - Shopee (Escrow)"
+            pe.paid_from = receivable_account
+            pe.paid_to = _get_or_create_bank_account("Shopee (Escrow)")
             pe.paid_amount = net
             pe.received_amount = net
             pe.reference_no = order_sn
+            pe.reference_date = nowdate()
+            pe.remarks = f"Shopee Order {order_sn} Payment"
 
             ref = pe.append("references", {})
             ref.reference_doctype = "Sales Invoice"
