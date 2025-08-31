@@ -2094,10 +2094,10 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
     """Sync orders by absolute UNIX seconds window.
     
     Args:
-        time_from: Start time in UNIX seconds
-        time_to: End time in UNIX seconds
+        time_from: Start time in UNIX secondsare
+        time_to: End time in UNIX secondsa
         page_size: Items per page (default 50)
-        order_status: Filter by specific status, or None/"ALL" for all statuses
+        order_status: Filter bsy specific status, or None/"ALL" for all statuses
         
     Maximum range: 15 days (1296000 seconds)
     Uses same deduplication logic as sync_recent_orders
@@ -2107,7 +2107,7 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         frappe.throw("Access token required. Please authenticate with Shopee first.")
         
     if not time_from or not time_to or time_from > time_to:
-        frappe.throw("Invalid time range")
+        frappe.throw("Invdasdasddalid time range")
         
     # Enforce 15-day maximum range
     MAX_DAYS = 15
