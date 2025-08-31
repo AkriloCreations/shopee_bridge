@@ -2090,17 +2090,20 @@ def webhook_handler():
         return {"success": False, "error": str(e)}
 
 @frappe.whitelist()
-def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
-    """Sync orders within a specific time range using the same logic as sync_recent_orders.
-    Uses cursor-based pagination and handles all statuses (READY_TO_SHIP, COMPLETED, CANCELLED).
+def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_status: str | None = None):
+    """Sync orders by absolute UNIX seconds window.
     
     Args:
         time_from: Start time in UNIX seconds
-        time_to: End time in UNIX seconds (max 15 days from time_from)
+        time_to: End time in UNIX seconds
         page_size: Items per page (default 50)
+        order_status: Filter by specific status, or None/"ALL" for all statuses
+        
+    Maximum range: 15 days (1296000 seconds)
+    Uses same deduplication logic as sync_recent_orders
     """
     s = _settings()
-    if not getattr(s, "access_token", ""):
+    if not s.access_token:
         frappe.throw("Access token required. Please authenticate with Shopee first.")
         
     if not time_from or not time_to or time_from > time_to:
@@ -2110,7 +2113,7 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50):
     MAX_DAYS = 15
     MAX_SECONDS = MAX_DAYS * 24 * 3600
     if (time_to - time_from) > MAX_SECONDS:
-        frappe.throw(f"Time range cannot exceed {MAX_DAYS} days. Current range: {(time_to - time_from) / 86400:.1f} days")
+        frappe.throw(f"Time range cannot exceed {MAX_DAYS} days")
 
     try:
         refresh_if_needed()
