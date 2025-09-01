@@ -2914,7 +2914,13 @@ def _find_existing_so_by_order_sn(order_sn: str) -> str | None:
     so = frappe.db.get_value("Sales Order", {"po_no": order_sn}, "name")
     if so:
         return so
-    return frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+    so_custom = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, "name")
+    if so_custom:
+        return so_custom
+    so_purchase = frappe.db.get_value("Sales Order", {"purchase_order_number": order_sn}, "name")
+    if so_purchase:
+        return so_purchase
+    return None
 
 def _find_existing_si_by_order_sn(order_sn: str) -> str | None:
     """Cari Sales Invoice existing: prioritas po_no (Customer's PO), fallback custom_shopee_order_sn."""
@@ -2923,7 +2929,13 @@ def _find_existing_si_by_order_sn(order_sn: str) -> str | None:
     si = frappe.db.get_value("Sales Invoice", {"po_no": order_sn}, "name")
     if si:
         return si
-    return frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+    si_custom = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
+    if si_custom:
+        return si_custom
+    si_purchase = frappe.db.get_value("Sales Invoice", {"purchase_order_number": order_sn}, "name")
+    if si_purchase:
+        return si_purchase
+    return None
 
 def _get_so_by_po(order_sn: str) -> str | None:
     return frappe.db.get_value("Sales Order", {"po_no": order_sn}, "name")

@@ -86,38 +86,21 @@ def _find_so_by_sn(order_sn: str) -> Dict[str, Any]:
     if not order_sn:
         return {"exists": False}
         
-    # Check po_no first
-    so_name = frappe.db.get_value("Sales Order", 
-        {"po_no": order_sn}, 
-        ["name", "po_no", "custom_shopee_order_sn", "modified"], 
-        as_dict=True
-    )
-    if so_name:
-        return {
-            "exists": True,
-            "name": so_name.name,
-            "po_no": so_name.po_no,
-            "custom_shopee_order_sn": so_name.custom_shopee_order_sn,
-            "modified": so_name.modified,
-            "match_field": "po_no"
-        }
-    
-    # Then check custom field
-    so_name = frappe.db.get_value("Sales Order",
-        {"custom_shopee_order_sn": order_sn},
-        ["name", "po_no", "custom_shopee_order_sn", "modified"],
-        as_dict=True
-    )
-    if so_name:
-        return {
-            "exists": True,
-            "name": so_name.name, 
-            "po_no": so_name.po_no,
-            "custom_shopee_order_sn": so_name.custom_shopee_order_sn,
-            "modified": so_name.modified,
-            "match_field": "custom_shopee_order_sn"
-        }
-        
+    # Check po_no
+    so_po = frappe.db.get_value("Sales Order", {"po_no": order_sn}, ["name", "po_no", "custom_shopee_order_sn", "modified"], as_dict=True)
+    if so_po:
+        return {"exists": True, "name": so_po.name, "po_no": so_po.po_no, "custom_shopee_order_sn": so_po.custom_shopee_order_sn, "modified": so_po.modified, "match_field": "po_no"}
+
+    # Check custom_shopee_order_sn
+    so_custom = frappe.db.get_value("Sales Order", {"custom_shopee_order_sn": order_sn}, ["name", "po_no", "custom_shopee_order_sn", "modified"], as_dict=True)
+    if so_custom:
+        return {"exists": True, "name": so_custom.name, "po_no": so_custom.po_no, "custom_shopee_order_sn": so_custom.custom_shopee_order_sn, "modified": so_custom.modified, "match_field": "custom_shopee_order_sn"}
+
+    # Check purchase_order_number (if present)
+    so_purchase = frappe.db.get_value("Sales Order", {"purchase_order_number": order_sn}, ["name", "po_no", "custom_shopee_order_sn", "modified"], as_dict=True)
+    if so_purchase:
+        return {"exists": True, "name": so_purchase.name, "po_no": so_purchase.po_no, "custom_shopee_order_sn": so_purchase.custom_shopee_order_sn, "modified": so_purchase.modified, "match_field": "purchase_order_number"}
+
     return {"exists": False}
 
 def _find_si_by_sn(order_sn: str) -> Dict[str, Any]:
@@ -125,38 +108,21 @@ def _find_si_by_sn(order_sn: str) -> Dict[str, Any]:
     if not order_sn:
         return {"exists": False}
         
-    # Check po_no first  
-    si_name = frappe.db.get_value("Sales Invoice",
-        {"po_no": order_sn},
-        ["name", "po_no", "custom_shopee_order_sn", "modified"],
-        as_dict=True
-    )
-    if si_name:
-        return {
-            "exists": True,
-            "name": si_name.name,
-            "po_no": si_name.po_no, 
-            "custom_shopee_order_sn": si_name.custom_shopee_order_sn,
-            "modified": si_name.modified,
-            "match_field": "po_no"
-        }
+    # Check po_no
+    si_po = frappe.db.get_value("Sales Invoice", {"po_no": order_sn}, ["name", "po_no", "custom_shopee_order_sn", "modified"], as_dict=True)
+    if si_po:
+        return {"exists": True, "name": si_po.name, "po_no": si_po.po_no, "custom_shopee_order_sn": si_po.custom_shopee_order_sn, "modified": si_po.modified, "match_field": "po_no"}
 
-    # Then check custom field
-    si_name = frappe.db.get_value("Sales Invoice",
-        {"custom_shopee_order_sn": order_sn},
-        ["name", "po_no", "custom_shopee_order_sn", "modified"],
-        as_dict=True
-    )
-    if si_name:
-        return {
-            "exists": True, 
-            "name": si_name.name,
-            "po_no": si_name.po_no,
-            "custom_shopee_order_sn": si_name.custom_shopee_order_sn,
-            "modified": si_name.modified,
-            "match_field": "custom_shopee_order_sn"
-        }
-        
+    # Check custom_shopee_order_sn
+    si_custom = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, ["name", "po_no", "custom_shopee_order_sn", "modified"], as_dict=True)
+    if si_custom:
+        return {"exists": True, "name": si_custom.name, "po_no": si_custom.po_no, "custom_shopee_order_sn": si_custom.custom_shopee_order_sn, "modified": si_custom.modified, "match_field": "custom_shopee_order_sn"}
+
+    # Check purchase_order_number (if present)
+    si_purchase = frappe.db.get_value("Sales Invoice", {"purchase_order_number": order_sn}, ["name", "po_no", "custom_shopee_order_sn", "modified"], as_dict=True)
+    if si_purchase:
+        return {"exists": True, "name": si_purchase.name, "po_no": si_purchase.po_no, "custom_shopee_order_sn": si_purchase.custom_shopee_order_sn, "modified": si_purchase.modified, "match_field": "purchase_order_number"}
+
     return {"exists": False}
 
 def _date_iso_from_epoch(ts: int | None) -> str:
