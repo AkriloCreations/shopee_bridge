@@ -1249,7 +1249,25 @@ def _process_order_to_si(order_sn: str):
                         cn_item.rate = item.rate
                         if item.warehouse:
                             cn_item.warehouse = item.warehouse
-
+                    # Tambahkan extra fees sebagai item negatif jika ada
+                    extra_fees = [
+                        ("shipping_seller_protection_fee_amount", "Proteksi Pengiriman Shopee"),
+                        ("service_fee", "Biaya Layanan Shopee"),
+                        ("commission_fee", "Komisi Shopee"),
+                        ("voucher_seller", "Voucher Shopee"),
+                        ("coin_cash_back", "Coin Cashback Shopee"),
+                    ]
+                    for key, name in extra_fees:
+                        fee = flt(esc_n.get(key))
+                        if fee:
+                            fee_row = cn.append("items", {})
+                            fee_row.item_code = name
+                            fee_row.qty = 1
+                            fee_row.rate = -abs(fee)
+                            fee_row.amount = -abs(fee)
+                    # Uncheck 'Update Outstanding for Self' if field exists
+                    if hasattr(cn, "update_outstanding_for_self"):
+                        cn.update_outstanding_for_self = 0
                     cn.insert(ignore_permissions=True)
                     cn.submit()
                     frappe.logger().info(
@@ -1313,6 +1331,24 @@ def _process_order_to_si(order_sn: str):
                     cn_item.rate = item.rate
                     if item.warehouse:
                         cn_item.warehouse = item.warehouse
+                # Tambahkan extra fees sebagai item negatif jika ada
+                extra_fees = [
+                    ("shipping_seller_protection_fee_amount", "Proteksi Pengiriman Shopee"),
+                    ("service_fee", "Biaya Layanan Shopee"),
+                    ("commission_fee", "Komisi Shopee"),
+                    ("voucher_seller", "Voucher Shopee"),
+                    ("coin_cash_back", "Coin Cashback Shopee"),
+                ]
+                for key, name in extra_fees:
+                    fee = flt(esc_n.get(key))
+                    if fee:
+                        fee_row = cn.append("items", {})
+                        fee_row.item_code = name
+                        fee_row.qty = 1
+                        fee_row.rate = -abs(fee)
+                        fee_row.amount = -abs(fee)
+                if hasattr(cn, "update_outstanding_for_self"):
+                    cn.update_outstanding_for_self = 0
                 cn.insert(ignore_permissions=True)
                 cn.submit()
                 frappe.logger().info(f"[Shopee] Created Credit Note {cn.name} for {order_sn} against {si.name}")
