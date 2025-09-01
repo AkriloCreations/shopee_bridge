@@ -831,6 +831,30 @@ def create_payment_entry_from_shopee(
         if pe_ref:
             return frappe.db.get_value("Payment Entry Reference", pe_ref, "parent")
 
+        # Tambahan: lock baris SI untuk mencegah race antar worker membuat PE bersamaan
+        try:
+            frappe.db.sql("select name from `tabSales Invoice` where name=%s for update", si.name)
+        except Exception:
+            pass
+
+        # Cek lagi setelah lock
+        pe_ref2 = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
+        )
+        if pe_ref2:
+            return frappe.db.get_value("Payment Entry Reference", pe_ref2, "parent")
+
+        # Cek Payment Entry existing berdasarkan reference_no (order_sn) + party sebagai fallback idempotensi
+        existing_pe = frappe.db.get_value(
+            "Payment Entry",
+            {"reference_no": order_sn, "party_type": "Customer", "party": si.customer, "docstatus": ["!=", 2]},
+            "name"
+        )
+        if existing_pe:
+            # Pastikan referensi anak belum ada → kalau belum, jangan duplikat; biarkan manual fix jika perlu
+            return existing_pe
+
         # Helpers
         from .api import _get_or_create_mode_of_payment, _insert_submit_with_retry
 
@@ -925,8 +949,25 @@ def create_payment_entry_from_shopee(
                 f"[Shopee PE] allocated({allocated}) != gross({gross_r}) @precision {precision} for SI {si.name}"
             )
 
-        pe = _insert_submit_with_retry(pe)
-        return pe.name
+        try:
+            pe = _insert_submit_with_retry(pe)
+            return pe.name
+        except Exception as e:
+            # Tangani duplikat nama karena race condition naming series
+            if "Duplicate entry" in str(e):
+                # Cari PE terbaru dengan SI reference
+                pe_name = frappe.db.get_value(
+                    "Payment Entry Reference",
+                    {"reference_doctype": "Sales Invoice", "reference_name": si.name},
+                    "parent"
+                ) or frappe.db.get_value(
+                    "Payment Entry",
+                    {"reference_no": order_sn, "party": si.customer, "docstatus": ["!=", 2]},
+                    "name"
+                )
+                if pe_name:
+                    return pe_name
+            raise
 
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
