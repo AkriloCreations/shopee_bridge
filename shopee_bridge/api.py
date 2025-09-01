@@ -2161,20 +2161,14 @@ def webhook_handler():
 
 @frappe.whitelist()
 def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_status: str | None = None):
-    """Sync orders in a time window and route each to SO or SI processing.
-
-    Logic:
-      READY_TO_SHIP  -> _process_order_to_so (if SO flow enabled or not; still create SO)
-      COMPLETED      -> _process_order_to_si
-      CANCELLED/*IN_CANCEL*/RETURNED -> cancel_order (if available)
-
-    If order_status provided, only that status processed. Otherwise the default status set.
-    Fallback: if no orders found by update_time, retry with create_time.
+    """Sync orders dalam rentang waktu; by update_time lalu fallback ke create_time.
+    READY_TO_SHIP -> _process_order_to_so
+    COMPLETED     -> _process_order_to_si
+    CANCELLED/IN_CANCEL/TO_RETURN -> cancel_order
     """
     s = _settings()
     if not getattr(s, "access_token", None):
         frappe.throw("Access token required. Please authenticate with Shopee first.")
-
     if not time_from or not time_to or int(time_from) > int(time_to):
         frappe.throw("Invalid time range")
 
@@ -2183,15 +2177,20 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         frappe.throw("Time range cannot exceed 15 days")
 
     try:
+        # kalau refresh mengganti token di DB, _call biasanya ambil dari argumen yg kita kirim (s.access_token)
         refresh_if_needed()
+        # ambil ulang settings (optional) kalau metode refresh mengubah record
+        s = _settings()
     except Exception:
         pass
 
-    # Build status list
-    if order_status and str(order_status).strip().upper() not in ("ALL", "*"):
-        statuses = [str(order_status).strip().upper()]
+    # Susun status
+    st_in = (order_status or "").strip().upper()
+    if st_in and st_in not in ("ALL", "*"):
+        statuses = [st_in]
     else:
-        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED", "IN_CANCEL"]
+        # catatan: RETURNED di Shopee umum dipakai sebagai TO_RETURN/RETURNED/TO_RETURN, kita tangani di handler
+        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED", "IN_CANCEL", "TO_RETURN"]
 
     processed = 0
     errors = 0
@@ -2205,93 +2204,117 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
             doc.custom_shopee_order_sn = order_sn
         doc.save(ignore_permissions=True)
 
-    # Payment Entry akan otomatis dibuat di _process_order_to_si bila net_amount > 0
-
-    def fetch_and_process(range_field: str) -> int:
+    def _handle_one(o: dict):
         nonlocal processed, errors, highest
+        order_sn = o.get("order_sn")
+        if not order_sn or order_sn in seen:
+            return
+        seen.add(order_sn)
+
+        st_now = (o.get("order_status") or "").upper()
+        # samakan beberapa variasi status:
+        if st_now == "RETURNED":
+            st_now = "TO_RETURN"
+
+        try:
+            if st_now == "READY_TO_SHIP":
+                res = _process_order_to_so(order_sn) or {}
+                so = res.get("sales_order")
+                if so:
+                    ensure_po(frappe.get_doc("Sales Order", so), order_sn)
+                if res.get("status") in ("created", "already_exists", "ok"):
+                    processed += 1
+
+            elif st_now == "COMPLETED":
+                res = _process_order_to_si(order_sn) or {}
+                si = res.get("sales_invoice")
+                if si:
+                    ensure_po(frappe.get_doc("Sales Invoice", si), order_sn)
+                if res.get("ok") or res.get("status") in ("created", "already_exists"):
+                    processed += 1
+
+            elif st_now in ("CANCELLED", "IN_CANCEL", "TO_RETURN"):
+                res = cancel_order(order_sn) or {}
+                if res.get("ok"):
+                    processed += 1
+
+        except Exception as e:
+            errors += 1
+            frappe.log_error(f"Process {order_sn} [{st_now}] fail: {e}", "Shopee Sync Range", _short=True)
+
+        ut = int(o.get("update_time") or o.get("create_time") or 0)
+        if ut > highest:
+            highest = ut
+
+    def fetch_with_cursor(range_field: str) -> int:
+        """return 1 kalau ada order ditemukan; 0 bila tidak ada sama sekali."""
         any_found = 0
         for st in statuses:
-            offset = 0
+            cursor = None
             while True:
                 params = {
-                    "time_range_field": range_field,
+                    "time_range_field": range_field,           # "update_time" | "create_time"
                     "time_from": int(time_from),
                     "time_to": int(time_to),
-                    "page_size": int(page_size),
-                    "offset": offset,
+                    "page_size": max(1, min(int(page_size or 50), 100)),  # max 100 di Shopee
                 }
-                if st:
+                # filter status (jangan kirim "ALL")
+                if st and st not in ("ALL", "*"):
                     params["order_status"] = st
+                if cursor:
+                    params["cursor"] = cursor
+
                 resp = _call(
                     "/api/v2/order/get_order_list",
                     str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
                     params,
                 )
+
                 if resp.get("error"):
+                    nonlocal errors
                     errors += 1
                     frappe.log_error(
                         f"sync_orders_range[{range_field}:{st}] {resp.get('error')}: {resp.get('message')}",
                         "Shopee Sync"
                     )
                     break
+
                 data = resp.get("response") or {}
                 orders = data.get("order_list") or []
                 if not orders:
+                    # tidak ada data halaman ini
                     break
+
                 any_found = 1
                 for o in orders:
-                    order_sn = o.get("order_sn")
-                    if not order_sn or order_sn in seen:
-                        continue
-                    seen.add(order_sn)
-                    st_now = (o.get("order_status") or "").upper()
-                    try:
-                        if st_now == "READY_TO_SHIP":
-                            res = _process_order_to_so(order_sn) or {}
-                            so_name = res.get("sales_order")
-                            if so_name:
-                                ensure_po(frappe.get_doc("Sales Order", so_name), order_sn)
-                            if res.get("status") in ("created", "already_exists", "ok"):
-                                processed += 1
-                        elif st_now == "COMPLETED":
-                            res = _process_order_to_si(order_sn) or {}
-                            si_name = res.get("sales_invoice")
-                            if si_name:
-                                ensure_po(frappe.get_doc("Sales Invoice", si_name), order_sn)
-                            if res.get("ok") or res.get("status") in ("created", "already_exists"):
-                                processed += 1
-                        elif st_now in ("CANCELLED", "IN_CANCEL", "RETURNED"):
-                            res = cancel_order(order_sn) or {}
-                            if res.get("ok"):
-                                processed += 1
-                    except Exception as e:
-                        errors += 1
-                        frappe.log_error(
-                            f"Process {order_sn} [{st_now}] fail: {e}",
-                            "Shopee Sync Range",
-                            _short=True,
-                        )
-                        continue
-                    ut = int(o.get("update_time") or o.get("create_time") or 0)
-                    if ut > highest:
-                        highest = ut
-                if not data.get("has_next_page"):
+                    _handle_one(o)
+
+                # --- PAGINATION v2: gunakan 'more' + 'next_cursor'
+                more = data.get("more")
+                next_cursor = data.get("next_cursor")
+                if more and next_cursor:
+                    cursor = next_cursor
+                else:
                     break
-                offset = data.get("next_offset", offset + page_size)
         return any_found
 
-    # First try by update_time
-    found = fetch_and_process("update_time")
-    # Fallback to create_time if nothing
+    # Coba pakai update_time dulu
+    found = fetch_with_cursor("update_time")
+    # Fallback ke create_time kalau tidak ada
     if not found:
-        fetch_and_process("create_time")
+        found = fetch_with_cursor("create_time")
 
     if processed == 0:
         frappe.logger().info(f"[Shopee Sync] No orders processed in range {time_from}->{time_to} statuses={statuses}")
-    if highest > int(s.last_success_update_time or 0):
-        s.last_success_update_time = highest
-        s.save(ignore_permissions=True)
-        frappe.db.commit()
+
+    try:
+        if highest > int(s.last_success_update_time or 0):
+            s.last_success_update_time = highest
+            s.save(ignore_permissions=True)
+            frappe.db.commit()
+    except Exception:
+        # tidak fatal untuk proses
+        pass
 
     return {
         "from": int(time_from),
@@ -2301,6 +2324,7 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         "success": errors == 0,
         "last_update_time": highest,
         "statuses": statuses,
+        "range_field": "create_time" if not found else "update_time",
     }
 
 def _find_existing_so_by_order_sn(order_sn: str) -> str | None:
