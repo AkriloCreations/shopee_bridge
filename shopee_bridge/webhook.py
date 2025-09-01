@@ -195,13 +195,24 @@ def shopee_webhook():
         raw_body = frappe.request.get_data(as_text=False) or b""
         headers = dict(frappe.request.headers or {})
         
-        # Always create a log entry immediately
-        log_doc = frappe.new_doc("Shopee Webhook Log")
-        log_doc.request_headers = json.dumps(headers, indent=2)
-        log_doc.request_body = raw_body.decode('utf-8', errors='replace') if raw_body else ''
-        log_doc.status = 'Received'
-        log_doc.insert(ignore_permissions=True)
-        frappe.db.commit()
+        # Early provisional log (minimal valid fields) – updated later or supplemented by final log entries
+        try:
+            env = (getattr(_settings(), "environment", "Test") or "Test").lower()
+            source = "Shopee Live" if env == "production" else "Shopee Test"
+            log_doc = frappe.get_doc({
+                "doctype": "Shopee Webhook Log",
+                "timestamp": frappe.utils.now(),
+                # order_sn/status unknown yet
+                "raw_data": raw_body.decode('utf-8', errors='replace') if raw_body else '',
+                "headers": json.dumps(headers, indent=2),
+                "response_status": "Error",  # provisional until processed
+                "source": source,
+                "ip_address": frappe.request.environ.get('REMOTE_ADDR', 'Unknown')
+            })
+            log_doc.insert(ignore_permissions=True)
+            frappe.db.commit()
+        except Exception as early_log_err:
+            frappe.logger().warning(f"[Shopee Webhook] Early log insert failed: {early_log_err}")
 
         # Log incoming request details
         frappe.logger().info(f"""[Shopee Webhook] Incoming request:
@@ -1072,8 +1083,7 @@ def log_webhook_activity(webhook_data, headers, raw_body, result, processing_tim
         if webhook_data:
             # event-based atau push (pakai status)
             event_type = (webhook_data.get('event') or "") or (order_data.get('status') or "")
-
-        log_doc = frappe.get_doc({
+        doc_values = {
             "doctype": "Shopee Webhook Log",
             "timestamp": frappe.utils.now(),
             "order_sn": (order_data.get('ordersn') or (webhook_data.get('order_sn') if webhook_data else "")) or "",
@@ -1082,19 +1092,20 @@ def log_webhook_activity(webhook_data, headers, raw_body, result, processing_tim
             "event_type": event_type,
             "raw_data": json.dumps(webhook_data, indent=2) if webhook_data else (raw_body.decode(errors="replace") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body)),
             "headers": json.dumps(headers, indent=2),
-            "response_status": "Success" if result.get('success') else "Error",
+            "response_status": "Success" if result.get('success') else ("Error" if result.get('error') else "Failed"),
             "error_message": result.get('error', '') if not result.get('success') else '',
             "processing_time": processing_time,
             "source": source,
             "ip_address": frappe.request.environ.get('REMOTE_ADDR', 'Unknown')
-        })
+        }
 
+        log_doc = frappe.get_doc(doc_values)
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
 
-        status_icon = "✅" if result.get('success') else "❌"
-        print(f"{status_icon} Webhook: {log_doc.order_sn or 'No Order'} | "
-              f"{log_doc.event_type or 'No Event'} | {processing_time:.1f}ms")
+        frappe.logger().info(
+            f"[Shopee Webhook] Log saved order={log_doc.order_sn or '-'} event={log_doc.event_type or '-'} time={processing_time:.1f}ms status={log_doc.response_status}"
+        )
 
     except Exception as e:
         frappe.logger().error(f"Failed to log webhook activity: {str(e)}")
