@@ -173,6 +173,14 @@ def shopee_webhook():
     start_time = time.time()
 
     try:
+        # Log request basics immediately
+        frappe.logger().info(f"""[Shopee Webhook] ===== BEGIN REQUEST =====
+            Timestamp: {frappe.utils.now()}
+            Method: {frappe.request.method}
+            Path: {frappe.request.path}
+            Headers: {json.dumps(dict(frappe.request.headers), indent=2)}
+        """)
+
         # Handle CORS preflight
         if frappe.request.method == "OPTIONS":
             frappe.local.response.headers = {
@@ -180,11 +188,20 @@ def shopee_webhook():
                 "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
                 "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Shopee-Signature"
             }
+            frappe.logger().info("[Shopee Webhook] Handled CORS preflight request")
             return {"success": True, "message": "CORS handled"}
 
         # Get request data (raw bytes, no decoding)
         raw_body = frappe.request.get_data(as_text=False) or b""
         headers = dict(frappe.request.headers or {})
+        
+        # Always create a log entry immediately
+        log_doc = frappe.new_doc("Shopee Webhook Log")
+        log_doc.request_headers = json.dumps(headers, indent=2)
+        log_doc.request_body = raw_body.decode('utf-8', errors='replace') if raw_body else ''
+        log_doc.status = 'Received'
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
 
         # Log incoming request details
         frappe.logger().info(f"""[Shopee Webhook] Incoming request:
@@ -194,6 +211,7 @@ def shopee_webhook():
             Content-Length: {len(raw_body)}
             Raw headers: {json.dumps(headers, indent=2)}
             Raw body preview: {raw_body[:200].decode('utf-8', errors='replace') if raw_body else 'empty'}...
+            Log Entry: {log_doc.name}
         """)
         
         # Parse webhook data (best effort)
@@ -206,15 +224,46 @@ def shopee_webhook():
                 processing_time = (time.time() - start_time) * 1000
                 err_msg = str(e)
                 frappe.logger().error(f"[Shopee Webhook] JSON parse error: {err_msg}, raw body: {raw_body[:500].decode('utf-8', errors='replace')}...")
-                result = {"success": False, "error": "invalid_json", "details": err_msg}
+                result = {
+                    "success": True,  # Return success even for JSON errors
+                    "message": "Webhook received",
+                    "internal_error": f"JSON parse error: {err_msg}",
+                    "timestamp": frappe.utils.now()
+                }
                 log_webhook_activity(None, headers, raw_body, result, processing_time)
                 return result
 
-        # Signature verification (use live push key)
-        url_path = frappe.request.path  # not used by the hash, but kept for logs/debug
-        live_push_key = (getattr(_settings(), "live_push_partner_key", "") or "").strip()
-        frappe.logger().debug(f"[Shopee Webhook] Using push key: {live_push_key[:5]}...")
-        if not verify_webhook_signature(url_path, raw_body, headers, live_push_key):
+        # Try both live and test push keys for verification
+        s = _settings()
+        live_push_key = (getattr(s, "live_push_partner_key", "") or "").strip()
+        test_push_key = (getattr(s, "webhook_test_key", "") or "").strip()
+        
+        # Get the exact webhook URL used by Shopee
+        full_url = "https://erp.managerio.ddns.net/api/method/shopee_bridge.webhook.shopee_webhook"
+        
+        # Debug URL construction
+        req_host = frappe.request.host_url.rstrip('/')
+        req_path = frappe.request.path
+        req_full = req_host + req_path
+        frappe.logger().debug(f"""[Shopee Webhook] URL details:
+            Using URL    : {full_url}
+            Request Host: {req_host}
+            Request Path: {req_path}
+            Full Request: {req_full}
+        """)
+        
+        # Try verification with both keys
+        frappe.logger().debug(f"""[Shopee Webhook] Attempting signature verification:
+            Full URL: {full_url}
+            Live key prefix: {live_push_key[:5] if live_push_key else 'not set'}...
+            Test key prefix: {test_push_key[:5] if test_push_key else 'not set'}...
+        """)
+        
+        verified = verify_webhook_signature(full_url, raw_body, headers, live_push_key)
+        if not verified and test_push_key:
+            verified = verify_webhook_signature(full_url, raw_body, headers, test_push_key)
+            
+        if not verified:
             processing_time = (time.time() - start_time) * 1000
             result = {"success": False, "error": "invalid_signature"}
             log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
@@ -222,9 +271,40 @@ def shopee_webhook():
 
         # Process webhook event
         if webhook_data and isinstance(webhook_data, dict):
-            result = process_webhook_event(webhook_data)
+            try:
+                # Extract essential info first
+                info = _extract_push_info(webhook_data)
+                frappe.logger().debug(f"[Shopee Webhook] Extracted info: {json.dumps(info, indent=2)}")
+                
+                # Return 200 OK even if processing fails
+                result = {
+                    "success": True,
+                    "message": "Webhook received",
+                    "order_sn": info.get("order_sn"),
+                    "status": info.get("status"),
+                    "timestamp": frappe.utils.now()
+                }
+                
+                # Process in background if needed
+                frappe.enqueue(
+                    "shopee_bridge.webhook.process_webhook_event",
+                    queue="short",
+                    webhook_data=webhook_data,
+                    now=True
+                )
+            except Exception as e:
+                frappe.logger().error(f"[Shopee Webhook] Processing error (non-fatal): {str(e)}")
+                result = {
+                    "success": True,  # Still return success to Shopee
+                    "message": "Webhook queued for processing",
+                    "timestamp": frappe.utils.now()
+                }
         else:
-            result = {"success": True, "message": "Webhook received but no data to process", "timestamp": frappe.utils.now()}
+            result = {
+                "success": True, 
+                "message": "Webhook received but no data to process", 
+                "timestamp": frappe.utils.now()
+            }
 
         # Log activity
         processing_time = (time.time() - start_time) * 1000
@@ -233,28 +313,83 @@ def shopee_webhook():
 
     except Exception as e:
         processing_time = (time.time() - start_time) * 1000
-        result = {"success": False, "error": "server_error", "details": str(e)}
+        error_msg = str(e)
+        traceback = frappe.get_traceback()
+        
+        # Log the error
+        frappe.logger().error(f"""[Shopee Webhook] Critical error:
+            Error: {error_msg}
+            Traceback: {traceback}
+            Processing time: {processing_time:.2f}ms
+        """)
+        
+        # Update log entry if it exists
+        if 'log_doc' in locals():
+            try:
+                log_doc.status = 'Error'
+                log_doc.error_message = error_msg
+                log_doc.stack_trace = traceback
+                log_doc.processing_time = processing_time
+                log_doc.save(ignore_permissions=True)
+                frappe.db.commit()
+            except Exception as log_err:
+                frappe.logger().error(f"[Shopee Webhook] Failed to update log entry: {str(log_err)}")
+        
+        result = {
+            "success": False,
+            "error": "server_error",
+            "details": error_msg,
+            "timestamp": frappe.utils.now()
+        }
+        
         log_webhook_activity(webhook_data if 'webhook_data' in locals() else None,
-                             headers if 'headers' in locals() else {},
-                             raw_body if 'raw_body' in locals() else b"",
-                             result, processing_time)
-        frappe.log_error(frappe.get_traceback(), "Shopee Webhook Critical Error")
+                           headers if 'headers' in locals() else {},
+                           raw_body if 'raw_body' in locals() else b"",
+                           result, processing_time)
+                           
+        frappe.log_error(traceback, "Shopee Webhook Critical Error")
         return result
 
 
-def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, live_push_key: str) -> bool:
+def test_webhook_signature(body: str | bytes, key: str) -> str:
+    """Test utility to generate webhook signature for a given body and key.
+    
+    Args:
+        body: Request body (string or bytes)
+        key: Partner key to use for signing
+        
+    Returns:
+        str: Calculated signature in hex format
+    """
+    url = "https://erp.managerio.ddns.net/api/method/shopee_bridge.webhook.shopee_webhook"
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    key_bytes = key.encode("utf-8")
+    base_string = f"{url}|{body.decode('utf-8')}"
+    return hmac.new(key_bytes, base_string.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, push_key: str) -> bool:
     """Verify Shopee Push v2 signature using HMAC-SHA256.
     
     Args:
         url: The full URL of the webhook endpoint
+            (should be https://erp.managerio.ddns.net/api/method/shopee_bridge.webhook.shopee_webhook)
         raw_body: Raw request body bytes
         headers: Request headers containing Authorization
-        live_push_key: Shopee partner key from Open Platform Console
+        push_key: Shopee partner key (live or test) from settings
+        
+    Returns:
+        bool: True if signature matches
         
     The signature is calculated as:
     1. base_string = url + "|" + raw_body 
     2. signature = hmac_sha256(partner_key, base_string).hexdigest()
     3. Compare with Authorization header
+    
+    Note:
+        - URL must include full scheme and host (e.g., https://your.domain/path)
+        - Body must be raw bytes without any modification
+        - Authorization header must contain the hex signature without prefix
     """
     import hashlib, hmac
     
@@ -266,9 +401,9 @@ def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, live_push
             return False
             
         # Verify partner key is configured
-        key = (live_push_key or "").strip()
+        key = (push_key or "").strip()
         if not key:
-            frappe.logger().error("[Shopee Webhook] Partner key not configured")
+            frappe.logger().error("[Shopee Webhook] No push key provided")
             return False
             
         # Build base string exactly as specified: url|body
