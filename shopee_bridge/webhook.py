@@ -753,261 +753,6 @@ def _normalize_escrow_payload(payload: dict) -> dict:
         "shipping_rebate": shipping_rebate,
     }
 
-
-def _handle_refund_case(si_name: str, norm: dict, order_sn: str) -> str | None:
-    """Handle case when net amount <= 0 (refund scenario)"""
-    try:
-        # Set flag di SI jika ada
-        try:
-            si_tmp = frappe.get_doc("Sales Invoice", si_name)
-            if hasattr(si_tmp, "custom_shopee_refund_sn"):
-                si_tmp.custom_shopee_refund_sn = order_sn
-                si_tmp.save(ignore_permissions=True)
-                frappe.db.commit()
-        except Exception:
-            pass
-
-        je_name = create_refund_journal_from_shopee(si_name, norm, order_sn)
-        return je_name
-    except Exception:
-        return None
-
-
-def _find_existing_payment_entry(si, order_sn: str) -> str | None:
-    """Check for existing Payment Entry to prevent duplicates"""
-    # Anti-duplikat PE untuk SI ini
-    pe_ref = frappe.db.exists(
-        "Payment Entry Reference",
-        {"reference_doctype": "Sales Invoice", "reference_name": si.name}
-    )
-    if pe_ref:
-        return frappe.db.get_value("Payment Entry Reference", pe_ref, "parent")
-
-    # Lock baris SI untuk mencegah race condition
-    try:
-        frappe.db.sql("select name from `tabSales Invoice` where name=%s for update", si.name)
-    except Exception:
-        pass
-
-    # Cek lagi setelah lock
-    pe_ref2 = frappe.db.exists(
-        "Payment Entry Reference",
-        {"reference_doctype": "Sales Invoice", "reference_name": si.name}
-    )
-    if pe_ref2:
-        return frappe.db.get_value("Payment Entry Reference", pe_ref2, "parent")
-
-    # Cek berdasarkan reference_no sebagai fallback
-    existing_pe = frappe.db.get_value(
-        "Payment Entry",
-        {"reference_no": order_sn, "party_type": "Customer", "party": si.customer, "docstatus": ["!=", 2]},
-        "name"
-    )
-    return existing_pe
-
-
-def _prepare_payment_entry_data(si, norm: dict, net: float, order_sn: str, posting_ts: int | None):
-    """Prepare all necessary data for Payment Entry creation"""
-    from .api import _get_or_create_mode_of_payment
-
-    paid_from = si.debit_to
-    paid_to = _get_or_create_bank_account("Shopee (Escrow)")
-    mop = _get_or_create_mode_of_payment("Shopee")
-
-    # Gross vs Net
-    gross = flt(si.grand_total)
-    expected_total_fees_raw = max(0, gross - net)
-
-    # Breakdown fees dari payload
-    fees_raw = {
-        "commission": flt(norm.get("commission_fee")),
-        "service": flt(norm.get("service_fee")),
-        "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
-        "shipdiff": flt(norm.get("shipping_fee_difference")),
-        "voucher_seller": flt(norm.get("voucher_seller")),
-        "voucher_shopee": flt(norm.get("voucher_from_shopee")),
-        "coin_cash_back": flt(norm.get("coin_cash_back")),
-        "voucher_code_seller": flt(norm.get("voucher_code_seller")),
-    }
-    payload_total_fees_raw = sum(v for v in fees_raw.values() if v > 0)
-    diff_fee_raw = expected_total_fees_raw - payload_total_fees_raw
-
-    # Debug logging
-    frappe.logger().info(f"[Shopee PE Debug] Order {order_sn}: gross={gross}, net={net}, expected_fees={expected_total_fees_raw}")
-    frappe.logger().info(f"[Shopee PE Debug] Fees raw: {fees_raw}")
-    frappe.logger().info(f"[Shopee PE Debug] Payload total fees: {payload_total_fees_raw}, diff: {diff_fee_raw}")
-    frappe.logger().info(f"[Shopee PE Debug] Norm payload: {norm}")
-
-    # Build fee accounts
-    fee_accounts = _build_fee_accounts()
-    diff_account = _get_or_create_expense_account("Selisih Biaya Shopee")
-
-    posting_date = _date_iso_from_epoch(posting_ts)
-    default_cc = _get_default_cost_center_for_si(si)
-
-    return {
-        "si": si,
-        "paid_from": paid_from,
-        "paid_to": paid_to,
-        "mop": mop,
-        "gross": gross,
-        "net": net,
-        "fees_raw": fees_raw,
-        "fee_accounts": fee_accounts,
-        "diff_account": diff_account,
-        "posting_date": posting_date,
-        "default_cc": default_cc,
-        "order_sn": order_sn,
-    }
-
-
-def _build_fee_accounts():
-    """Build dictionary of fee accounts with error handling"""
-    fee_accounts = {}
-    fee_names = {
-        "commission": "Komisi Shopee",
-        "service": "Biaya Layanan Shopee",
-        "protection": "Proteksi Pengiriman Shopee",
-        "shipdiff": "Selisih Ongkir Shopee",
-        "voucher_seller": "Voucher Seller Shopee",
-        "voucher_shopee": "Voucher Shopee",
-        "coin_cash_back": "Coin Cashback Shopee",
-        "voucher_code_seller": "Voucher Kode Seller Shopee",
-    }
-    
-    for key, name in fee_names.items():
-        try:
-            fee_accounts[key] = _get_or_create_expense_account(name)
-        except Exception as e:
-            frappe.logger().error(f"Failed to create {name} account: {e}")
-            fee_accounts[key] = None
-    
-    return fee_accounts
-
-
-def _create_and_configure_pe(pe_data):
-    """Create and configure Payment Entry document"""
-    pe = frappe.new_doc("Payment Entry")
-    pe.company = pe_data["si"].company
-    pe.payment_type = "Receive"
-    pe.mode_of_payment = pe_data["mop"]
-    pe.party_type = "Customer"
-    pe.party = pe_data["si"].customer
-    pe.posting_date = pe_data["posting_date"]
-    pe.reference_no = pe_data["order_sn"]
-    pe.reference_date = pe_data["posting_date"]
-    pe.cost_center = pe_data["default_cc"]
-
-    precision = _pe_precision(pe)
-    rounded_net = flt(pe_data["net"], precision)
-    if rounded_net <= 0:
-        frappe.logger().info(f"[Shopee PE] Skip: rounded net {pe_data['net']} -> 0 @precision {precision} untuk {pe_data['order_sn']}")
-        return None
-
-    pe.paid_from = pe_data["paid_from"]
-    pe.paid_to = pe_data["paid_to"]
-    pe.paid_amount = rounded_net
-    pe.received_amount = rounded_net
-
-    return pe
-
-
-def _add_deductions_to_pe(pe, pe_data):
-    """Add deductions to Payment Entry"""
-    gross_r = flt(pe_data["gross"], _pe_precision(pe))
-    if pe.paid_amount > gross_r:
-        frappe.logger().warning(
-            f"[Shopee PE] Net ({pe.paid_amount}) > Gross ({gross_r}) SI {pe_data['si'].name}, skip PE"
-        )
-        return None
-
-    remaining = flt(gross_r - pe.paid_amount, _pe_precision(pe))
-    total_deductions = 0.0
-    precision = _pe_precision(pe)
-    default_cc = pe_data["default_cc"]
-    fees_raw = pe_data["fees_raw"]
-    fee_accounts = pe_data["fee_accounts"]
-    diff_account = pe_data["diff_account"]
-
-    if remaining <= 0:
-        allocated = pe.paid_amount
-    else:
-        ordered_keys = [
-            "commission", "service", "protection", "shipdiff",
-            "voucher_seller", "voucher_shopee", "coin_cash_back", "voucher_code_seller"
-        ]
-        for k in ordered_keys:
-            raw_v = flt(fees_raw.get(k), precision)
-            if raw_v <= 0 or remaining <= 0:
-                continue
-            account_to_use = fee_accounts.get(k) or diff_account
-            if not account_to_use:
-                continue
-            use_v = raw_v if raw_v <= remaining else remaining
-            if use_v > 0:
-                row = pe.append("deductions", {})
-                row.account = account_to_use
-                row.amount = use_v
-                row.cost_center = default_cc
-                total_deductions += use_v
-                remaining = flt(remaining - use_v, precision)
-
-        # Add diff row for remaining
-        if remaining > 0 and diff_account:
-            row = pe.append("deductions", {})
-            row.account = diff_account
-            row.amount = remaining
-            row.cost_center = default_cc
-            total_deductions += remaining
-            remaining = 0.0
-
-        allocated = flt(pe.paid_amount + total_deductions, precision)
-
-    # Guard: don't allocate more than grand_total
-    if allocated > gross_r:
-        allocated = gross_r
-
-    return allocated
-
-
-def _add_references_to_pe(pe, si, allocated):
-    """Add references to Payment Entry"""
-    ref = pe.append("references", {})
-    ref.reference_doctype = "Sales Invoice"
-    ref.reference_name = si.name
-    ref.allocated_amount = allocated
-
-    # Log if allocation != gross
-    gross_r = flt(si.grand_total, _pe_precision(pe))
-    if allocated != gross_r:
-        frappe.logger().warning(
-            f"[Shopee PE] allocated({allocated}) != gross({gross_r}) @precision {_pe_precision(pe)} for SI {si.name}"
-        )
-
-
-def _submit_payment_entry(pe, si, order_sn: str):
-    """Submit Payment Entry with error handling"""
-    from .api import _insert_submit_with_retry
-
-    try:
-        pe = _insert_submit_with_retry(pe)
-        return pe.name
-    except Exception as e:
-        if "Duplicate entry" in str(e):
-            pe_name = frappe.db.get_value(
-                "Payment Entry Reference",
-                {"reference_doctype": "Sales Invoice", "reference_name": si.name},
-                "parent"
-            ) or frappe.db.get_value(
-                "Payment Entry",
-                {"reference_no": order_sn, "party": si.customer, "docstatus": ["!=", 2]},
-                "name"
-            )
-            if pe_name:
-                return pe_name
-        raise
-
-
 def create_payment_entry_from_shopee(
     si_name: str,
     escrow: dict,
@@ -1029,10 +774,25 @@ def create_payment_entry_from_shopee(
     net = flt(norm.get("net_amount") or net_amount)
     posting_ts = posting_ts or norm.get("payout_time")
 
-    # Handle refund case
-    if net <= 0:
-        return _handle_refund_case(si_name, norm, order_sn)
+    if net <= 0:  # NEW
+        # Untuk kasus refund / negative net: buat Journal Entry yang mencatat biaya/deduction
+        try:
+            norm2 = norm
+            # set flag di SI jika ada
+            try:
+                si_tmp = frappe.get_doc("Sales Invoice", si_name)
+                if hasattr(si_tmp, "custom_shopee_refund_sn"):
+                    si_tmp.custom_shopee_refund_sn = order_sn
+                    si_tmp.save(ignore_permissions=True)
+                    frappe.db.commit()
+            except Exception:
+                pass
 
+            je_name = create_refund_journal_from_shopee(si_name, norm2, order_sn)
+            return je_name
+        except Exception:
+            # jika gagal, tetap skip pembuatan PE
+            return None  # NEW
     if enqueue:
         return frappe.enqueue(
             "shopee_bridge.webhook.create_payment_entry_from_shopee",
@@ -1051,29 +811,225 @@ def create_payment_entry_from_shopee(
         if si.docstatus != 1:
             frappe.throw(f"Sales Invoice {si.name} not submitted")
 
-        # Check for existing PE
-        existing_pe = _find_existing_payment_entry(si, order_sn)
+        # Anti-duplikat PE untuk SI ini
+        pe_ref = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
+        )
+        if pe_ref:
+            return frappe.db.get_value("Payment Entry Reference", pe_ref, "parent")
+
+        # Tambahan: lock baris SI untuk mencegah race antar worker membuat PE bersamaan
+        try:
+            frappe.db.sql("select name from `tabSales Invoice` where name=%s for update", si.name)
+        except Exception:
+            pass
+
+        # Cek lagi setelah lock
+        pe_ref2 = frappe.db.exists(
+            "Payment Entry Reference",
+            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
+        )
+        if pe_ref2:
+            return frappe.db.get_value("Payment Entry Reference", pe_ref2, "parent")
+
+        # Cek Payment Entry existing berdasarkan reference_no (order_sn) + party sebagai fallback idempotensi
+        existing_pe = frappe.db.get_value(
+            "Payment Entry",
+            {"reference_no": order_sn, "party_type": "Customer", "party": si.customer, "docstatus": ["!=", 2]},
+            "name"
+        )
         if existing_pe:
+            # Pastikan referensi anak belum ada → kalau belum, jangan duplikat; biarkan manual fix jika perlu
             return existing_pe
 
-        # Prepare data
-        pe_data = _prepare_payment_entry_data(si, norm, net, order_sn, posting_ts)
-        
-        # Create and configure PE
-        pe = _create_and_configure_pe(pe_data)
-        if pe is None:
+        # Helpers
+        from .api import _get_or_create_mode_of_payment, _insert_submit_with_retry
+
+        paid_from = si.debit_to
+        paid_to = _get_or_create_bank_account("Shopee (Escrow)")
+        mop = _get_or_create_mode_of_payment("Shopee")
+
+        # Gross vs Net
+        gross = flt(si.grand_total)
+        expected_total_fees_raw = max(0, gross - net)
+
+        # Breakdown fees dari payload (raw, belum dibulatkan) - semua komponen utama Shopee
+        fees_raw = {
+            "commission": flt(norm.get("commission_fee")),
+            "service": flt(norm.get("service_fee")),
+            "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
+            "shipdiff": flt(norm.get("shipping_fee_difference")),
+            "voucher_seller": flt(norm.get("voucher_seller")),
+            "voucher_shopee": flt(norm.get("voucher_from_shopee")),
+            "coin_cash_back": flt(norm.get("coin_cash_back")),
+            "voucher_code_seller": flt(norm.get("voucher_code_seller")),
+        }
+        payload_total_fees_raw = sum(v for v in fees_raw.values() if v > 0)
+        diff_fee_raw = expected_total_fees_raw - payload_total_fees_raw  # bisa +/- karena rounding/kelengkapan payload
+
+        # Debug logging
+        frappe.logger().info(f"[Shopee PE Debug] Order {order_sn}: gross={gross}, net={net}, expected_fees={expected_total_fees_raw}")
+        frappe.logger().info(f"[Shopee PE Debug] Fees raw: {fees_raw}")
+        frappe.logger().info(f"[Shopee PE Debug] Payload total fees: {payload_total_fees_raw}, diff: {diff_fee_raw}")
+        frappe.logger().info(f"[Shopee PE Debug] Norm payload: {norm}")
+
+        fee_accounts = {}
+        try:
+            fee_accounts["commission"] = _get_or_create_expense_account("Komisi Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Komisi Shopee account: {e}")
+            fee_accounts["commission"] = None
+        try:
+            fee_accounts["service"] = _get_or_create_expense_account("Biaya Layanan Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Biaya Layanan Shopee account: {e}")
+            fee_accounts["service"] = None
+        try:
+            fee_accounts["protection"] = _get_or_create_expense_account("Proteksi Pengiriman Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Proteksi Pengiriman Shopee account: {e}")
+            fee_accounts["protection"] = None
+        try:
+            fee_accounts["shipdiff"] = _get_or_create_expense_account("Selisih Ongkir Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Selisih Ongkir Shopee account: {e}")
+            fee_accounts["shipdiff"] = None
+        try:
+            fee_accounts["voucher_seller"] = _get_or_create_expense_account("Voucher Seller Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Voucher Seller Shopee account: {e}")
+            fee_accounts["voucher_seller"] = None
+        try:
+            fee_accounts["voucher_shopee"] = _get_or_create_expense_account("Voucher Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Voucher Shopee account: {e}")
+            fee_accounts["voucher_shopee"] = None
+        try:
+            fee_accounts["coin_cash_back"] = _get_or_create_expense_account("Coin Cashback Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Coin Cashback Shopee account: {e}")
+            fee_accounts["coin_cash_back"] = None
+        try:
+            fee_accounts["voucher_code_seller"] = _get_or_create_expense_account("Voucher Kode Seller Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Voucher Kode Seller Shopee account: {e}")
+            fee_accounts["voucher_code_seller"] = None
+        try:
+            diff_account = _get_or_create_expense_account("Selisih Biaya Shopee")
+        except Exception as e:
+            frappe.logger().error(f"Failed to create Selisih Biaya Shopee account: {e}")
+            diff_account = None
+
+        posting_date = _date_iso_from_epoch(posting_ts)
+        ref_date = posting_date
+        default_cc = _get_default_cost_center_for_si(si)
+
+        pe = frappe.new_doc("Payment Entry")
+        pe.company = si.company
+        pe.payment_type = "Receive"
+        pe.mode_of_payment = mop
+        pe.party_type = "Customer"
+        pe.party = si.customer
+        pe.posting_date = posting_date
+        pe.reference_no = order_sn
+        pe.reference_date = ref_date
+        pe.cost_center = default_cc
+
+        precision = _pe_precision(pe)
+
+        rounded_net = flt(net, precision)
+        if rounded_net <= 0:
+            frappe.logger().info(f"[Shopee PE] Skip: rounded net {net} -> 0 @precision {precision} untuk {order_sn}")
             return None
         
-        # Add deductions
-        allocated = _add_deductions_to_pe(pe, pe_data)
-        if allocated is None:
+        # Uang yang diterima (ke escrow) = NET (dibulatkan ke presisi PE)
+        pe.paid_from = paid_from
+        pe.paid_to = paid_to
+        pe.paid_amount = flt(net, precision)
+        pe.received_amount = flt(net, precision)
+
+        # === Rebuild deductions agar TEPAT = gross_r - paid_amount (tidak overshoot) ===
+        gross_r = flt(gross, precision)
+        if pe.paid_amount > gross_r:
+            frappe.logger().warning(
+                f"[Shopee PE] Net ({pe.paid_amount}) > Gross ({gross_r}) SI {si.name}, skip PE"
+            )
             return None
-        
-        # Add references
-        _add_references_to_pe(pe, si, allocated)
-        
-        # Submit PE
-        return _submit_payment_entry(pe, si, order_sn)
+
+        remaining = flt(gross_r - pe.paid_amount, precision)
+        total_deductions = 0.0
+        if remaining <= 0:
+            # Invoice sudah net / tidak perlu deductions (kemungkinan invoice net mode)
+            allocated = pe.paid_amount
+        else:
+            # Urutan prioritas: semua komponen fee Shopee
+            ordered_keys = [
+                "commission", "service", "protection", "shipdiff",
+                "voucher_seller", "voucher_shopee", "coin_cash_back", "voucher_code_seller"
+            ]
+            for k in ordered_keys:
+                raw_v = flt(fees_raw.get(k), precision)
+                if raw_v <= 0 or remaining <= 0:
+                    continue
+                account_to_use = fee_accounts.get(k) or diff_account
+                if not account_to_use:
+                    continue
+                use_v = raw_v if raw_v <= remaining else remaining
+                if use_v > 0:
+                    row = pe.append("deductions", {})
+                    row.account = account_to_use
+                    row.amount = use_v
+                    row.cost_center = default_cc
+                    total_deductions += use_v
+                    remaining = flt(remaining - use_v, precision)
+
+            # Tambahkan diff row untuk sisa jika ada
+            if remaining > 0 and diff_account:
+                row = pe.append("deductions", {})
+                row.account = diff_account
+                row.amount = remaining
+                row.cost_center = default_cc
+                total_deductions += remaining
+                remaining = 0.0
+
+            allocated = flt(pe.paid_amount + total_deductions, precision)
+
+        # Guard: jangan alokasikan lebih besar dari grand_total
+        if allocated > gross_r:
+            allocated = gross_r
+
+        ref = pe.append("references", {})
+        ref.reference_doctype = "Sales Invoice"
+        ref.reference_name = si.name
+        ref.allocated_amount = allocated
+
+        # (Opsional) Log kalau alokasi ≠ gross setelah rounding → hanya warning
+        gross_r = flt(gross, precision)
+        if allocated != gross_r:
+            frappe.logger().warning(
+                f"[Shopee PE] allocated({allocated}) != gross({gross_r}) @precision {precision} for SI {si.name}"
+            )
+
+        try:
+            pe = _insert_submit_with_retry(pe)
+            return pe.name
+        except Exception as e:
+            # Tangani duplikat nama karena race condition naming series
+            if "Duplicate entry" in str(e):
+                # Cari PE terbaru dengan SI reference
+                pe_name = frappe.db.get_value(
+                    "Payment Entry Reference",
+                    {"reference_doctype": "Sales Invoice", "reference_name": si.name},
+                    "parent"
+                ) or frappe.db.get_value(
+                    "Payment Entry",
+                    {"reference_no": order_sn, "party": si.customer, "docstatus": ["!=", 2]},
+                    "name"
+                )
+                if pe_name:
+                    return pe_name
+            raise
 
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
