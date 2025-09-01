@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import base64
 import json
+import datetime
 from typing import Dict, Any, Optional
 from frappe.utils import flt, nowdate # pyright: ignore[reportMissingImports]
 
@@ -753,427 +754,203 @@ def _normalize_escrow_payload(payload: dict) -> dict:
         "shipping_rebate": shipping_rebate,
     }
 
-def create_payment_entry_from_shopee(
-    si_name: str,
-    escrow: dict,
-    net_amount: float,
-    order_sn: str,
-    posting_ts: int | None = None,
-    enqueue: bool = False
-) -> str | None:
+def create_payment_entry_from_shopee(si_name: str, escrow: dict, net_amount: float, 
+                                    order_sn: str, posting_ts: int = None, enqueue: bool = True):
     """
-    Buat Payment Entry settlement Shopee dengan proper account mapping:
-    
-    FIXED ISSUES:
-    - Each fee type now gets its own expense account (commission, service, protection, etc.)
-    - Better error handling for account creation 
-    - Validation of PE amounts and deductions
-    - Enhanced logging and debugging
-    
-    PROCESS:
-    - allocate = NET + total_deductions (== GROSS after rounding) → SI = Paid
-    - deductions = (GROSS - NET) with proper account breakdown:
-      * Komisi Shopee (commission_fee)
-      * Biaya Layanan Shopee (service_fee) 
-      * Proteksi Pengiriman Shopee (protection_fee)
-      * Selisih Ongkir Shopee (shipping_fee_difference)
-      * Voucher Seller Shopee (voucher_seller)
-      * Voucher Shopee (voucher_from_shopee)
-      * Coin Cashback Shopee (coin_cash_back)
-      * Voucher Kode Seller Shopee (voucher_code_seller)
-      * NO MORE fallback to generic "difference" account
-    - isi Cost Center (header & deductions)
-    - Reference Date wajib
-    - anti-duplikat PE per SI
-    - semua angka dibulatkan ke presisi PE → Difference Amount = 0
+    Enhanced Payment Entry creation yang menambahkan semua komponen escrow sebagai deductions.
     """
-    norm = _normalize_escrow_payload(escrow or {})
-    net = flt(norm.get("net_amount") or net_amount)
-    posting_ts = posting_ts or norm.get("payout_time")
-
-    if net <= 0:  # NEW
-        # Untuk kasus refund / negative net: buat Journal Entry yang mencatat biaya/deduction
-        try:
-            norm2 = norm
-            # set flag di SI jika ada
-            try:
-                si_tmp = frappe.get_doc("Sales Invoice", si_name)
-                if hasattr(si_tmp, "custom_shopee_refund_sn"):
-                    si_tmp.custom_shopee_refund_sn = order_sn
-                    si_tmp.save(ignore_permissions=True)
-                    frappe.db.commit()
-            except Exception:
-                pass
-
-            je_name = create_refund_journal_from_shopee(si_name, norm2, order_sn)
-            return je_name
-        except Exception:
-            # jika gagal, tetap skip pembuatan PE
-            return None  # NEW
-    if enqueue:
-        return frappe.enqueue(
-            "shopee_bridge.webhook.create_payment_entry_from_shopee",
-            queue="short",
-            job_name=f"PE Shopee {order_sn}",
-            si_name=si_name,
-            escrow=escrow,
-            net_amount=float(net),
-            order_sn=order_sn,
-            posting_ts=posting_ts,
-            enqueue=False
-        )
-
     try:
         si = frappe.get_doc("Sales Invoice", si_name)
-        if si.docstatus != 1:
-            frappe.throw(f"Sales Invoice {si.name} not submitted")
-
-        # Anti-duplikat PE untuk SI ini
-        pe_ref = frappe.db.exists(
-            "Payment Entry Reference",
-            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
-        )
-        if pe_ref:
-            return frappe.db.get_value("Payment Entry Reference", pe_ref, "parent")
-
-        # Tambahan: lock baris SI untuk mencegah race antar worker membuat PE bersamaan
-        try:
-            frappe.db.sql("select name from `tabSales Invoice` where name=%s for update", si.name)
-        except Exception:
-            pass
-
-        # Cek lagi setelah lock
-        pe_ref2 = frappe.db.exists(
-            "Payment Entry Reference",
-            {"reference_doctype": "Sales Invoice", "reference_name": si.name}
-        )
-        if pe_ref2:
-            return frappe.db.get_value("Payment Entry Reference", pe_ref2, "parent")
-
-        # Cek Payment Entry existing berdasarkan reference_no (order_sn) + party sebagai fallback idempotensi
-        existing_pe = frappe.db.get_value(
-            "Payment Entry",
-            {"reference_no": order_sn, "party_type": "Customer", "party": si.customer, "docstatus": ["!=", 2]},
-            "name"
-        )
-        if existing_pe:
-            # Pastikan referensi anak belum ada → kalau belum, jangan duplikat; biarkan manual fix jika perlu
-            return existing_pe
-
-        # Helpers
-        from .api import _get_or_create_mode_of_payment, _insert_submit_with_retry
-        # Note: We use our own _get_or_create_expense_account from this file (webhook.py)
-        # not the simpler version from api.py
-
-        paid_from = si.debit_to
-        paid_to = _get_or_create_bank_account("Shopee (Escrow)")
-        mop = _get_or_create_mode_of_payment("Shopee")
-
-        # Gross vs Net
-        gross = flt(si.grand_total)
-        expected_total_fees_raw = max(0, gross - net)
-
-        # Breakdown fees dari payload (raw, belum dibulatkan) - semua komponen utama Shopee
-        fees_raw = {
-            "commission": flt(norm.get("commission_fee")),
-            "service": flt(norm.get("service_fee")),
-            "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
-            "shipdiff": flt(norm.get("shipping_fee_difference")),
-            "voucher_seller": flt(norm.get("voucher_seller")),
-            "voucher_shopee": flt(norm.get("voucher_from_shopee")),
-            "coin_cash_back": flt(norm.get("coin_cash_back")),
-            "voucher_code_seller": flt(norm.get("voucher_code_seller")),
-        }
-        payload_total_fees_raw = sum(v for v in fees_raw.values() if v > 0)
-        diff_fee_raw = expected_total_fees_raw - payload_total_fees_raw  # bisa +/- karena rounding/kelengkapan payload
-
-        # Debug logging
-        frappe.logger().info(f"[Shopee PE Debug] Order {order_sn}: gross={gross}, net={net}, expected_fees={expected_total_fees_raw}")
-        frappe.logger().info(f"[Shopee PE Debug] Fees raw: {fees_raw}")
-        frappe.logger().info(f"[Shopee PE Debug] Payload total fees: {payload_total_fees_raw}, diff: {diff_fee_raw}")
-        frappe.logger().info(f"[Shopee PE Debug] Norm payload: {norm}")
-
-        # Create expense accounts for different fee types
-        fee_account_mapping = {
-            "commission": "Komisi Shopee",
-            "service": "Biaya Layanan Shopee", 
-            "protection": "Proteksi Pengiriman Shopee",
-            "shipdiff": "Selisih Ongkir Shopee",
-            "voucher_seller": "Voucher Seller Shopee",
-            "voucher_shopee": "Voucher Shopee", 
-            "coin_cash_back": "Coin Cashback Shopee",
-            "voucher_code_seller": "Voucher Kode Seller Shopee"
-        }
         
-        fee_accounts = {}
-        failed_accounts = []
+        # Normalize escrow details
+        esc_n = _normalize_escrow_payload(escrow)
         
-        # Create all fee accounts - MUST succeed for each account
-        for key, account_name in fee_account_mapping.items():
+        # Calculate actual net amount dari escrow
+        actual_net = flt(esc_n.get("net_amount") or esc_n.get("payout_amount") or net_amount)
+        
+        if actual_net <= 0:
+            frappe.logger().info(f"No payment needed for {order_sn}: net_amount = {actual_net}")
+            return None
+        
+        # Determine posting date dari escrow payout time
+        posting_date = nowdate()
+        if posting_ts:
             try:
-                account = _get_or_create_expense_account(account_name)
-                if account:
-                    fee_accounts[key] = account
-                    frappe.logger().info(f"[Shopee PE] Created/found account {key}: {account}")
-                else:
-                    failed_accounts.append(key)
-                    frappe.logger().error(f"[Shopee PE] FAILED to create account for {key}: {account_name}")
-            except Exception as e:
-                failed_accounts.append(key)
-                fee_accounts[key] = None
-                frappe.logger().error(f"[Shopee PE] Exception creating {account_name} account: {e}")
+                posting_date = datetime.fromtimestamp(posting_ts).date().isoformat()
+            except:
+                pass
+        elif esc_n.get("payout_time"):
+            try:
+                posting_date = datetime.fromtimestamp(int(esc_n.get("payout_time"))).date().isoformat()
+            except:
+                pass
         
-        # NO MORE diff_account fallback - we require specific accounts
+        # Prevent future dates
+        if posting_date > nowdate():
+            posting_date = nowdate()
         
-        # If any accounts failed, throw error - we need all accounts to work properly
-        if failed_accounts:
-            frappe.throw(f"Failed to create required Shopee expense accounts: {failed_accounts}. Please check Chart of Accounts setup and ensure parent expense accounts exist.")
-        
-        # Log account creation summary
-        frappe.logger().info(f"[Shopee PE] Successfully created all accounts: {list(fee_accounts.keys())}")
-
-        posting_date = _date_iso_from_epoch(posting_ts)
-        ref_date = posting_date
-        default_cc = _get_default_cost_center_for_si(si)
-
+        # Create Payment Entry
         pe = frappe.new_doc("Payment Entry")
-        pe.company = si.company
         pe.payment_type = "Receive"
-        pe.mode_of_payment = mop
-        pe.party_type = "Customer"
+        pe.party_type = "Customer" 
         pe.party = si.customer
+        pe.company = si.company
         pe.posting_date = posting_date
         pe.reference_no = order_sn
-        pe.reference_date = ref_date
-        pe.cost_center = default_cc
-
-        precision = _pe_precision(pe)
-
-        rounded_net = flt(net, precision)
-        if rounded_net <= 0:
-            frappe.logger().info(f"[Shopee PE] Skip: rounded net {net} -> 0 @precision {precision} untuk {order_sn}")
-            return None
+        pe.reference_date = posting_date
+        pe.remarks = f"Shopee Order {order_sn} Payment (Auto-created)"
         
-        # Uang yang diterima (ke escrow) = NET (dibulatkan ke presisi PE)
-        pe.paid_from = paid_from
-        pe.paid_to = paid_to
-        pe.paid_amount = flt(net, precision)
-        pe.received_amount = flt(net, precision)
-
-        # === Rebuild deductions agar TEPAT = gross_r - paid_amount (tidak overshoot) ===
-        gross_r = flt(gross, precision)
-        if pe.paid_amount > gross_r:
-            frappe.logger().warning(
-                f"[Shopee PE] Net ({pe.paid_amount}) > Gross ({gross_r}) SI {si.name}, skip PE"
-            )
-            return None
-
-        remaining = flt(gross_r - pe.paid_amount, precision)
-        total_deductions = 0.0
-        deduction_details = []  # For debugging
+        # Set accounts
+        pe.paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account")
+        pe.paid_to = _get_or_create_bank_account("Shopee (Escrow)")
+        pe.mode_of_payment = "Shopee"
         
-        if remaining <= 0:
-            # Invoice sudah net / tidak perlu deductions (kemungkinan invoice net mode)
-            allocated = pe.paid_amount
-            frappe.logger().info(f"[Shopee PE] No deductions needed: remaining={remaining}, allocated={allocated}")
-        else:
-            # Urutan prioritas: semua komponen fee Shopee
-            ordered_keys = [
-                "commission", "service", "protection", "shipdiff",
-                "voucher_seller", "voucher_shopee", "coin_cash_back", "voucher_code_seller"
-            ]
-            
-            for k in ordered_keys:
-                raw_v = flt(fees_raw.get(k, 0), precision)
-                if raw_v <= 0 or remaining <= 0:
-                    continue
-                    
-                # Get specific account for this fee type - MUST exist
-                account_to_use = fee_accounts.get(k)
-                if not account_to_use:
-                    frappe.logger().error(f"[Shopee PE] No account found for {k} - this should not happen!")
-                    continue
-                
-                # Calculate amount to use (don't exceed remaining)
-                use_v = min(raw_v, remaining)
-                
-                if use_v > 0:
-                    row = pe.append("deductions", {})
-                    row.type = "Actual"  # Required field for deduction entries
-                    row.account = account_to_use
-                    row.amount = use_v
-                    row.cost_center = default_cc
-                    
-                    total_deductions += use_v
-                    remaining = flt(remaining - use_v, precision)
-                    
-                    deduction_details.append({
-                        "type": k,
-                        "account": account_to_use,
-                        "amount": use_v,
-                        "raw_amount": raw_v
-                    })
-                    
-                    frappe.logger().info(f"[Shopee PE] Added deduction {k}: {use_v} -> {account_to_use}")
-
-            # If there's still remaining amount, it means our fee breakdown is incomplete
-            # Log this but don't add any "difference" row - we want to be precise
-            if remaining > 0:
-                frappe.logger().warning(f"[Shopee PE] Remaining amount after all deductions: {remaining}. This suggests incomplete fee data from Shopee payload.")
-                frappe.logger().warning(f"[Shopee PE] Expected total fees: {expected_total_fees_raw}, Actual mapped fees: {sum(fees_raw.values())}")
-                
-                # Optional: Add to the largest fee account if we really need to balance
-                # For now, we'll leave it unallocated to identify data issues
-
-            allocated = flt(pe.paid_amount + total_deductions, precision)
-            frappe.logger().info(f"[Shopee PE] Deduction summary: {deduction_details}")
-            frappe.logger().info(f"[Shopee PE] Total deductions: {total_deductions}, Allocated: {allocated}")
-
-        # Guard: jangan alokasikan lebih besar dari grand_total
-        if allocated > gross_r:
-            allocated = gross_r
-
+        # Set amounts - paid_amount adalah gross (sebelum fee), received_amount adalah net
+        gross_amount = flt(si.grand_total)
+        pe.paid_amount = gross_amount
+        pe.received_amount = actual_net
+        
+        # Add SI reference
         ref = pe.append("references", {})
         ref.reference_doctype = "Sales Invoice"
         ref.reference_name = si.name
-        ref.allocated_amount = allocated
-
-        # (Opsional) Log kalau alokasi ≠ gross setelah rounding → hanya warning
-        gross_r = flt(gross, precision)
-        if allocated != gross_r:
-            frappe.logger().warning(
-                f"[Shopee PE] allocated({allocated}) != gross({gross_r}) @precision {precision} for SI {si.name}"
-            )
-
-        # Validate final result
-        validation_result = _validate_payment_entry_amounts(pe, gross_r, net, fees_raw)
-        if not validation_result.get("valid"):
-            frappe.logger().warning(f"[Shopee PE] Validation warning: {validation_result.get('message')}")
-
-        try:
-            pe = _insert_submit_with_retry(pe)
-            frappe.logger().info(f"[Shopee PE] Successfully created PE {pe.name} for order {order_sn}")
-            return pe.name
-        except Exception as e:
-            # Tangani duplikat nama karena race condition naming series
-            if "Duplicate entry" in str(e):
-                # Cari PE terbaru dengan SI reference
-                pe_name = frappe.db.get_value(
-                    "Payment Entry Reference",
-                    {"reference_doctype": "Sales Invoice", "reference_name": si.name},
-                    "parent"
-                ) or frappe.db.get_value(
-                    "Payment Entry",
-                    {"reference_no": order_sn, "party": si.customer, "docstatus": ["!=", 2]},
-                    "name"
-                )
-                if pe_name:
-                    return pe_name
-            raise
-
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Shopee Payment Entry Error")
-        raise
-
+        ref.allocated_amount = gross_amount
+        
+        # === ADD ESCROW DEDUCTIONS ===
+        # Mapping escrow components ke expense accounts
+        escrow_components = [
+            {
+                "key": "commission_fee",
+                "account_name": "Komisi Shopee",
+                "amount": flt(esc_n.get("commission_fee", 0))
+            },
+            {
+                "key": "service_fee", 
+                "account_name": "Biaya Layanan Shopee",
+                "amount": flt(esc_n.get("service_fee", 0))
+            },
+            {
+                "key": "shipping_seller_protection_fee_amount",
+                "account_name": "Proteksi Pengiriman Shopee", 
+                "amount": flt(esc_n.get("shipping_seller_protection_fee_amount", 0))
+            },
+            {
+                "key": "shipping_fee_difference",
+                "account_name": "Selisih Ongkir Shopee",
+                "amount": flt(esc_n.get("shipping_fee_difference", 0))
+            },
+            {
+                "key": "voucher_seller",
+                "account_name": "Voucher Shopee (Seller)",
+                "amount": flt(esc_n.get("voucher_seller", 0))
+            },
+            {
+                "key": "coin_cash_back", 
+                "account_name": "Coin Cashback Shopee",
+                "amount": flt(esc_n.get("coin_cash_back", 0))
+            }
+        ]
+        
+        # Add deductions untuk setiap komponen yang ada
+        for component in escrow_components:
+            amount = component["amount"]
+            if amount > 0:  # Hanya tambahkan jika ada nilai
+                try:
+                    # Get or create expense account
+                    expense_account = _get_or_create_expense_account(component["account_name"])
+                    
+                    # Add deduction row
+                    deduction = pe.append("deductions", {})
+                    deduction.account = expense_account
+                    deduction.amount = amount
+                    deduction.description = f"{component['account_name']} - {order_sn}"
+                    
+                except Exception as e:
+                    frappe.log_error(f"Failed to add deduction {component['key']}: {e}", "PE Deduction")
+        
+        # Validate total deductions
+        total_deductions = sum(flt(d.amount) for d in pe.deductions)
+        expected_deductions = gross_amount - actual_net
+        
+        # Log untuk debugging
+        frappe.logger().info(f"PE {order_sn}: Gross={gross_amount}, Net={actual_net}, "
+                           f"Deductions={total_deductions}, Expected={expected_deductions}")
+        
+        # Adjust jika ada perbedaan kecil (rounding)
+        if abs(total_deductions - expected_deductions) > 1:
+            # Add atau adjust "Other Shopee Charges" untuk balance
+            diff = expected_deductions - total_deductions
+            if abs(diff) > 1:  # Hanya jika perbedaan > Rp 1
+                other_account = _get_or_create_expense_account("Biaya Shopee Lainnya")
+                other_deduction = pe.append("deductions", {})
+                other_deduction.account = other_account
+                other_deduction.amount = diff
+                other_deduction.description = f"Penyesuaian Biaya Shopee - {order_sn}"
+        
+        # Insert dan submit
+        pe.insert(ignore_permissions=True)
+        pe.submit()
+        
+        frappe.logger().info(f"Created Payment Entry {pe.name} for {order_sn} with {len(pe.deductions)} deductions")
+        return pe.name
+        
+    except Exception as e:
+        frappe.log_error(f"Failed to create Payment Entry for {order_sn}: {e}\n"
+                        f"Escrow details: {frappe.as_json(esc_n)}", "Payment Entry Creation")
+        return None
 
 def _get_or_create_expense_account(account_name: str) -> str:
-    """Pastikan akun Expense untuk deductions ada & valid."""
-    if not account_name or not account_name.strip():
-        frappe.logger().error("Empty account name provided")
-        return None
-        
-    account_name = account_name.strip()
+    """Create expense account jika belum ada."""
+    # Clean account name (max 140 chars)
+    clean_name = account_name.strip()[:140]
+    
+    # Check if exists
+    if frappe.db.exists("Account", clean_name):
+        return clean_name
+    
+    # Get company dan parent account
     company = frappe.db.get_single_value("Global Defaults", "default_company")
     
-    if not company:
-        frappe.logger().error("No default company found in Global Defaults")
-        return None
-        
-    cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
-
-    # Check if account already exists
-    acc_name = frappe.db.get_value("Account", {"company": company, "account_name": account_name}, "name")
-    if acc_name:
-        try:
-            acc = frappe.get_doc("Account", acc_name)
-            changed = False
-            
-            # Ensure account settings are correct
-            if acc.is_group: 
-                acc.is_group = 0
-                changed = True
-            if acc.root_type != "Expense": 
-                acc.root_type = "Expense"
-                changed = True
-            if getattr(acc, "account_currency", None) and acc.account_currency != cur:
-                acc.account_currency = cur
-                changed = True
-            if acc.disabled: 
-                acc.disabled = 0
-                changed = True
-            if not acc.account_type:
-                acc.account_type = "Expense Account"
-                changed = True
-                
-            if changed: 
-                acc.save(ignore_permissions=True)
-                frappe.logger().info(f"Updated existing expense account {acc.name}")
-            
-            return acc.name
-        except Exception as e:
-            frappe.logger().error(f"Error updating existing account {acc_name}: {e}")
-            return None
-
-    # Find suitable parent account for new expense account
-    parent_candidates = [
-        ("account_name", "Indirect Expenses"),
-        ("account_name", "Direct Expenses"), 
-        ("account_name", "Expenses"),
-        ("account_name", "Operating Expenses"),
-        ("root_type", "Expense")
+    # Cari parent expense account
+    parent_account = None
+    expense_parents = [
+        "Indirect Expenses",
+        "Marketing Expenses", 
+        "Selling Expenses",
+        "Expenses"
     ]
     
-    parent = None
-    for field, value in parent_candidates:
-        parent = frappe.db.get_value("Account", {
-            "company": company, 
-            field: value, 
-            "is_group": 1
-        }, "name")
-        if parent:
-            frappe.logger().info(f"Found parent account {parent} using {field}={value}")
+    for parent in expense_parents:
+        if frappe.db.exists("Account", {"account_name": parent, "company": company}):
+            parent_account = frappe.db.get_value("Account", 
+                {"account_name": parent, "company": company}, "name")
             break
     
-    if not parent:
-        frappe.logger().error(f"No suitable parent account found for expense account in company {company}. Please set up your Chart of Accounts properly.")
-        return None
+    if not parent_account:
+        # Fallback: cari account bertipe "Expense" 
+        parent_accounts = frappe.get_all("Account", 
+            filters={"company": company, "account_type": "Expense", "is_group": 1},
+            limit=1, pluck="name")
+        parent_account = parent_accounts[0] if parent_accounts else None
     
-    # Create new expense account
-    frappe.logger().info(f"Creating expense account '{account_name}' under parent '{parent}' for company '{company}'")
+    if not parent_account:
+        frappe.throw(f"Cannot find parent expense account for {clean_name}")
     
+    # Create account
     try:
-        acc = frappe.get_doc({
-            "doctype": "Account",
-            "company": company,
-            "account_name": account_name,
-            "parent_account": parent,
-            "is_group": 0,
-            "root_type": "Expense",
-            "account_type": "Expense Account",
-            "account_currency": cur,
-        })
-        acc.insert(ignore_permissions=True)
-        frappe.logger().info(f"Successfully created expense account {acc.name}")
-        return acc.name
-    except frappe.DuplicateEntryError:
-        # Account might have been created by another process
-        frappe.logger().info(f"Account {account_name} already exists (duplicate), fetching...")
-        acc_name = frappe.db.get_value("Account", {"company": company, "account_name": account_name}, "name")
-        return acc_name if acc_name else None
+        account = frappe.new_doc("Account")
+        account.account_name = clean_name
+        account.parent_account = parent_account
+        account.account_type = "Expense"
+        account.company = company
+        account.is_group = 0
+        account.insert(ignore_permissions=True)
+        return account.name
+        
     except Exception as e:
-        frappe.logger().error(f"Failed to insert expense account '{account_name}': {e}")
-        return None
-
+        frappe.log_error(f"Failed to create expense account {clean_name}: {e}", "Account Creation")
+        # Return generic expense account as fallback
+        return parent_account
 def _get_or_create_bank_account(account_name: str) -> str:
     """Pastikan akun escrow Bank ada & valid."""
     company = frappe.db.get_single_value("Global Defaults", "default_company")
@@ -1196,6 +973,25 @@ def _get_or_create_bank_account(account_name: str) -> str:
         frappe.db.get_value("Account", {"company": company, "account_type": "Bank", "is_group": 1}, "name")
         or frappe.db.get_value("Account", {"company": company, "root_type": "Asset", "is_group": 1}, "name")
     )
+    
+    # Fallback: cari parent asset account yang ada
+    if not parent:
+        # Cari semua asset group accounts
+        asset_groups = frappe.db.get_list("Account", 
+            filters={"company": company, "root_type": "Asset", "is_group": 1},
+            fields=["name"], limit=1
+        )
+        if asset_groups:
+            parent = asset_groups[0].name
+        else:
+            # Ultimate fallback: cari root asset account
+            root_asset = frappe.db.get_value("Account", 
+                {"company": company, "root_type": "Asset", "parent_account": ["is", "not set"]}, 
+                "name"
+            )
+            if root_asset:
+                parent = root_asset
+    
     if not parent:
         frappe.logger().error(f"No suitable parent account found for bank account in company {company}. Please set up your Chart of Accounts properly.")
         return None
@@ -1214,7 +1010,17 @@ def _get_or_create_bank_account(account_name: str) -> str:
         return acc.name
     except Exception as e:
         frappe.logger().error(f"Failed to insert bank account {account_name}: {e}")
-        return None
+        # Try with a different name if duplicate
+        if "Duplicate entry" in str(e):
+            alt_name = f"{account_name} ({frappe.utils.random_string(4)})"
+            frappe.logger().info(f"Trying alternative bank name: {alt_name}")
+            try:
+                acc.account_name = alt_name
+                acc.insert(ignore_permissions=True)
+                return acc.name
+            except Exception as e2:
+                frappe.logger().error(f"Failed to insert bank with alternative name {alt_name}: {e2}")
+        frappe.throw(f"Cannot create bank account {account_name}: {str(e)}")
 
 
 def create_refund_journal_from_shopee(si_name: str, norm_payload: dict, order_sn: str) -> str | None:
@@ -1300,692 +1106,8 @@ def create_refund_journal_from_shopee(si_name: str, norm_payload: dict, order_sn
         return None
 
 # =============================================================================
-# VALIDATION & UTILITY FUNCTIONS
-# =============================================================================
-
-def _validate_payment_entry_amounts(pe, gross_amount: float, net_amount: float, fees_raw: dict) -> dict:
-    """Validate Payment Entry amounts and deductions."""
-    try:
-        total_deductions = sum(row.amount for row in pe.deductions or [])
-        total_allocated = sum(row.allocated_amount for row in pe.references or [])
-        
-        expected_total = pe.paid_amount + total_deductions
-        
-        validation = {
-            "valid": True,
-            "message": "",
-            "details": {
-                "paid_amount": pe.paid_amount,
-                "total_deductions": total_deductions,
-                "total_allocated": total_allocated,
-                "expected_total": expected_total,
-                "gross_amount": gross_amount,
-                "net_amount": net_amount,
-                "fees_total": sum(v for v in fees_raw.values() if v > 0)
-            }
-        }
-        
-        # Check if paid amount matches net amount
-        if abs(pe.paid_amount - net_amount) > 0.01:
-            validation["valid"] = False
-            validation["message"] += f"Paid amount ({pe.paid_amount}) doesn't match net amount ({net_amount}). "
-        
-        # Check if total allocated matches expected
-        if abs(total_allocated - expected_total) > 0.01:
-            validation["valid"] = False
-            validation["message"] += f"Allocated amount ({total_allocated}) doesn't match expected ({expected_total}). "
-        
-        # Check deduction accounts
-        deduction_accounts = [row.account for row in pe.deductions or []]
-        unique_accounts = set(deduction_accounts)
-        if len(deduction_accounts) != len(unique_accounts):
-            validation["message"] += "Duplicate deduction accounts found. "
-        
-        return validation
-    except Exception as e:
-        return {
-            "valid": False,
-            "message": f"Validation error: {e}",
-            "details": {}
-        }
-
-# =============================================================================
 # DEVELOPMENT & TEST FUNCTIONS
 # =============================================================================
-
-@frappe.whitelist() 
-def simulate_payment_entry_creation():
-    """Simulate Payment Entry creation to test the new logic without actually creating SI"""
-    try:
-        # Simulate realistic Shopee escrow data
-        test_escrow = {
-            "response": {
-                "order_income": {
-                    "escrow_amount": 100000,  # 100k gross
-                    "payout_amount": 82000,   # 82k net (after all fees)
-                    "commission_fee": 8000,   # 8% commission
-                    "service_fee": 3000,      # 3k service fee
-                    "shipping_seller_protection_fee": 2000,  # 2k protection
-                    "shipping_fee_difference": 1000,  # 1k shipping diff
-                    "voucher_from_seller": 2000,      # 2k voucher seller
-                    "voucher_from_shopee": 1000,      # 1k voucher shopee
-                    "coin_cash_back": 1000,           # 1k coin cashback
-                    "voucher_code_seller": 0          # 0 voucher code
-                }
-            }
-        }
-        
-        # Test the normalization
-        from shopee_bridge.webhook import _normalize_escrow_payload
-        norm = _normalize_escrow_payload(test_escrow)
-        
-        # Test fee breakdown
-        fees_raw = {
-            "commission": flt(norm.get("commission_fee")),
-            "service": flt(norm.get("service_fee")),
-            "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
-            "shipdiff": flt(norm.get("shipping_fee_difference")),
-            "voucher_seller": flt(norm.get("voucher_seller")),
-            "voucher_shopee": flt(norm.get("voucher_from_shopee")),
-            "coin_cash_back": flt(norm.get("coin_cash_back")),
-            "voucher_code_seller": flt(norm.get("voucher_code_seller")),
-        }
-        
-        # Test account creation for each fee type
-        fee_account_mapping = {
-            "commission": "Komisi Shopee",
-            "service": "Biaya Layanan Shopee", 
-            "protection": "Proteksi Pengiriman Shopee",
-            "shipdiff": "Selisih Ongkir Shopee",
-            "voucher_seller": "Voucher Seller Shopee",
-            "voucher_shopee": "Voucher Shopee", 
-            "coin_cash_back": "Coin Cashback Shopee",
-            "voucher_code_seller": "Voucher Kode Seller Shopee"
-        }
-        
-        fee_accounts = {}
-        for key, account_name in fee_account_mapping.items():
-            try:
-                account = _get_or_create_expense_account(account_name)
-                fee_accounts[key] = account
-            except Exception as e:
-                fee_accounts[key] = f"ERROR: {e}"
-        
-        # Simulate the deduction logic
-        gross = 100000  # From escrow_amount
-        net = 82000     # From payout_amount
-        precision = 2
-        
-        remaining = flt(gross - net, precision)  # 18000 total fees expected
-        total_deductions = 0.0
-        deduction_simulation = []
-        
-        ordered_keys = [
-            "commission", "service", "protection", "shipdiff",
-            "voucher_seller", "voucher_shopee", "coin_cash_back", "voucher_code_seller"
-        ]
-        
-        for k in ordered_keys:
-            raw_v = flt(fees_raw.get(k, 0), precision)
-            if raw_v <= 0 or remaining <= 0:
-                continue
-                
-            account_to_use = fee_accounts.get(k)
-            if not account_to_use or account_to_use.startswith("ERROR"):
-                continue
-            
-            use_v = min(raw_v, remaining)
-            
-            if use_v > 0:
-                total_deductions += use_v
-                remaining = flt(remaining - use_v, precision)
-                
-                deduction_simulation.append({
-                    "fee_type": k,
-                    "account": account_to_use,
-                    "amount": use_v,
-                    "raw_amount": raw_v,
-                    "type_field": "Actual"  # This is what we set now
-                })
-        
-        return {
-            "success": True,
-            "message": "Payment Entry simulation completed",
-            "test_data": {
-                "gross_amount": gross,
-                "net_amount": net,
-                "expected_total_fees": gross - net
-            },
-            "normalized_payload": norm,
-            "fees_breakdown": fees_raw,
-            "account_creation": fee_accounts,
-            "deduction_simulation": deduction_simulation,
-            "totals": {
-                "simulated_deductions": total_deductions,
-                "remaining_unallocated": remaining,
-                "allocated_amount": net + total_deductions
-            },
-            "validation": {
-                "all_accounts_created": all(not str(acc).startswith("ERROR") for acc in fee_accounts.values()),
-                "deductions_balance": remaining == 0,
-                "proper_allocation": (net + total_deductions) == gross
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
-
-@frappe.whitelist()
-def debug_existing_payment_entries(order_sn: str = None):
-    """Debug existing Payment Entries to see their deduction structure"""
-    try:
-        filters = {"party_type": "Customer"}
-        if order_sn:
-            filters["reference_no"] = order_sn
-        
-        # Get recent Payment Entries
-        pe_list = frappe.db.get_list(
-            "Payment Entry",
-            filters=filters,
-            fields=["name", "reference_no", "party", "paid_amount", "posting_date", "docstatus"],
-            order_by="creation desc",
-            limit=10
-        )
-        
-        results = []
-        for pe_data in pe_list:
-            try:
-                pe = frappe.get_doc("Payment Entry", pe_data["name"])
-                
-                # Get deductions
-                deductions = []
-                for ded in pe.deductions or []:
-                    deductions.append({
-                        "type": getattr(ded, "type", "Not Set"),
-                        "account": ded.account,
-                        "amount": ded.amount
-                    })
-                
-                # Get references
-                references = []
-                for ref in pe.references or []:
-                    references.append({
-                        "reference_doctype": ref.reference_doctype,
-                        "reference_name": ref.reference_name,
-                        "allocated_amount": ref.allocated_amount
-                    })
-                
-                results.append({
-                    "pe_name": pe_data["name"],
-                    "order_sn": pe_data["reference_no"],
-                    "party": pe_data["party"],
-                    "paid_amount": pe_data["paid_amount"],
-                    "posting_date": pe_data["posting_date"],
-                    "docstatus": pe_data["docstatus"],
-                    "deductions_count": len(deductions),
-                    "deductions": deductions,
-                    "references": references,
-                    "has_selisih_biaya": any("Selisih Biaya Shopee" in ded["account"] for ded in deductions),
-                    "missing_type_field": any(ded["type"] == "Not Set" for ded in deductions)
-                })
-            except Exception as e:
-                results.append({
-                    "pe_name": pe_data["name"],
-                    "error": str(e)
-                })
-        
-        return {
-            "success": True,
-            "message": f"Found {len(pe_list)} Payment Entries",
-            "payment_entries": results,
-            "summary": {
-                "total_found": len(pe_list),
-                "with_selisih_biaya": sum(1 for r in results if r.get("has_selisih_biaya")),
-                "missing_type_field": sum(1 for r in results if r.get("missing_type_field")),
-                "order_sn_filter": order_sn or "All recent PEs"
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
-
-@frappe.whitelist()
-def test_payment_entry_structure():
-    """Test Payment Entry deduction structure to ensure proper fields are set"""
-    try:
-        # Create a mock Payment Entry to test deduction structure
-        pe = frappe.new_doc("Payment Entry")
-        pe.payment_type = "Receive"
-        pe.party_type = "Customer"
-        
-        # Test deduction row structure
-        test_deductions = [
-            {"type": "commission", "account_name": "Komisi Shopee", "amount": 10000},
-            {"type": "service", "account_name": "Biaya Layanan Shopee", "amount": 5000},
-            {"type": "protection", "account_name": "Proteksi Pengiriman Shopee", "amount": 2000}
-        ]
-        
-        deduction_structure = []
-        
-        for deduction in test_deductions:
-            # Try to get the account
-            try:
-                account = _get_or_create_expense_account(deduction["account_name"])
-                if account:
-                    # Add deduction row structure
-                    row_structure = {
-                        "type": "Actual",  # Required field
-                        "account": account,
-                        "account_name": deduction["account_name"],
-                        "amount": deduction["amount"],
-                        "cost_center": None,  # Will be filled from SI
-                        "fee_type": deduction["type"]
-                    }
-                    deduction_structure.append(row_structure)
-                else:
-                    deduction_structure.append({
-                        "error": f"Could not create account: {deduction['account_name']}"
-                    })
-            except Exception as e:
-                deduction_structure.append({
-                    "error": f"Exception creating {deduction['account_name']}: {e}"
-                })
-        
-        # Test if we can add these to a PE (without saving)
-        total_amount = 0
-        for deduction in deduction_structure:
-            if "error" not in deduction:
-                row = pe.append("deductions", {})
-                row.type = deduction["type"]
-                row.account = deduction["account"]
-                row.amount = deduction["amount"]
-                total_amount += deduction["amount"]
-        
-        return {
-            "success": True,
-            "message": "Payment Entry deduction structure test completed",
-            "deduction_structure": deduction_structure,
-            "total_deductions": total_amount,
-            "pe_deductions_count": len(pe.deductions),
-            "required_fields": {
-                "type": "Actual (required for all deductions)",
-                "account": "Specific expense account for each fee",
-                "amount": "Fee amount from Shopee payload",
-                "cost_center": "From Sales Invoice or default"
-            },
-            "note": "All deduction rows must have 'type' field set to 'Actual'"
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
-
-@frappe.whitelist()
-def force_create_shopee_accounts_and_test():
-    """Force create all Shopee accounts and test Payment Entry creation"""
-    try:
-        # Account mapping yang HARUS ada
-        required_accounts = {
-            "commission": "Komisi Shopee",
-            "service": "Biaya Layanan Shopee", 
-            "protection": "Proteksi Pengiriman Shopee",
-            "shipdiff": "Selisih Ongkir Shopee",
-            "voucher_seller": "Voucher Seller Shopee",
-            "voucher_shopee": "Voucher Shopee", 
-            "coin_cash_back": "Coin Cashback Shopee",
-            "voucher_code_seller": "Voucher Kode Seller Shopee"
-        }
-        
-        # FORCE CREATE semua account
-        created_accounts = {}
-        failed_accounts = {}
-        
-        for key, account_name in required_accounts.items():
-            try:
-                # Try multiple times to ensure creation
-                account = None
-                for attempt in range(3):
-                    account = _get_or_create_expense_account(account_name)
-                    if account:
-                        break
-                    frappe.logger().warning(f"Attempt {attempt+1} failed for {account_name}")
-                
-                if account:
-                    created_accounts[key] = account
-                    frappe.logger().info(f"✓ {key}: {account}")
-                else:
-                    failed_accounts[key] = f"Failed after 3 attempts: {account_name}"
-                    frappe.logger().error(f"✗ {key}: FAILED - {account_name}")
-                    
-            except Exception as e:
-                failed_accounts[key] = str(e)
-                frappe.logger().error(f"✗ {key}: ERROR - {e}")
-        
-        # Test deduction structure yang AKAN digunakan
-        test_fees = {
-            "commission": 5000,     # 5k commission
-            "service": 2000,        # 2k service  
-            "protection": 1000,     # 1k protection
-            "shipdiff": 500,        # 500 shipping diff
-            "voucher_seller": 1000, # 1k voucher seller
-            "voucher_shopee": 500,  # 500 voucher shopee
-            "coin_cash_back": 200,  # 200 coin cashback
-            "voucher_code_seller": 0 # 0 voucher code
-        }
-        
-        # Simulasi Payment Entry deduction structure
-        pe_deductions_preview = []
-        total_deductions = 0
-        
-        for key in ["commission", "service", "protection", "shipdiff", 
-                   "voucher_seller", "voucher_shopee", "coin_cash_back", "voucher_code_seller"]:
-            
-            amount = test_fees.get(key, 0)
-            if amount <= 0:
-                continue
-                
-            account = created_accounts.get(key)
-            if account:
-                pe_deductions_preview.append({
-                    "type": "Actual",  # Field yang HARUS ada
-                    "account": account,
-                    "amount": amount,
-                    "fee_type": key
-                })
-                total_deductions += amount
-        
-        return {
-            "success": len(failed_accounts) == 0,
-            "message": f"Account creation: {len(created_accounts)}/{len(required_accounts)} successful",
-            "created_accounts": created_accounts,
-            "failed_accounts": failed_accounts,
-            "pe_deduction_preview": pe_deductions_preview,
-            "totals": {
-                "expected_deductions": total_deductions,
-                "number_of_deduction_rows": len(pe_deductions_preview)
-            },
-            "important_notes": [
-                "ALL Payment Entry deductions now use specific accounts",
-                "NO MORE 'Selisih Biaya Shopee' fallback", 
-                "Each fee type gets its own deduction row",
-                "Type field is set to 'Actual' for all deductions"
-            ],
-            "next_steps": [
-                "Create a new Shopee order to test Payment Entry creation",
-                "Check that deductions use the specific accounts above",
-                "Old Payment Entries may still show 'Selisih Biaya Shopee' - those are from old code"
-            ]
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
-
-@frappe.whitelist()
-def create_all_shopee_expense_accounts():
-    """Create all Shopee expense accounts manually to ensure they exist"""
-    try:
-        fee_account_mapping = {
-            "commission": "Komisi Shopee",
-            "service": "Biaya Layanan Shopee", 
-            "protection": "Proteksi Pengiriman Shopee",
-            "shipdiff": "Selisih Ongkir Shopee",
-            "voucher_seller": "Voucher Seller Shopee",
-            "voucher_shopee": "Voucher Shopee", 
-            "coin_cash_back": "Coin Cashback Shopee",
-            "voucher_code_seller": "Voucher Kode Seller Shopee"
-        }
-        
-        results = {}
-        
-        for key, account_name in fee_account_mapping.items():
-            try:
-                account = _get_or_create_expense_account(account_name)
-                if account:
-                    results[key] = {"success": True, "account": account, "account_name": account_name}
-                else:
-                    results[key] = {"success": False, "error": "Account creation returned None", "account_name": account_name}
-            except Exception as e:
-                results[key] = {"success": False, "error": str(e), "account_name": account_name}
-        
-        success_count = sum(1 for r in results.values() if r["success"])
-        
-        return {
-            "success": success_count == len(fee_account_mapping),
-            "message": f"Created/verified {success_count}/{len(fee_account_mapping)} accounts",
-            "accounts": results,
-            "summary": {
-                "total_accounts": len(fee_account_mapping),
-                "successful": success_count,
-                "failed": len(fee_account_mapping) - success_count
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
-
-@frappe.whitelist()
-def debug_payment_entry_accounts():
-    """Debug function to test account creation and fee mapping"""
-    try:
-        # Test data
-        fees_raw = {
-            "commission": 10000,
-            "service": 5000,
-            "protection": 2000,
-            "shipdiff": 1000,
-            "voucher_seller": 3000,
-            "voucher_shopee": 500,
-            "coin_cash_back": 200,
-            "voucher_code_seller": 0,
-        }
-        
-        # Create expense accounts for different fee types
-        fee_account_mapping = {
-            "commission": "Komisi Shopee",
-            "service": "Biaya Layanan Shopee", 
-            "protection": "Proteksi Pengiriman Shopee",
-            "shipdiff": "Selisih Ongkir Shopee",
-            "voucher_seller": "Voucher Seller Shopee",
-            "voucher_shopee": "Voucher Shopee", 
-            "coin_cash_back": "Coin Cashback Shopee",
-            "voucher_code_seller": "Voucher Kode Seller Shopee"
-        }
-        
-        fee_accounts = {}
-        failed_accounts = []
-        
-        # Create all fee accounts
-        for key, account_name in fee_account_mapping.items():
-            try:
-                fee_accounts[key] = _get_or_create_expense_account(account_name)
-                if not fee_accounts[key]:
-                    failed_accounts.append(key)
-                    frappe.logger().warning(f"Failed to create account for {key}: {account_name}")
-            except Exception as e:
-                failed_accounts.append(key)
-                fee_accounts[key] = None
-                frappe.logger().error(f"Exception creating {account_name} account: {e}")
-        
-        # Test deduction logic
-        remaining = 21700  # Total fees from fees_raw
-        deduction_details = []
-        
-        ordered_keys = [
-            "commission", "service", "protection", "shipdiff",
-            "voucher_seller", "voucher_shopee", "coin_cash_back", "voucher_code_seller"
-        ]
-        
-        for k in ordered_keys:
-            raw_v = flt(fees_raw.get(k, 0), 2)
-            if raw_v <= 0 or remaining <= 0:
-                continue
-                
-            # Get specific account for this fee type
-            account_to_use = fee_accounts.get(k)
-            if not account_to_use:
-                account_to_use = fee_accounts.get("shipdiff")  # Use diff account as fallback
-                
-            if not account_to_use:
-                continue
-            
-            # Calculate amount to use (don't exceed remaining)
-            use_v = min(raw_v, remaining)
-            
-            if use_v > 0:
-                remaining = remaining - use_v
-                
-                deduction_details.append({
-                    "fee_type": k,
-                    "account": account_to_use,
-                    "amount": use_v,
-                    "raw_amount": raw_v
-                })
-        
-        return {
-            "success": True,
-            "fee_accounts_created": fee_accounts,
-            "failed_accounts": failed_accounts,
-            "deduction_simulation": deduction_details,
-            "total_deductions": sum(d["amount"] for d in deduction_details),
-            "remaining_after_deductions": remaining,
-            "fees_raw": fees_raw,
-            "expected_total_fees": sum(v for v in fees_raw.values() if v > 0)
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
-
-@frappe.whitelist()
-def test_payment_entry_creation():
-    """Test Payment Entry creation with different fee scenarios"""
-    try:
-        # Mock data for testing
-        test_scenarios = [
-            {
-                "name": "Standard Fees",
-                "escrow": {
-                    "response": {
-                        "order_income": {
-                            "escrow_amount": 100000,
-                            "payout_amount": 85000,
-                            "commission_fee": 10000,
-                            "service_fee": 3000,
-                            "shipping_seller_protection_fee": 2000,
-                            "voucher_from_seller": 0,
-                            "voucher_from_shopee": 0,
-                            "coin_cash_back": 0
-                        }
-                    }
-                },
-                "net_amount": 85000,
-                "order_sn": f"TEST-PE-{frappe.utils.now_datetime().timestamp():.0f}"
-            },
-            {
-                "name": "All Fee Types",
-                "escrow": {
-                    "response": {
-                        "order_income": {
-                            "escrow_amount": 200000,
-                            "payout_amount": 170000,
-                            "commission_fee": 15000,
-                            "service_fee": 5000,
-                            "shipping_seller_protection_fee": 3000,
-                            "shipping_fee_difference": 2000,
-                            "voucher_from_seller": 3000,
-                            "voucher_from_shopee": 1000,
-                            "coin_cash_back": 1000,
-                            "voucher_code_seller": 0
-                        }
-                    }
-                },
-                "net_amount": 170000,
-                "order_sn": f"TEST-PE-ALL-{frappe.utils.now_datetime().timestamp():.0f}"
-            }
-        ]
-        
-        results = []
-        for scenario in test_scenarios:
-            frappe.logger().info(f"[Test PE] Testing scenario: {scenario['name']}")
-            
-            # Test the normalization function
-            norm = _normalize_escrow_payload(scenario["escrow"])
-            
-            # Test fee account creation
-            fee_accounts = {}
-            fee_account_mapping = {
-                "commission": "Komisi Shopee",
-                "service": "Biaya Layanan Shopee", 
-                "protection": "Proteksi Pengiriman Shopee",
-                "shipdiff": "Selisih Ongkir Shopee",
-                "voucher_seller": "Voucher Seller Shopee",
-                "voucher_shopee": "Voucher Shopee", 
-                "coin_cash_back": "Coin Cashback Shopee",
-                "voucher_code_seller": "Voucher Kode Seller Shopee"
-            }
-            
-            for key, account_name in fee_account_mapping.items():
-                try:
-                    acc = _get_or_create_expense_account(account_name)
-                    fee_accounts[key] = acc
-                except Exception as e:
-                    fee_accounts[key] = None
-                    frappe.logger().error(f"Failed to create {account_name}: {e}")
-            
-            scenario_result = {
-                "scenario": scenario["name"],
-                "order_sn": scenario["order_sn"],
-                "normalized_payload": norm,
-                "fee_accounts_created": fee_accounts,
-                "accounts_success": len([a for a in fee_accounts.values() if a]),
-                "accounts_failed": len([a for a in fee_accounts.values() if not a])
-            }
-            
-            results.append(scenario_result)
-        
-        return {
-            "success": True,
-            "message": "Payment Entry creation test completed",
-            "test_results": results,
-            "note": "Check fee account creation and payload normalization"
-        }
-        
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Test Payment Entry Creation Error")
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": frappe.get_traceback()
-        }
-
 
 @frappe.whitelist()
 def test_webhook():
@@ -2213,16 +1335,15 @@ def repair_shopee_payment_entries(limit: int = 200):
             need = round(gross - net, 2)
             have = round(sum(flt(d.amount) for d in new_pe.deductions), 2)
             diff = round(need - have, 2)
-            
             if abs(diff) >= 0.01:
-                # TIDAK LAGI menggunakan "Selisih Biaya Shopee" - skip repair ini
-                frappe.logger().warning(
-                    f"[Shopee Repair] Skipping PE repair for SI {si_row.name}: "
-                    f"Cannot balance deductions (need={need}, have={have}, diff={diff}). "
-                    f"Manual review required."
-                )
-                skipped += 1
-                continue
+                si_doc = frappe.get_doc("Sales Invoice", si_row.name)
+                cc = _get_default_cost_center_for_si(si_doc)
+                acc = _get_or_create_expense_account("Selisih Biaya Shopee")
+                row = new_pe.append("deductions", {})
+                row.account = acc
+                row.amount = flt(diff)
+                row.charge_type = "Actual"
+                row.cost_center = cc
 
             if not new_pe.reference_date:
                 new_pe.reference_date = new_pe.posting_date
@@ -2358,227 +1479,6 @@ def dbg_verify_signature():
         "compare": results,
     }
 
-
-@frappe.whitelist()
-def debug_sync_orders_range_pe(order_sn_list: str = None, time_from: int = None, time_to: int = None):
-    """
-    Debug Payment Entry creation issues during sync_orders_range.
-    Test specific orders or recent orders to see why PE is not created.
-    """
-    try:
-        from shopee_bridge.api import _settings, _call, _safe_int
-        
-        s = _settings()
-        if not s.access_token:
-            return {"error": "No access token"}
-        
-        # Determine order list
-        if order_sn_list:
-            order_sns = [sn.strip() for sn in order_sn_list.split(",") if sn.strip()]
-        else:
-            # Get recent COMPLETED orders if no specific orders provided
-            if not time_from or not time_to:
-                import time
-                time_to = int(time.time())
-                time_from = time_to - (24 * 3600)  # Last 24 hours
-            
-            resp = _call(
-                "/api/v2/order/get_order_list",
-                str(s.partner_id).strip(), s.partner_key,
-                s.shop_id, s.access_token,
-                {
-                    "time_range_field": "update_time",
-                    "time_from": time_from,
-                    "time_to": time_to,
-                    "page_size": 10,
-                    "order_status": "COMPLETED"
-                }
-            )
-            if resp.get("error"):
-                return {"error": f"API call failed: {resp.get('message')}"}
-            
-            orders = resp.get("response", {}).get("order_list", [])
-            order_sns = [o.get("order_sn") for o in orders if o.get("order_sn")]
-        
-        if not order_sns:
-            return {"error": "No orders found to debug"}
-        
-        results = []
-        for order_sn in order_sns[:5]:  # Limit to 5 orders
-            result = {
-                "order_sn": order_sn,
-                "sales_invoice": None,
-                "payment_entry": None,
-                "escrow_data": None,
-                "net_amount": 0,
-                "error": None,
-                "debug_info": {}
-            }
-            
-            try:
-                # Check if SI exists
-                si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
-                result["sales_invoice"] = si_name
-                result["debug_info"]["has_si"] = bool(si_name)
-                
-                if not si_name:
-                    result["error"] = "No Sales Invoice found"
-                    results.append(result)
-                    continue
-                
-                # Check if PE already exists
-                pe_exists = frappe.db.exists(
-                    "Payment Entry Reference",
-                    {"reference_doctype": "Sales Invoice", "reference_name": si_name}
-                )
-                result["debug_info"]["has_pe"] = bool(pe_exists)
-                
-                if pe_exists:
-                    pe_ref = frappe.get_doc("Payment Entry Reference", {"reference_doctype": "Sales Invoice", "reference_name": si_name})
-                    result["payment_entry"] = pe_ref.parent
-                    results.append(result)
-                    continue
-                
-                # Get escrow data
-                esc = _call(
-                    "/api/v2/payment/get_escrow_detail",
-                    str(s.partner_id).strip(), s.partner_key,
-                    s.shop_id, s.access_token,
-                    {"order_sn": order_sn}
-                )
-                
-                if esc.get("error"):
-                    result["error"] = f"Escrow API failed: {esc.get('message')}"
-                    results.append(result)
-                    continue
-                
-                # Normalize escrow
-                esc_norm = _normalize_escrow_payload(esc)
-                result["escrow_data"] = esc_norm
-                result["net_amount"] = flt(esc_norm.get("net_amount"))
-                result["debug_info"]["payout_time"] = _safe_int(esc_norm.get("payout_time"))
-                
-                # Check conditions that would prevent PE creation
-                if result["net_amount"] <= 0:
-                    result["error"] = f"Net amount is {result['net_amount']} (must be > 0)"
-                    results.append(result)
-                    continue
-                
-                # Try to create PE
-                try:
-                    pe_name = create_payment_entry_from_shopee(
-                        si_name=si_name,
-                        escrow=esc_norm,
-                        net_amount=result["net_amount"],
-                        order_sn=order_sn,
-                        posting_ts=result["debug_info"]["payout_time"],
-                        enqueue=False
-                    )
-                    result["payment_entry"] = pe_name
-                    result["debug_info"]["pe_created"] = bool(pe_name)
-                except Exception as pe_error:
-                    result["error"] = f"PE creation failed: {str(pe_error)}"
-                    result["debug_info"]["pe_error"] = frappe.get_traceback()
-                
-            except Exception as e:
-                result["error"] = f"Debug failed: {str(e)}"
-                result["debug_info"]["exception"] = frappe.get_traceback()
-            
-            results.append(result)
-        
-        return {
-            "success": True,
-            "debugged_orders": len(results),
-            "results": results,
-            "summary": {
-                "with_si": len([r for r in results if r["sales_invoice"]]),
-                "with_pe": len([r for r in results if r["payment_entry"]]),
-                "errors": len([r for r in results if r["error"]]),
-                "net_amounts": [r["net_amount"] for r in results]
-            }
-        }
-        
-    except Exception as e:
-        return {"success": False, "error": str(e), "traceback": frappe.get_traceback()}
-
-
-@frappe.whitelist()
-def test_payment_entry_creation(order_sn: str):
-    """
-    Test Payment Entry creation for a specific order with detailed logging.
-    """
-    try:
-        from shopee_bridge.api import _settings, _call, _safe_int
-        
-        s = _settings()
-        if not s.access_token:
-            return {"error": "No access token"}
-        
-        # Get SI
-        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
-        if not si_name:
-            return {"error": f"No Sales Invoice found for order {order_sn}"}
-        
-        # Check existing PE
-        pe_exists = frappe.db.exists(
-            "Payment Entry Reference",
-            {"reference_doctype": "Sales Invoice", "reference_name": si_name}
-        )
-        
-        if pe_exists:
-            pe_ref = frappe.get_doc("Payment Entry Reference", {"reference_doctype": "Sales Invoice", "reference_name": si_name})
-            return {
-                "success": True,
-                "message": "Payment Entry already exists",
-                "payment_entry": pe_ref.parent,
-                "sales_invoice": si_name
-            }
-        
-        # Get escrow
-        esc = _call(
-            "/api/v2/payment/get_escrow_detail",
-            str(s.partner_id).strip(), s.partner_key,
-            s.shop_id, s.access_token,
-            {"order_sn": order_sn}
-        )
-        
-        if esc.get("error"):
-            return {"error": f"Escrow API failed: {esc.get('message')}"}
-        
-        # Normalize escrow
-        esc_norm = _normalize_escrow_payload(esc)
-        net_amount = flt(esc_norm.get("net_amount"))
-        
-        frappe.logger().info(f"[Test PE] Order {order_sn}: SI={si_name}, net_amount={net_amount}")
-        
-        if net_amount <= 0:
-            return {"error": f"Cannot create PE: net_amount is {net_amount} (must be > 0)"}
-        
-        # Create PE with full logging
-        pe_name = create_payment_entry_from_shopee(
-            si_name=si_name,
-            escrow=esc_norm,
-            net_amount=net_amount,
-            order_sn=order_sn,
-            posting_ts=_safe_int(esc_norm.get("payout_time")),
-            enqueue=False
-        )
-        
-        if pe_name:
-            return {
-                "success": True,
-                "message": f"Payment Entry created successfully",
-                "payment_entry": pe_name,
-                "sales_invoice": si_name,
-                "net_amount": net_amount,
-                "escrow_data": esc_norm
-            }
-        else:
-            return {"error": "Payment Entry creation returned None"}
-            
-    except Exception as e:
-        return {
-            "success": False, 
-            "error": str(e), 
-            "traceback": frappe.get_traceback()
-        }
+def _andakocak():
+    pass
+    
