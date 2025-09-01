@@ -3,7 +3,7 @@ from frappe.utils import get_url, flt, nowdate, cint, add_days, now, format_date
 from datetime import datetime, timedelta, timezone
 import json
 from .webhook import create_payment_entry_from_shopee
-from shopee_bridge.webhook import create_payment_entry_from_shopee, _get_or_create_bank_account
+from shopee_bridge.webhook import create_payment_entry_from_shopee, _get_or_create_bank_account, _get_or_create_expense_account
 
 try:
     from zoneinfo import ZoneInfo
@@ -406,45 +406,7 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
         
         return fallback_sku
 
-def _get_or_create_expense_account(account_name: str) -> str:
-    """Pastikan akun Expense untuk deductions ada & valid."""
-    company = frappe.db.get_single_value("Global Defaults", "default_company")
-    cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
 
-    acc_name = frappe.db.get_value("Account", {"company": company, "account_name": account_name}, "name")
-    if acc_name:
-        acc = frappe.get_doc("Account", acc_name)
-        changed = False
-        if acc.is_group: acc.is_group = 0; changed = True
-        if acc.root_type != "Expense": acc.root_type = "Expense"; changed = True
-        if acc.account_type != "Expense Account": acc.account_type = "Expense Account"; changed = True
-        if getattr(acc, "account_currency", None) and acc.account_currency != cur:
-            acc.account_currency = cur; changed = True
-        if acc.disabled: acc.disabled = 0; changed = True
-        if changed: acc.save(ignore_permissions=True)
-        return acc.name
-
-    parent = (
-        frappe.db.get_value("Account", {"company": company, "account_name": "Indirect Expenses", "is_group": 1}, "name")
-        or frappe.db.get_value("Account", {"company": company, "account_name": "Direct Expenses", "is_group": 1}, "name")
-        or frappe.db.get_value("Account", {"company": company, "root_type": "Expense", "is_group": 1}, "name")
-    )
-    acc = frappe.get_doc({
-        "doctype": "Account",
-        "company": company,
-        "account_name": account_name,
-        "parent_account": parent,
-        "is_group": 0,
-        "root_type": "Expense",
-        "account_type": "Expense Account",
-        "account_currency": cur,
-    })
-    try:
-        acc.insert(ignore_permissions=True)
-        return acc.name
-    except Exception as e:
-        frappe.logger().error(f"Failed to insert expense account {account_name}: {e}")
-        return None
 
 def _get_item_group():
     """Get or create Shopee item group."""
@@ -2712,18 +2674,31 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         if esc.get("error"):
             frappe.logger().warning(f"[Shopee Backfill] escrow_detail fail {order_sn}: {esc.get('message')}")
             return
+        
+        # Normalize escrow dan hitung net_amount yang benar
+        from .webhook import _normalize_escrow_payload
+        esc_norm = _normalize_escrow_payload(esc)
+        net_amount = flt(esc_norm.get("net_amount"))
+        payout_ts = _safe_int(esc_norm.get("payout_time"))
+        
+        # Skip jika net_amount <= 0 (refund case atau tidak ada pembayaran)
+        if net_amount <= 0:
+            frappe.logger().info(f"[Shopee Backfill] Skip PE for {order_sn}: net_amount={net_amount}")
+            return
+            
         try:
             from .webhook import create_payment_entry_from_shopee
             pe_name = create_payment_entry_from_shopee(
                 si_name=si_name,
-                escrow=esc,
-                net_amount=0,
+                escrow=esc_norm,  # Pass normalized data
+                net_amount=net_amount,  # Use calculated net_amount
                 order_sn=order_sn,
-                posting_ts=None,
+                posting_ts=payout_ts,  # Use proper timestamp
                 enqueue=False
             )
             if pe_name:
                 stats["PE"] += 1
+                frappe.logger().info(f"[Shopee Backfill] Created PE {pe_name} for {order_sn}, net={net_amount}")
         except Exception as e:
             stats["errors"] += 1
             frappe.log_error(f"Ensure payment {order_sn} fail: {e}", "Shopee Backfill Payment")
