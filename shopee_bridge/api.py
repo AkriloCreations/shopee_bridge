@@ -406,6 +406,42 @@ def _ensure_item_exists(sku: str, it: dict, rate: float) -> str:
         
         return fallback_sku
 
+def _get_or_create_expense_account(account_name: str) -> str:
+    """Pastikan akun Expense untuk deductions ada & valid."""
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    cur = frappe.db.get_value("Company", company, "default_currency") or "IDR"
+
+    acc_name = frappe.db.get_value("Account", {"company": company, "account_name": account_name}, "name")
+    if acc_name:
+        acc = frappe.get_doc("Account", acc_name)
+        changed = False
+        if acc.is_group: acc.is_group = 0; changed = True
+        if acc.root_type != "Expense": acc.root_type = "Expense"; changed = True
+        if acc.account_type != "Expense Account": acc.account_type = "Expense Account"; changed = True
+        if getattr(acc, "account_currency", None) and acc.account_currency != cur:
+            acc.account_currency = cur; changed = True
+        if acc.disabled: acc.disabled = 0; changed = True
+        if changed: acc.save(ignore_permissions=True)
+        return acc.name
+
+    parent = (
+        frappe.db.get_value("Account", {"company": company, "account_name": "Indirect Expenses", "is_group": 1}, "name")
+        or frappe.db.get_value("Account", {"company": company, "account_name": "Direct Expenses", "is_group": 1}, "name")
+        or frappe.db.get_value("Account", {"company": company, "root_type": "Expense", "is_group": 1}, "name")
+    )
+    acc = frappe.get_doc({
+        "doctype": "Account",
+        "company": company,
+        "account_name": account_name,
+        "parent_account": parent,
+        "is_group": 0,
+        "root_type": "Expense",
+        "account_type": "Expense Account",
+        "account_currency": cur,
+    })
+    acc.insert(ignore_permissions=True)
+    return acc.name
+
 def _get_item_group():
     """Get or create Shopee item group."""
     item_group_name = "Shopee Products"
@@ -830,13 +866,20 @@ def _process_order_to_si(order_sn: str):
                             cn_item.rate = item.rate
                             if item.warehouse:
                                 cn_item.warehouse = item.warehouse
-                        # Tambahkan Shopee charges sebagai tax/charge row jika ada
-                        shopee_charge = flt(esc_n.get("seller_penalty")) + flt(esc_n.get("commission_fee")) + flt(esc_n.get("service_fee"))
-                        if shopee_charge:
-                            tax_row = cn.append("taxes", {})
-                            tax_row.charge_type = "Actual"
-                            tax_row.account_head = "Selisih Biaya Shopee"
-                            tax_row.tax_amount = shopee_charge
+                        # Tambahkan Shopee charges sebagai tax/charge row untuk setiap fee
+                        extra_fees = [
+                            ("seller_penalty", "Biaya Penalti Shopee"),
+                            ("commission_fee", "Komisi Shopee"),
+                            ("service_fee", "Biaya Layanan Shopee"),
+                        ]
+                        for key, name in extra_fees:
+                            fee = flt(esc_n.get(key))
+                            if fee > 0:
+                                account = _get_or_create_expense_account(name)
+                                tax_row = cn.append("taxes", {})
+                                tax_row.charge_type = "Actual"
+                                tax_row.account_head = account
+                                tax_row.tax_amount = -abs(fee)  # Negative for CN
                         cn.insert(ignore_permissions=True)
                         cn.submit()
                         frappe.db.commit()
@@ -1249,7 +1292,7 @@ def _process_order_to_si(order_sn: str):
                         cn_item.rate = item.rate
                         if item.warehouse:
                             cn_item.warehouse = item.warehouse
-                    # Tambahkan extra fees sebagai item negatif jika ada
+                    # Tambahkan extra fees sebagai tax/charge row jika ada
                     extra_fees = [
                         ("shipping_seller_protection_fee_amount", "Proteksi Pengiriman Shopee"),
                         ("service_fee", "Biaya Layanan Shopee"),
@@ -1260,11 +1303,11 @@ def _process_order_to_si(order_sn: str):
                     for key, name in extra_fees:
                         fee = flt(esc_n.get(key))
                         if fee:
-                            fee_row = cn.append("items", {})
-                            fee_row.item_code = name
-                            fee_row.qty = 1
-                            fee_row.rate = -abs(fee)
-                            fee_row.amount = -abs(fee)
+                            account = _get_or_create_expense_account(name)
+                            tax_row = cn.append("taxes", {})
+                            tax_row.charge_type = "Actual"
+                            tax_row.account_head = account
+                            tax_row.tax_amount = -abs(fee)
                     # Uncheck 'Update Outstanding for Self' if field exists
                     if hasattr(cn, "update_outstanding_for_self"):
                         cn.update_outstanding_for_self = 0
@@ -1331,7 +1374,7 @@ def _process_order_to_si(order_sn: str):
                     cn_item.rate = item.rate
                     if item.warehouse:
                         cn_item.warehouse = item.warehouse
-                # Tambahkan extra fees sebagai item negatif jika ada
+                # Tambahkan extra fees sebagai tax/charge row jika ada
                 extra_fees = [
                     ("shipping_seller_protection_fee_amount", "Proteksi Pengiriman Shopee"),
                     ("service_fee", "Biaya Layanan Shopee"),
@@ -1342,11 +1385,11 @@ def _process_order_to_si(order_sn: str):
                 for key, name in extra_fees:
                     fee = flt(esc_n.get(key))
                     if fee:
-                        fee_row = cn.append("items", {})
-                        fee_row.item_code = name
-                        fee_row.qty = 1
-                        fee_row.rate = -abs(fee)
-                        fee_row.amount = -abs(fee)
+                        account = _get_or_create_expense_account(name)
+                        tax_row = cn.append("taxes", {})
+                        tax_row.charge_type = "Actual"
+                        tax_row.account_head = account
+                        tax_row.tax_amount = -abs(fee)
                 if hasattr(cn, "update_outstanding_for_self"):
                     cn.update_outstanding_for_self = 0
                 cn.insert(ignore_permissions=True)

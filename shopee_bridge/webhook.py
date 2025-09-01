@@ -936,8 +936,8 @@ def create_payment_entry_from_shopee(
                     total_deductions += use_v
                     remaining = flt(remaining - use_v, precision)
 
-            # Tambahkan diff row untuk sisa rounding saja
-            if remaining > (1 / (10 ** max(precision, 0))):
+            # Tambahkan diff row untuk sisa jika ada
+            if remaining > 0:
                 row = pe.append("deductions", {})
                 row.account = diff_account
                 row.amount = remaining
@@ -1061,64 +1061,85 @@ def _get_or_create_bank_account(account_name: str) -> str:
 
 
 def create_refund_journal_from_shopee(si_name: str, norm_payload: dict, order_sn: str) -> str | None:
-    """Create a Journal Entry to record refund/deduction when net <= 0 or payout negative.
+    """Create a Credit Note to record refund when net <= 0 or payout negative.
 
-    The JE will post:
-      - Debit: Komisi/Fees (expense) / or a single combined expense account
-      - Credit: Receivable/Bank or a dedicated 'Shopee Refund Clearing' account
+    The CN will post as return against the original SI, reducing its outstanding.
 
-    Returns: JE name or None
+    Returns: CN name or None
     """
     try:
         si = frappe.get_doc("Sales Invoice", si_name)
     except Exception:
         return None
 
-    company = si.company
-    default_cc = _get_default_cost_center_for_si(si)
-
-    # Accounts
-    expense_acc = _get_or_create_expense_account("Biaya Pembatalan Shopee")
-    clearing_acc = _get_or_create_bank_account("Shopee (Refund Clearing)")
-
     refund_amount = flt(norm_payload.get("refund_amount") or 0)
-    # if refund_amount is 0 but net <=0, compute delta
     net = flt(norm_payload.get("net_amount") or 0)
     escrow = flt(norm_payload.get("escrow_amount") or 0)
     amount = refund_amount if refund_amount > 0 else max(0.0, escrow - net)
     if amount <= 0:
-        # still create a minimal JE to track cancellation if there's any small fee
-        amount = abs(flt(net)) or 0.0
+        amount = abs(net) or 0.0
     if amount <= 0:
         return None
 
-    je = frappe.new_doc("Journal Entry")
-    je.company = company
-    je.posting_date = frappe.utils.nowdate()
-    je.voucher_type = "Journal Entry"
-    je.cheque_no = order_sn
-    je.cheque_date = frappe.utils.nowdate()
-
-    # Debit: Expense (fee)
-    dr = je.append("accounts", {})
-    dr.account = expense_acc
-    dr.debit_in_account_currency = flt(amount)
-    dr.cost_center = default_cc
-
-    # Credit: Clearing (liability/asset depending on your chart) — use bank account created
-    cr = je.append("accounts", {})
-    cr.account = clearing_acc
-    cr.credit_in_account_currency = flt(amount)
-    cr.cost_center = default_cc
+    # Check if CN already exists
+    cn_exists = frappe.db.exists("Sales Invoice", {"return_against": si_name, "is_return": 1})
+    if cn_exists:
+        return cn_exists
 
     try:
-        je.insert(ignore_permissions=True)
-        je.submit()
+        cn = frappe.new_doc("Sales Invoice")
+        cn.customer = si.customer
+        cn.posting_date = frappe.utils.nowdate()
+        cn.set_posting_time = 1
+        cn.company = si.company
+        cn.currency = si.currency
+        cn.update_stock = 0
+        cn.is_return = 1
+        cn.return_against = si_name
+        try:
+            cn.custom_shopee_refund_sn = order_sn
+        except Exception:
+            pass
+        base_po = f"{order_sn}-RET"
+        cn.po_no = base_po if not frappe.db.exists("Sales Invoice", {"po_no": base_po}) else f"{base_po}-{frappe.utils.random_string(4)}"
+
+        # Copy items from original SI with negative qty
+        for item in si.items:
+            cn_item = cn.append("items", {})
+            cn_item.item_code = item.item_code
+            cn_item.qty = -1 * flt(item.qty or 0)
+            cn_item.rate = item.rate
+            if item.warehouse:
+                cn_item.warehouse = item.warehouse
+
+        # Add Shopee fees as tax/charge rows if any
+        extra_fees = [
+            ("commission_fee", "Komisi Shopee"),
+            ("service_fee", "Biaya Layanan Shopee"),
+            ("shipping_seller_protection_fee_amount", "Proteksi Pengiriman Shopee"),
+            ("voucher_seller", "Voucher Seller Shopee"),
+            ("coin_cash_back", "Coin Cashback Shopee"),
+        ]
+        for key, name in extra_fees:
+            fee = flt(norm_payload.get(key))
+            if fee > 0:
+                account = _get_or_create_expense_account(name)
+                tax_row = cn.append("taxes", {})
+                tax_row.charge_type = "Actual"
+                tax_row.account_head = account
+                tax_row.tax_amount = -abs(fee)
+
+        # Ensure update_outstanding_for_self is unchecked
+        if hasattr(cn, "update_outstanding_for_self"):
+            cn.update_outstanding_for_self = 1
+
+        cn.insert(ignore_permissions=True)
+        cn.submit()
         frappe.db.commit()
-        frappe.logger().info(f"[Shopee] Created refund Journal Entry {je.name} for order {order_sn}")
-        return je.name
+        frappe.logger().info(f"[Shopee] Created Credit Note {cn.name} for refund {order_sn} against {si_name}")
+        return cn.name
     except Exception as e:
-        frappe.log_error(f"Failed to create refund JE for {order_sn}: {e}", "Shopee Refund JE")
+        frappe.log_error(f"Failed to create refund CN for {order_sn}: {e}", "Shopee Refund CN")
         return None
 
 # =============================================================================
