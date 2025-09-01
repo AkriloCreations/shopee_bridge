@@ -744,8 +744,99 @@ def _process_order_to_si(order_sn: str):
     # --- anti duplikat: cek SI yang punya po_no = order_sn
     existed_si = _get_si_by_po(order_sn)
     if existed_si:
-        frappe.logger().info(f"[Shopee] SI {existed_si} for {order_sn} already exists, skipping")
-        return {"ok": True, "status": "already_exists", "sales_invoice": existed_si}
+        # Jangan langsung return; tetap coba buat Payment Entry & Credit Note kalau belum ada.
+        frappe.logger().info(f"[Shopee] SI {existed_si} for {order_sn} already exists, attempting PE/CN remediation")
+
+        existing_si_doc = frappe.get_doc("Sales Invoice", existed_si)
+
+        # Ambil detail order & escrow agar bisa tentukan posting_date refund dan net/refund amount
+        det = _call(
+            "/api/v2/order/get_order_detail",
+            str(s.partner_id).strip(), s.partner_key,
+            s.shop_id, s.access_token,
+            {
+                "order_sn_list": order_sn,
+                "response_optional_fields": (
+                    "buyer_user_id,buyer_username,recipient_address,"
+                    "item_list,create_time,pay_time,ship_by_date,days_to_ship,order_status"
+                ),
+            },
+        )
+        posting_date_shopee = frappe.utils.today()
+        if not det.get("error"):
+            orders = (det.get("response") or {}).get("order_list") or []
+            if orders:
+                _dates_tmp = _extract_dates_from_order(orders[0], {})
+                posting_date_shopee = _dates_tmp.get("posting_date") or posting_date_shopee
+
+        esc_raw = _call(
+            "/api/v2/payment/get_escrow_detail",
+            str(s.partner_id).strip(), s.partner_key,
+            s.shop_id, s.access_token,
+            {"order_sn": order_sn}
+        )
+        if esc_raw.get("error"):
+            return {"ok": True, "status": "already_exists", "sales_invoice": existed_si, "note": f"Escrow error: {esc_raw.get('message')}"}
+
+        esc_n = _norm_esc(esc_raw)
+        net_amount = flt(esc_n.get("net_amount"))
+        refund_amount = flt(esc_n.get("refund_amount"))
+
+        # Credit Note (Return) jika ada refund dan belum ada CN
+        if refund_amount > 0:
+            cn_exists = frappe.db.exists(
+                "Sales Invoice",
+                {"is_return": 1, "return_against": existing_si_doc.name}
+            )
+            if not cn_exists:
+                try:
+                    cn = frappe.new_doc("Sales Invoice")
+                    cn.customer = existing_si_doc.customer
+                    cn.posting_date = posting_date_shopee
+                    cn.set_posting_time = 1
+                    cn.company = existing_si_doc.company
+                    cn.currency = existing_si_doc.currency
+                    cn.update_stock = existing_si_doc.update_stock
+                    cn.is_return = 1
+                    cn.return_against = existing_si_doc.name
+                    try:
+                        cn.custom_shopee_refund_sn = order_sn
+                    except Exception:
+                        pass
+                    base_po = f"{order_sn}-RET"
+                    cn.po_no = base_po if not frappe.db.exists("Sales Invoice", {"po_no": base_po}) else f"{base_po}-{frappe.utils.random_string(4)}"
+                    for item in existing_si_doc.items:
+                        cn_item = cn.append("items", {})
+                        cn_item.item_code = item.item_code
+                        cn_item.qty = -1 * flt(item.qty or 0)
+                        cn_item.rate = item.rate
+                        if item.warehouse:
+                            cn_item.warehouse = item.warehouse
+                    cn.insert(ignore_permissions=True)
+                    cn.submit()
+                    frappe.logger().info(f"[Shopee] (Remediate) Created Credit Note {cn.name} for {order_sn} against {existing_si_doc.name}")
+                except Exception as e:
+                    frappe.log_error(message=f"(Remediate) Failed CN for {order_sn}: {e}", title="Shopee CN Creation")
+
+        pe_created = None
+        if net_amount > 0:
+            pe_exists = frappe.db.exists(
+                "Payment Entry Reference",
+                {"reference_doctype": "Sales Invoice", "reference_name": existing_si_doc.name}
+            )
+            if not pe_exists:
+                pe_created = create_payment_entry_from_shopee(
+                    si_name=existing_si_doc.name,
+                    escrow=esc_n,
+                    net_amount=net_amount,
+                    order_sn=order_sn,
+                    posting_ts=_safe_int(esc_n.get("payout_time") or 0),
+                    enqueue=False
+                )
+        resp = {"ok": True, "status": "already_exists", "sales_invoice": existed_si}
+        if pe_created:
+            resp["payment_entry"] = pe_created
+        return resp
 
     # --- detail order dari Shopee
     det = _call(
