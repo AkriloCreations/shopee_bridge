@@ -848,13 +848,17 @@ def create_payment_entry_from_shopee(
         gross = flt(si.grand_total)
         expected_total_fees_raw = max(0, gross - net)
 
-        # Breakdown fees dari payload (raw, belum dibulatkan)
+        # Breakdown fees dari payload (raw, belum dibulatkan) - semua komponen utama Shopee
         fees_raw = {
             "commission": flt(norm.get("commission_fee")),
             "service": flt(norm.get("service_fee")),
             "protection": flt(norm.get("shipping_seller_protection_fee_amount")),
             "shipdiff": flt(norm.get("shipping_fee_difference")),
-            "voucher": flt(norm.get("voucher_seller")) + flt(norm.get("coin_cash_back")) + flt(norm.get("voucher_code_seller")),
+            "voucher_seller": flt(norm.get("voucher_seller")),
+            "voucher_shopee": flt(norm.get("voucher_from_shopee")),
+            "coin_cash_back": flt(norm.get("coin_cash_back")),
+            "credit_card": flt(norm.get("credit_card_transaction_fee")),
+            "voucher_code_seller": flt(norm.get("voucher_code_seller")),
         }
         payload_total_fees_raw = sum(v for v in fees_raw.values() if v > 0)
         diff_fee_raw = expected_total_fees_raw - payload_total_fees_raw  # bisa +/- karena rounding/kelengkapan payload
@@ -864,7 +868,11 @@ def create_payment_entry_from_shopee(
             "service": _get_or_create_expense_account("Biaya Layanan Shopee"),
             "protection": _get_or_create_expense_account("Proteksi Pengiriman Shopee"),
             "shipdiff": _get_or_create_expense_account("Selisih Ongkir Shopee"),
-            "voucher": _get_or_create_expense_account("Voucher Shopee"),
+            "voucher_seller": _get_or_create_expense_account("Voucher Seller Shopee"),
+            "voucher_shopee": _get_or_create_expense_account("Voucher Shopee"),
+            "coin_cash_back": _get_or_create_expense_account("Coin Cashback Shopee"),
+            "credit_card": _get_or_create_expense_account("Biaya Kartu Kredit Shopee"),
+            "voucher_code_seller": _get_or_create_expense_account("Voucher Kode Seller Shopee"),
         }
         diff_account = _get_or_create_expense_account("Selisih Biaya Shopee")
 
@@ -910,8 +918,11 @@ def create_payment_entry_from_shopee(
             # Invoice sudah net / tidak perlu deductions (kemungkinan invoice net mode)
             allocated = pe.paid_amount
         else:
-            # Urutan prioritas: commission, service, protection, shipdiff, voucher
-            ordered_keys = ["commission", "service", "protection", "shipdiff", "voucher"]
+            # Urutan prioritas: semua komponen fee Shopee
+            ordered_keys = [
+                "commission", "service", "protection", "shipdiff",
+                "voucher_seller", "voucher_shopee", "coin_cash_back", "credit_card", "voucher_code_seller"
+            ]
             for k in ordered_keys:
                 raw_v = flt(fees_raw.get(k), precision)
                 if raw_v <= 0 or remaining <= 0:
