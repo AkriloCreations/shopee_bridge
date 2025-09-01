@@ -225,7 +225,7 @@ def shopee_webhook():
             Log Entry: {log_doc.name}
         """)
         
-        # Parse webhook data (best effort)
+    # Parse webhook data (best effort)
         webhook_data = None
         if raw_body:
             try:
@@ -291,6 +291,20 @@ def shopee_webhook():
                 # Extract essential info first
                 info = _extract_push_info(webhook_data)
                 frappe.logger().debug(f"[Shopee Webhook] Extracted info: {json.dumps(info, indent=2)}")
+                # Update provisional log with identifiers
+                try:
+                    if 'log_doc' in locals():
+                        log_doc.order_sn = info.get('order_sn') or ''
+                        log_doc.shop_id = str(info.get('shop_id') or '')
+                        log_doc.event_type = info.get('status') or info.get('completed_scenario') or ''
+                        mapped = _map_status_for_select(info.get('status'))
+                        if mapped:
+                            log_doc.status = mapped
+                        log_doc.response_status = 'Success'
+                        log_doc.save(ignore_permissions=True)
+                        frappe.db.commit()
+                except Exception as upd_err:
+                    frappe.logger().warning(f"[Shopee Webhook] Failed to update provisional log: {upd_err}")
                 
                 # Return 200 OK even if processing fails
                 result = {
@@ -324,7 +338,11 @@ def shopee_webhook():
 
         # Log activity
         processing_time = (time.time() - start_time) * 1000
-        log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
+        # Update existing log instead of duplicating
+        if 'log_doc' in locals():
+            log_webhook_activity(webhook_data, headers, raw_body, result, processing_time, existing_docname=log_doc.name)
+        else:
+            log_webhook_activity(webhook_data, headers, raw_body, result, processing_time)
         return result
 
     except Exception as e:
@@ -358,10 +376,16 @@ def shopee_webhook():
             "timestamp": frappe.utils.now()
         }
         
-        log_webhook_activity(webhook_data if 'webhook_data' in locals() else None,
-                           headers if 'headers' in locals() else {},
-                           raw_body if 'raw_body' in locals() else b"",
-                           result, processing_time)
+        if 'log_doc' in locals():
+            log_webhook_activity(webhook_data if 'webhook_data' in locals() else None,
+                                 headers if 'headers' in locals() else {},
+                                 raw_body if 'raw_body' in locals() else b"",
+                                 result, processing_time, existing_docname=log_doc.name)
+        else:
+            log_webhook_activity(webhook_data if 'webhook_data' in locals() else None,
+                                 headers if 'headers' in locals() else {},
+                                 raw_body if 'raw_body' in locals() else b"",
+                                 result, processing_time)
                            
         frappe.log_error(traceback, "Shopee Webhook Critical Error")
         return result
@@ -1075,7 +1099,27 @@ def health_check():
         "url": f"{frappe.utils.get_url()}/api/method/shopee_bridge.webhook.health_check"
     }
 
-def log_webhook_activity(webhook_data, headers, raw_body, result, processing_time, source="Shopee Live"):
+def _map_status_for_select(raw_status: str | None) -> str | None:
+    """Map raw Shopee status to allowed Select options in DocType.
+    Allowed: PROCESSED, READY_TO_SHIP, SHIPPED, CANCELLED
+    Fallback: None (leave blank) if not mappable."""
+    if not raw_status:
+        return None
+    s = str(raw_status).upper()
+    mapping = {
+        'UNPAID': 'PROCESSED',  # treat UNPAID as received/processed
+        'TO_SHIP': 'READY_TO_SHIP',
+        'READY_TO_SHIP': 'READY_TO_SHIP',
+        'PROCESSED': 'PROCESSED',
+        'COMPLETED': 'PROCESSED',
+        'SHIPPED': 'SHIPPED',
+        'CANCELLED': 'CANCELLED',
+        'CANCELED': 'CANCELLED'
+    }
+    return mapping.get(s)
+
+
+def log_webhook_activity(webhook_data, headers, raw_body, result, processing_time, source="Shopee Live", existing_docname: str | None = None):
     """Log webhook activity to database"""
     try:
         order_data = webhook_data.get('data', {}) if webhook_data else {}
@@ -1083,12 +1127,37 @@ def log_webhook_activity(webhook_data, headers, raw_body, result, processing_tim
         if webhook_data:
             # event-based atau push (pakai status)
             event_type = (webhook_data.get('event') or "") or (order_data.get('status') or "")
+        if existing_docname:
+            try:
+                log_doc = frappe.get_doc("Shopee Webhook Log", existing_docname)
+                log_doc.order_sn = (order_data.get('ordersn') or (webhook_data.get('order_sn') if webhook_data else "") or log_doc.get('order_sn')) if webhook_data else log_doc.get('order_sn')
+                log_doc.shop_id = str(webhook_data.get('shop_id', '')) if webhook_data else log_doc.get('shop_id')
+                mapped_status = _map_status_for_select(order_data.get('status'))
+                if mapped_status:
+                    log_doc.status = mapped_status
+                log_doc.event_type = event_type or log_doc.get('event_type')
+                # Replace raw_data only if we have parsed data (preserve original otherwise)
+                if webhook_data:
+                    log_doc.raw_data = json.dumps(webhook_data, indent=2)
+                log_doc.headers = json.dumps(headers, indent=2)
+                log_doc.response_status = "Success" if result.get('success') else ("Error" if result.get('error') else "Failed")
+                log_doc.error_message = result.get('error', '') if not result.get('success') else ''
+                log_doc.processing_time = processing_time
+                log_doc.source = source
+                log_doc.save(ignore_permissions=True)
+                frappe.db.commit()
+                frappe.logger().info(f"[Shopee Webhook] Log updated order={log_doc.order_sn or '-'} event={log_doc.event_type or '-'}")
+                return
+            except Exception as upd_err:
+                frappe.logger().warning(f"[Shopee Webhook] Could not update existing log {existing_docname}: {upd_err}; creating new entry")
+
+        # Create new log if no existing docname provided or update failed
         doc_values = {
             "doctype": "Shopee Webhook Log",
             "timestamp": frappe.utils.now(),
             "order_sn": (order_data.get('ordersn') or (webhook_data.get('order_sn') if webhook_data else "")) or "",
             "shop_id": str(webhook_data.get('shop_id', '')) if webhook_data else '',
-            "status": order_data.get('status', ''),
+            "status": _map_status_for_select(order_data.get('status')) or '',
             "event_type": event_type,
             "raw_data": json.dumps(webhook_data, indent=2) if webhook_data else (raw_body.decode(errors="replace") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body)),
             "headers": json.dumps(headers, indent=2),
@@ -1098,13 +1167,11 @@ def log_webhook_activity(webhook_data, headers, raw_body, result, processing_tim
             "source": source,
             "ip_address": frappe.request.environ.get('REMOTE_ADDR', 'Unknown')
         }
-
-        log_doc = frappe.get_doc(doc_values)
-        log_doc.insert(ignore_permissions=True)
+        new_log = frappe.get_doc(doc_values)
+        new_log.insert(ignore_permissions=True)
         frappe.db.commit()
-
         frappe.logger().info(
-            f"[Shopee Webhook] Log saved order={log_doc.order_sn or '-'} event={log_doc.event_type or '-'} time={processing_time:.1f}ms status={log_doc.response_status}"
+            f"[Shopee Webhook] Log saved order={new_log.order_sn or '-'} event={new_log.event_type or '-'} time={processing_time:.1f}ms status={new_log.response_status}"
         )
 
     except Exception as e:
