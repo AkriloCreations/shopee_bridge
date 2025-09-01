@@ -439,8 +439,12 @@ def _get_or_create_expense_account(account_name: str) -> str:
         "account_type": "Expense Account",
         "account_currency": cur,
     })
-    acc.insert(ignore_permissions=True)
-    return acc.name
+    try:
+        acc.insert(ignore_permissions=True)
+        return acc.name
+    except Exception as e:
+        frappe.logger().error(f"Failed to insert expense account {account_name}: {e}")
+        return None
 
 def _get_item_group():
     """Get or create Shopee item group."""
