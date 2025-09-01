@@ -119,15 +119,12 @@ def _call(path: str, partner_id: str, partner_key: str,
     use_get = path.startswith("/api/v2/") and ("/get_" in path or path.endswith("/get"))
     try:
         if use_get:
-            # gabungkan params ke querystring
             qp = dict(q)
             if params:
-                # Konversi semua value ke str untuk aman di querystring
                 for k, v in params.items():
                     qp[k] = str(v)
             r = requests.get(url, params=qp, timeout=timeout)
         else:
-            # default: POST body JSON
             r = requests.post(
                 url,
                 params=q,
@@ -141,7 +138,6 @@ def _call(path: str, partner_id: str, partner_key: str,
         else:
             data = {"error": "HTTP", "message": r.text}
 
-        # Pastikan selalu dict
         if isinstance(data, list):
             data = {"response": {"_list_payload": data}}
 
@@ -651,7 +647,7 @@ def _process_order_to_so(order_sn: str):
             "order_sn_list": order_sn,
             "response_optional_fields": (
                 "buyer_user_id,buyer_username,recipient_address,"
-                "item_list,create_time,ship_by_date,days_to_ship,order_status"
+                "item_list,create_time,pay_time,ship_by_date,days_to_ship,order_status"
             ),
         },
     )
@@ -670,8 +666,10 @@ def _process_order_to_so(order_sn: str):
     # Customer
     customer = _create_or_get_customer(od, order_sn)
 
-    # Dates
-    transaction_date, delivery_date = _extract_dates_from_order(od)
+    # Dates (unified helper)
+    _dates = _extract_dates_from_order(od)
+    transaction_date = _dates.get("transaction_date")
+    delivery_date = _dates.get("delivery_date")
 
     # Build SO
     so = frappe.new_doc("Sales Order")
@@ -756,9 +754,10 @@ def _process_order_to_si(order_sn: str):
         s.shop_id, s.access_token,
         {
             "order_sn_list": order_sn,
+            # Tambah pay_time agar bisa pakai tanggal pembayaran sebagai fallback posting_date
             "response_optional_fields": (
                 "buyer_user_id,buyer_username,recipient_address,"
-                "item_list,create_time,ship_by_date,days_to_ship,order_status"
+                "item_list,create_time,pay_time,ship_by_date,days_to_ship,order_status"
             ),
         },
     )
@@ -784,10 +783,24 @@ def _process_order_to_si(order_sn: str):
     # --- customer
     customer = _create_or_get_customer(od, order_sn)
 
-    # --- build SI
+    # --- Ambil escrow lebih awal supaya dapat payout_time utk posting_date
+    esc_raw = _call(
+        "/api/v2/payment/get_escrow_detail",
+        str(s.partner_id).strip(), s.partner_key,
+        s.shop_id, s.access_token,
+        {"order_sn": order_sn}
+    )
+    esc_resp = (esc_raw.get("response") or {}) if not esc_raw.get("error") else {}
+    oi = esc_resp.get("order_income") or {}
+    # Unified date extraction (will derive posting_date from payout > pay > create)
+    _dates = _extract_dates_from_order(od, esc_resp)
+    posting_date_shopee = _dates.get("posting_date")
+    payout_ts = _safe_int((esc_resp.get("payout_time") or oi.get("payout_time")))
+
+    # --- build SI dengan posting_date dari Shopee
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
-    si.posting_date = nowdate()
+    si.posting_date = posting_date_shopee
     si.set_posting_time = 1
     si.update_stock = update_stock
     si.currency = "IDR"
@@ -852,12 +865,7 @@ def _process_order_to_si(order_sn: str):
             return {"ok": False, "error": str(e)}
 
     # === Escrow → Payment Entry ===
-    esc_raw = _call(
-        "/api/v2/payment/get_escrow_detail",
-        str(s.partner_id).strip(), s.partner_key,
-        s.shop_id, s.access_token,
-        {"order_sn": order_sn}
-    )
+    # Jika escrow call awal error, esc_raw akan punya error dan kita skip PE
     if esc_raw.get("error"):
         frappe.logger().warning(f"[Shopee] escrow_detail fail {order_sn}: {esc_raw.get('message')}")
         return {"ok": True, "sales_invoice": si.name, "note": "No payment entry created"}
@@ -882,7 +890,7 @@ def _process_order_to_si(order_sn: str):
                 try:
                     cn = frappe.new_doc("Sales Invoice")
                     cn.customer = existing_si.customer
-                    cn.posting_date = nowdate()
+                    cn.posting_date = posting_date_shopee  # gunakan tanggal Shopee agar konsisten rekonsiliasi
                     cn.set_posting_time = 1
                     cn.company = existing_si.company
                     cn.currency = existing_si.currency
@@ -908,12 +916,13 @@ def _process_order_to_si(order_sn: str):
                         cn.po_no = f"{base_po}-{frappe.utils.random_string(4)}"
 
                     # Copy items dari SI.
-                    # Catatan: untuk is_return=1, ERPNext akan menghitung tanda/valuasi sendiri.
+                    # Catatan: ERPNext (v13+ hingga v15) mengharuskan qty NEGATIF untuk Sales Invoice Return.
+                    # Error yang muncul sebelumnya: "quantity must be negative number" ketika qty positif.
+                    # Karena itu setiap item.qty kita balikkan menjadi negatif agar valid dan nilai CN menjadi negatif.
                     for item in existing_si.items:
                         cn_item = cn.append("items", {})
                         cn_item.item_code = item.item_code
-                        # Pola aman: qty positif; ERPNext handle sebagai retur.
-                        cn_item.qty = item.qty
+                        cn_item.qty = -1 * flt(item.qty or 0)
                         cn_item.rate = item.rate
                         if item.warehouse:
                             cn_item.warehouse = item.warehouse
@@ -941,7 +950,7 @@ def _process_order_to_si(order_sn: str):
                     escrow=esc_n,
                     net_amount=net_amount,
                     order_sn=order_sn,
-                    posting_ts=_safe_int(esc_n.get("payout_time") or 0),
+                    posting_ts=_safe_int(esc_n.get("payout_time") or payout_ts or 0),
                     enqueue=False
                 )
                 return {"ok": True, "status": "already_exists", "sales_invoice": existing_si.name, "payment_entry": pe_name}
@@ -960,7 +969,7 @@ def _process_order_to_si(order_sn: str):
                 escrow=esc_n,
                 net_amount=net_amount,
                 order_sn=order_sn,
-                posting_ts=_safe_int(esc_n.get("payout_time") or 0),
+                posting_ts=_safe_int(esc_n.get("payout_time") or payout_ts or 0),
                 enqueue=False
             )
             return {"ok": True, "sales_invoice": si.name, "payment_entry": pe_name}
@@ -1335,40 +1344,62 @@ def _create_or_get_customer(order_detail: dict, order_sn: str | None = None):
     return customer_name
 
     
-def _extract_dates_from_order(order_detail):
-    """Extract and convert dates from Shopee order."""
-    from datetime import datetime, timezone
-    
-    # Get timestamps
-    create_time = int(order_detail.get("create_time") or 0)
-    ship_by_date = int(order_detail.get("ship_by_date") or 0)
-    days_to_ship = int(order_detail.get("days_to_ship") or 0)
-    
-    # Convert create_time to date
+def _extract_dates_from_order(order_detail: dict, escrow_detail: dict | None = None) -> dict:
+    """Unified date derivation for Shopee orders.
+
+    Returns dict with keys:
+      - transaction_date: payment date if available else create date else today
+      - delivery_date: ship_by_date else create+days_to_ship else transaction_date
+      - posting_date: payout_time (escrow) else pay_time else create_time else today
+      - raw: original numeric timestamps for trace/debug
+    """
     try:
-        if create_time:
-            transaction_date = datetime.fromtimestamp(create_time, tz=timezone.utc).date().isoformat()
+        create_ts = _safe_int(order_detail.get("create_time"))
+        pay_ts = _safe_int(order_detail.get("pay_time"))
+        ship_by_ts = _safe_int(order_detail.get("ship_by_date"))
+        days_to_ship = _safe_int(order_detail.get("days_to_ship"))
+
+        payout_ts = 0
+        if escrow_detail:
+            payout_ts = _safe_int(
+                escrow_detail.get("payout_time")
+                or (escrow_detail.get("order_income") or {}).get("payout_time")
+            )
+
+        transaction_date = _date_from_epoch(pay_ts or create_ts or 0)
+
+        if ship_by_ts:
+            delivery_date = _date_from_epoch(ship_by_ts)
+        elif create_ts and days_to_ship:
+            try:
+                delivery_date = (datetime.utcfromtimestamp(create_ts).date() + timedelta(days=days_to_ship)).isoformat()
+            except Exception:
+                delivery_date = transaction_date
         else:
-            transaction_date = nowdate()
-    except:
-        transaction_date = nowdate()
-    
-    # Calculate delivery date
-    try:
-        if ship_by_date:
-            delivery_date = datetime.fromtimestamp(ship_by_date, tz=timezone.utc).date().isoformat()
-        elif create_time and days_to_ship:
-            delivery_ts = create_time + (days_to_ship * 86400)  # days_to_ship * seconds_per_day
-            delivery_date = datetime.fromtimestamp(delivery_ts, tz=timezone.utc).date().isoformat()
-        else:
-            # Fallback: 3 days from transaction date
-            from frappe.utils import add_days  # pyright: ignore[reportMissingImports]
-            delivery_date = add_days(transaction_date, 3)
-    except:
-        from frappe.utils import add_days  # pyright: ignore[reportMissingImports]
-        delivery_date = add_days(transaction_date, 3)
-    
-    return transaction_date, delivery_date
+            delivery_date = transaction_date
+
+        posting_date = _date_from_epoch(payout_ts or pay_ts or create_ts or 0)
+
+        return {
+            "transaction_date": transaction_date,
+            "delivery_date": delivery_date,
+            "posting_date": posting_date,
+            "raw": {
+                "create_time": create_ts,
+                "pay_time": pay_ts,
+                "ship_by_date": ship_by_ts,
+                "days_to_ship": days_to_ship,
+                "payout_time": payout_ts,
+            },
+        }
+    except Exception:
+        today = nowdate()
+        return {
+            "transaction_date": today,
+            "delivery_date": today,
+            "posting_date": today,
+            "raw": {},
+        }
 
 def _get_or_create_mode_of_payment(name: str) -> str:
     company = frappe.db.get_single_value("Global Defaults", "default_company")
@@ -2130,173 +2161,133 @@ def webhook_handler():
 
 @frappe.whitelist()
 def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_status: str | None = None):
-    """Sync orders by absolute UNIX seconds window.
-    
-    Args:
-        time_from: Start time in UNIX secondsare
-        time_to: End time in UNIX secondsa
-        page_size: Items per page (default 50)
-        order_status: Filter bsy specific status, or None/"ALL" for all statuses
-        
-    Maximum range: 15 days (1296000 seconds)
-    Uses same deduplication logic as sync_recent_orders
+    """Sync orders in a time window and route each to SO or SI processing.
+
+    Logic:
+      READY_TO_SHIP  -> _process_order_to_so (if SO flow enabled or not; still create SO)
+      COMPLETED      -> _process_order_to_si
+      CANCELLED/*IN_CANCEL*/RETURNED -> cancel_order (if available)
+
+    If order_status provided, only that status processed. Otherwise the default status set.
+    Fallback: if no orders found by update_time, retry with create_time.
     """
     s = _settings()
-    if not s.access_token:
+    if not getattr(s, "access_token", None):
         frappe.throw("Access token required. Please authenticate with Shopee first.")
-        
-    if not time_from or not time_to or time_from > time_to:
-        frappe.throw("Invdasdasddalid time range")
-        
-    # Enforce 15-day maximum range
-    MAX_DAYS = 15
-    MAX_SECONDS = MAX_DAYS * 24 * 3600
-    if (time_to - time_from) > MAX_SECONDS:
-        frappe.throw(f"Time range cannot exceed {MAX_DAYS} days")
+
+    if not time_from or not time_to or int(time_from) > int(time_to):
+        frappe.throw("Invalid time range")
+
+    MAX_SECONDS = 15 * 24 * 3600
+    if (int(time_to) - int(time_from)) > MAX_SECONDS:
+        frappe.throw("Time range cannot exceed 15 days")
 
     try:
         refresh_if_needed()
     except Exception:
         pass
 
-    use_so_flow = cint(getattr(s, "use_sales_order_flow", 0) or 0)
-
-    # Jika order_status None/"ALL"/"" -> ambil semua status (tanpa filter)
-    if not order_status or str(order_status).strip().upper() == "ALL":
-        statuses = [None]
-    else:
+    # Build status list
+    if order_status and str(order_status).strip().upper() not in ("ALL", "*"):
         statuses = [str(order_status).strip().upper()]
+    else:
+        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED", "IN_CANCEL"]
 
+    processed = 0
+    errors = 0
     highest = int(s.last_success_update_time or 0)
-    processed = errors = 0
-    seen = set()
+    seen: set[str] = set()
 
-    # Always use same status list as sync_recent_orders for consistency
-    statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED"]
-
-    # Initialize helpers for payment and field filling
-    def _ensure_po_no_filled(doc, order_sn: str):
-        """Ensure po_no and custom_shopee_order_sn are filled to prevent duplicates"""
-        if not doc.po_no or not doc.custom_shopee_order_sn:
+    def ensure_po(doc, order_sn: str):
+        if not getattr(doc, "po_no", None):
             doc.po_no = order_sn
+        if hasattr(doc, "custom_shopee_order_sn") and not getattr(doc, "custom_shopee_order_sn", None):
             doc.custom_shopee_order_sn = order_sn
-            doc.save(ignore_permissions=True)
+        doc.save(ignore_permissions=True)
 
-    def _ensure_payment(order_sn: str):
-        si_name = frappe.db.get_value("Sales Invoice", {"custom_shopee_order_sn": order_sn}, "name")
-        if not si_name:
-            return
-        # Check if PE exists
-        pe_exists = frappe.db.exists(
-            "Payment Entry Reference",
-            {"reference_doctype": "Sales Invoice", "reference_name": si_name}
-        )
-        if pe_exists:
-            return
+    # Payment Entry akan otomatis dibuat di _process_order_to_si bila net_amount > 0
 
-        # Get escrow & create PE
-        esc = _call(
-            "/api/v2/payment/get_escrow_detail",
-            str(s.partner_id).strip(), s.partner_key,
-            s.shop_id, s.access_token,
-            {"order_sn": order_sn}
-        )
-        if esc.get("error"):
-            frappe.logger().warning(f"[Shopee Sync] escrow_detail fail {order_sn}: {esc.get('message')}")
-            return
-
-        try:
-            pe_name = create_payment_entry_from_shopee(
-                si_name=si_name,
-                escrow=esc,
-                net_amount=0,
-                order_sn=order_sn,
-                posting_ts=None,
-                enqueue=False
-            )
-            if pe_name:
-                processed += 1
-        except Exception as e:
-            errors += 1
-            frappe.log_error(f"Ensure payment {order_sn} fail: {e}", "Shopee Sync Payment", _short=True)
-
-    for st in statuses:
-        offset = 0
-        while True:
-            params = {
-                "time_range_field": "update_time",
-                "time_from": int(time_from),
-                "time_to": int(time_to),
-                "page_size": int(page_size),
-                "offset": offset,
-            }
-            if st:
-                params["order_status"] = st
-
-            resp = _call(
-                "/api/v2/order/get_order_list",
-                str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
-                params,
-            )
-            if resp.get("error"):
-                errors += 1
-                frappe.log_error(f"sync_orders_range[{st or 'ALL'}] {resp.get('error')}: {resp.get('message')}",
-                                 "Shopee Sync")
-                break
-
-            data   = resp.get("response") or {}
-            orders = data.get("order_list") or []
-            if not orders:
-                break
-
-            for o in orders:
-                order_sn = o.get("order_sn")
-                if not order_sn or order_sn in seen:
-                    continue
-                seen.add(order_sn)
-
-                # Skip bila SO-flow namun status tidak memenuhi kriteria SO (mis. COMPLETED)
-                if use_so_flow:
-                    st_now = (o.get("order_status") or "").upper()
-                    if not _should_make_so(st_now):
-                        continue
-
-                # Use exact same order processing logic as sync_recent_orders
-                try:
-                    if st == "READY_TO_SHIP":
-                        res = _process_order_to_so(order_sn) or {}
-                        if res.get("sales_order"):
-                            _ensure_po_no_filled(frappe.get_doc("Sales Order", res["sales_order"]), order_sn)
-                        if res.get("status") in ("created", "already_exists", "ok"):
-                            processed += 1
-
-                    elif st == "COMPLETED":
-                        res = _process_order_to_si(order_sn) or {}
-                        if res.get("sales_invoice"):
-                            _ensure_po_no_filled(frappe.get_doc("Sales Invoice", res["sales_invoice"]), order_sn)
-                            # Also ensure PE is created
-                            _ensure_payment(order_sn)
-                        if res.get("ok") or res.get("status") in ("created", "already_exists"):
-                            processed += 1
-
-                    elif st in ("CANCELLED", "IN_CANCEL"):
-                        res = cancel_order(order_sn) or {}
-                        if res.get("ok"):
-                            processed += 1
-                            
-                except Exception as e:
+    def fetch_and_process(range_field: str) -> int:
+        nonlocal processed, errors, highest
+        any_found = 0
+        for st in statuses:
+            offset = 0
+            while True:
+                params = {
+                    "time_range_field": range_field,
+                    "time_from": int(time_from),
+                    "time_to": int(time_to),
+                    "page_size": int(page_size),
+                    "offset": offset,
+                }
+                if st:
+                    params["order_status"] = st
+                resp = _call(
+                    "/api/v2/order/get_order_list",
+                    str(s.partner_id).strip(), s.partner_key, s.shop_id, s.access_token,
+                    params,
+                )
+                if resp.get("error"):
                     errors += 1
-                    frappe.log_error(f"Process {order_sn} [{st}] fail: {e}", "Shopee Sync Range", _short=True)
-                    continue
+                    frappe.log_error(
+                        f"sync_orders_range[{range_field}:{st}] {resp.get('error')}: {resp.get('message')}",
+                        "Shopee Sync"
+                    )
+                    break
+                data = resp.get("response") or {}
+                orders = data.get("order_list") or []
+                if not orders:
+                    break
+                any_found = 1
+                for o in orders:
+                    order_sn = o.get("order_sn")
+                    if not order_sn or order_sn in seen:
+                        continue
+                    seen.add(order_sn)
+                    st_now = (o.get("order_status") or "").upper()
+                    try:
+                        if st_now == "READY_TO_SHIP":
+                            res = _process_order_to_so(order_sn) or {}
+                            so_name = res.get("sales_order")
+                            if so_name:
+                                ensure_po(frappe.get_doc("Sales Order", so_name), order_sn)
+                            if res.get("status") in ("created", "already_exists", "ok"):
+                                processed += 1
+                        elif st_now == "COMPLETED":
+                            res = _process_order_to_si(order_sn) or {}
+                            si_name = res.get("sales_invoice")
+                            if si_name:
+                                ensure_po(frappe.get_doc("Sales Invoice", si_name), order_sn)
+                            if res.get("ok") or res.get("status") in ("created", "already_exists"):
+                                processed += 1
+                        elif st_now in ("CANCELLED", "IN_CANCEL", "RETURNED"):
+                            res = cancel_order(order_sn) or {}
+                            if res.get("ok"):
+                                processed += 1
+                    except Exception as e:
+                        errors += 1
+                        frappe.log_error(
+                            f"Process {order_sn} [{st_now}] fail: {e}",
+                            "Shopee Sync Range",
+                            _short=True,
+                        )
+                        continue
+                    ut = int(o.get("update_time") or o.get("create_time") or 0)
+                    if ut > highest:
+                        highest = ut
+                if not data.get("has_next_page"):
+                    break
+                offset = data.get("next_offset", offset + page_size)
+        return any_found
 
-                ut = int(o.get("update_time") or 0)
-                if ut > highest:
-                    highest = ut
+    # First try by update_time
+    found = fetch_and_process("update_time")
+    # Fallback to create_time if nothing
+    if not found:
+        fetch_and_process("create_time")
 
-            if not data.get("has_next_page"):
-                break
-            offset = data.get("next_offset", offset + page_size)
-
+    if processed == 0:
+        frappe.logger().info(f"[Shopee Sync] No orders processed in range {time_from}->{time_to} statuses={statuses}")
     if highest > int(s.last_success_update_time or 0):
         s.last_success_update_time = highest
         s.save(ignore_permissions=True)
@@ -2305,10 +2296,11 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
     return {
         "from": int(time_from),
         "to": int(time_to),
-        "max_update_time": highest,
         "processed_orders": processed,
         "errors": errors,
         "success": errors == 0,
+        "last_update_time": highest,
+        "statuses": statuses,
     }
 
 def _find_existing_so_by_order_sn(order_sn: str) -> str | None:
@@ -2639,14 +2631,22 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
                                     cn.return_against = si_name
                                     cn.currency = si.currency
                                     cn.update_stock = 0  # No stock impact for refunds
-                                    cn.custom_shopee_order_sn = order_sn
-                                    cn.po_no = order_sn
+                                    # Jangan gunakan custom_shopee_order_sn lagi agar tidak bentrok unique/dedup
+                                    try:
+                                        cn.custom_shopee_refund_sn = order_sn
+                                    except Exception:
+                                        pass
+                                    base_po = f"{order_sn}-RET"
+                                    cn.po_no = base_po
+                                    if frappe.db.exists("Sales Invoice", {"po_no": base_po}):
+                                        cn.po_no = f"{base_po}-{frappe.utils.random_string(4)}"
                                     
                                     # Copy items from original SI
                                     for item in si.items:
                                         cn_item = cn.append("items", {})
                                         cn_item.item_code = item.item_code
-                                        cn_item.qty = -1 * item.qty  # Negative qty for return
+                                        # ERPNext expects negative qty on return invoices
+                                        cn_item.qty = -1 * flt(item.qty or 0)
                                         cn_item.rate = item.rate
                                         if item.warehouse:
                                             cn_item.warehouse = item.warehouse
@@ -3820,17 +3820,12 @@ def complete_order_to_si(order_sn: str):
         if si_name:
             return {"ok": True, "status": "already_invoiced", "sales_invoice": si_name}
 
-        # Create SI from SO with proper defaults
-        si = frappe.get_doc(so).make_sales_invoice()
-        si.custom_shopee_order_sn = order_sn
-        si.po_no = order_sn  # Ensure both fields are set
-        si.posting_date = nowdate()
-        si.set_posting_time = 1
-        si.update_stock = 0  # Prevent negative stock
-        si.insert(ignore_permissions=True)
-        si.submit()
-
-        # Ambil escrow detail
+        # --- Tentukan posting_date dari data Shopee untuk rekonsiliasi bank ---
+        # Urutan prioritas:
+        # 1. payout_time (tanggal dana cair / escrow release)
+        # 2. pay_time (tanggal buyer bayar)
+        # 3. create_time (tanggal order dibuat)
+        # 4. nowdate() fallback
         s = _settings()
         esc = _call(
             "/api/v2/payment/get_escrow_detail",
@@ -3840,10 +3835,41 @@ def complete_order_to_si(order_sn: str):
             s.access_token,
             {"order_sn": order_sn}
         )
-        escrow = (esc.get("response") or {}) if not esc.get("error") else {}
+        escrow_resp = (esc.get("response") or {}) if not esc.get("error") else {}
+        oi = escrow_resp.get("order_income") or {}
+        payout_ts = _safe_int(escrow_resp.get("payout_time") or oi.get("payout_time"))
+        pay_ts = _safe_int(escrow_resp.get("pay_time") or oi.get("pay_time"))
+        chosen_ts = payout_ts or pay_ts
+        order_ct_ts = 0
+        if not chosen_ts:
+            # Ambil create_time dari order detail jika perlu
+            odet = _call(
+                "/api/v2/order/get_order_detail",
+                str(s.partner_id).strip(), s.partner_key,
+                s.shop_id, s.access_token,
+                {"order_sn_list": order_sn, "response_optional_fields": "create_time"}
+            )
+            if not odet.get("error"):
+                lst = (odet.get("response") or {}).get("order_list") or []
+                if lst:
+                    order_ct_ts = _safe_int(lst[0].get("create_time"))
+        posting_date_shopee = _date_from_epoch(chosen_ts or order_ct_ts) if (chosen_ts or order_ct_ts) else nowdate()
 
-        # Get net amount from escrow response
-        net = flt(escrow.get("escrow_amount") or escrow.get("payout_amount") or 0)
+        # Create SI from SO with proper defaults (gunakan tanggal Shopee)
+        si = frappe.get_doc(so).make_sales_invoice()
+        si.custom_shopee_order_sn = order_sn
+        si.po_no = order_sn  # Ensure both fields are set
+        si.posting_date = posting_date_shopee
+        si.set_posting_time = 1
+        si.update_stock = 0  # Prevent negative stock movement on conversion
+        si.insert(ignore_permissions=True)
+        si.submit()
+
+        # Net amount dari escrow (pakai payout/escrow amount)
+        net = flt(
+            (escrow_resp.get("escrow_amount") or oi.get("escrow_amount") or 0)
+            or (escrow_resp.get("payout_amount") or oi.get("payout_amount") or 0)
+        )
         if net > 0:
             # Get proper accounts
             receivable_account = frappe.db.get_single_value("Accounts Settings", "default_receivable_account")
@@ -3856,14 +3882,14 @@ def complete_order_to_si(order_sn: str):
             pe.party_type = "Customer"
             pe.party = so.customer
             pe.company = so.company
-            pe.posting_date = nowdate()
+            pe.posting_date = posting_date_shopee
             pe.mode_of_payment = "Shopee"
             pe.paid_from = receivable_account
             pe.paid_to = _get_or_create_bank_account("Shopee (Escrow)")
             pe.paid_amount = net
             pe.received_amount = net
             pe.reference_no = order_sn
-            pe.reference_date = nowdate()
+            pe.reference_date = posting_date_shopee
             pe.remarks = f"Shopee Order {order_sn} Payment"
 
             ref = pe.append("references", {})
