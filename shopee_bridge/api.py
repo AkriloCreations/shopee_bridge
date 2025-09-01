@@ -797,6 +797,28 @@ def _process_order_to_si(order_sn: str):
     posting_date_shopee = _dates.get("posting_date")
     payout_ts = _safe_int((esc_resp.get("payout_time") or oi.get("payout_time")))
 
+    # === NORMALISASI TANGGAL POSTING (HARUS SAMA DENGAN TANGGAL MASUK SHOPEE) ===
+    # posting_date_shopee saat ini string 'YYYY-MM-DD'. Kita validasi & clamp jika future.
+    try:
+        today_str = nowdate()
+        if posting_date_shopee:
+            # Future date guard (kalau timezone mismatch)
+            if posting_date_shopee > today_str:
+                posting_date_shopee = today_str
+        else:
+            posting_date_shopee = today_str
+    except Exception:
+        posting_date_shopee = nowdate()
+
+    # Simpan epoch untuk PE reference jika payout_ts kosong (konversi dari posting_date_shopee)
+    if not payout_ts:
+        try:
+            # interpret posting_date_shopee as local date start-of-day UTC epoch
+            dt_tmp = datetime.strptime(posting_date_shopee, "%Y-%m-%d")
+            payout_ts = int(dt_tmp.replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            payout_ts = int(time.time())
+
     # --- build SI dengan posting_date dari Shopee
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
@@ -950,6 +972,7 @@ def _process_order_to_si(order_sn: str):
                     escrow=esc_n,
                     net_amount=net_amount,
                     order_sn=order_sn,
+                    # Pastikan posting_ts yang diberikan ke PE konsisten dengan SI posting_date
                     posting_ts=_safe_int(esc_n.get("payout_time") or payout_ts or 0),
                     enqueue=False
                 )
