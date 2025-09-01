@@ -179,7 +179,6 @@ if not s.partner_id or not s.partner_key:
 # 2. API URL formation
 base_url = _base()  # Check environment setting
 
-# 3. Signature verification
 payload = f"{partner_id}{path}{ts}{access_token or ''}{shop_id or ''}"
 sign = _sign(partner_key, payload)  # Compare with Shopee's error message
 
@@ -195,66 +194,46 @@ Debug flow:
 # 1. Check webhook reception
 @frappe.whitelist(allow_guest=True)
 def webhook_handler():
-    # Log incoming data
     # Verify signature
     # Extract order_sn
 
 # 2. Verify order processing
 def _process_order(order_sn):
-    # Check flow selection
     # Monitor API calls
-    # Track document creation
 
 # 3. Document creation issues
 def _create_or_get_customer(order_detail):
-    # Customer mapping logic
-    # Address creation
-
-def _ensure_item_exists(sku, it, rate):
     # Item resolution
     # Fallback creation
 ```
-
 ### 3. Migration Debugging
 
 Key points:
 ```python
 # 1. Migration mode check
-s.migration_mode = 1
 s.migration_cutoff_date = frappe.utils.today()
-
 # 2. Batch processing monitoring
 def migrate_completed_orders_execute():
-    # Track progress per batch
     # Log errors separately
     # Monitor performance
 
 # 3. Stock updates
-if cint(getattr(s, "migration_mode", 0)) == 1:
-    # No stock updates
 else:
     # Normal stock flow
 ```
-
-## Development Workflow
-
 1. Setup:
 ```bash
 cd $BENCH_DIR
-bench get-app shopee_bridge
 bench install-app shopee_bridge
 ```
 
-2. Code Quality:
 - Pre-commit hooks for formatting (ruff, eslint, prettier)
 - Run `pre-commit install` in the repo root
 
-3. Testing:
 - Unit tests in `tests/` directory
 - Test webhooks via `test_webhook()` function
 
 ## Common Integration Points
-
 1. ERPNext Doctypes:
 - Sales Order
 - Sales Invoice

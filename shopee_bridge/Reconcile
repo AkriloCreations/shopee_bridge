@@ -1,0 +1,78 @@
+def accurate_reference_only_reconciliation():
+    """100% accurate reconciliation - reference number must match exactly"""
+    
+    unreconciled = frappe.db.sql("""
+        SELECT name, deposit, withdrawal, reference_number
+        FROM `tabBank Transaction`
+        WHERE status = 'Unreconciled'
+          AND bank_account LIKE '%Shopee%'
+          AND reference_number IS NOT NULL
+          AND reference_number != ''
+          AND reference_number != '-'
+        LIMIT 50
+    """, as_dict=True)
+    
+    processed = 0
+    skipped_no_reference = 0
+    skipped_no_pe = 0
+    
+    for bt_data in unreconciled:
+        bt = frappe.get_doc("Bank Transaction", bt_data.name)
+        
+        # Get transaction details
+        net_amount = float(bt.deposit or bt.withdrawal or 0)
+        if net_amount <= 0:
+            continue
+            
+        payment_type = "Receive" if bt.deposit else "Pay"
+        reference = bt.reference_number.strip()
+        
+        # Only process if reference exists
+        if not reference or reference == "-":
+            skipped_no_reference += 1
+            continue
+        
+        # Find EXACT reference match
+        pe = frappe.db.get_value("Payment Entry", {
+            "docstatus": 1,
+            "reference_no": reference,
+            "payment_type": payment_type
+        }, ["name", "paid_amount"], as_dict=True)
+        
+        if not pe:
+            skipped_no_pe += 1
+            print(f"No PE found for reference: {reference}")
+            continue
+        
+        # Check if PE already linked to another BT
+        existing_link = frappe.db.get_value("Bank Transaction Payments", {
+            "payment_entry": pe.name
+        }, "parent")
+        
+        if existing_link:
+            print(f"PE {pe.name} already linked to BT {existing_link}")
+            continue
+        
+        # Reconcile with exact reference match
+        bt.append("payment_entries", {
+            "payment_document": "Payment Entry",
+            "payment_entry": pe.name,
+            "allocated_amount": net_amount
+        })
+        bt.status = "Reconciled"
+        bt.clearance_date = bt.date
+        bt.save()
+        processed += 1
+        print(f"✓ {bt.name} ({reference}) -> {pe.name} (PE: {pe.paid_amount}, BT: {net_amount})")
+    
+    frappe.db.commit()
+    
+    print(f"\nResults:")
+    print(f"Reconciled: {processed}")
+    print(f"Skipped (no reference): {skipped_no_reference}")
+    print(f"Skipped (no matching PE): {skipped_no_pe}")
+    
+    return processed
+
+# Run 100% accurate reconciliation
+result = accurate_reference_only_reconciliation()
