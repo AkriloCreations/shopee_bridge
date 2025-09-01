@@ -1478,7 +1478,3 @@ def dbg_verify_signature():
         },
         "compare": results,
     }
-
-def _andakocak():
-    pass
-    
