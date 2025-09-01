@@ -2164,7 +2164,7 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
     """Sync orders dalam rentang waktu; by update_time lalu fallback ke create_time.
     READY_TO_SHIP -> _process_order_to_so
     COMPLETED     -> _process_order_to_si
-    CANCELLED/IN_CANCEL/TO_RETURN -> cancel_order
+    CANCELLED/IN_CANCEL -> cancel_order
     """
     s = _settings()
     if not getattr(s, "access_token", None):
@@ -2189,8 +2189,7 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
     if st_in and st_in not in ("ALL", "*"):
         statuses = [st_in]
     else:
-        # catatan: RETURNED di Shopee umum dipakai sebagai TO_RETURN/RETURNED/TO_RETURN, kita tangani di handler
-        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED", "IN_CANCEL", "TO_RETURN"]
+        statuses = ["READY_TO_SHIP", "COMPLETED", "CANCELLED", "IN_CANCEL"]
 
     processed = 0
     errors = 0
@@ -2212,9 +2211,9 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         seen.add(order_sn)
 
         st_now = (o.get("order_status") or "").upper()
-        # samakan beberapa variasi status:
+        # normalisasi status tambahan jika diperlukan (RETURNED kita treat sebagai CANCELLED untuk sekarang)
         if st_now == "RETURNED":
-            st_now = "TO_RETURN"
+            st_now = "CANCELLED"
 
         try:
             if st_now == "READY_TO_SHIP":
@@ -2233,7 +2232,7 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
                 if res.get("ok") or res.get("status") in ("created", "already_exists"):
                     processed += 1
 
-            elif st_now in ("CANCELLED", "IN_CANCEL", "TO_RETURN"):
+            elif st_now in ("CANCELLED", "IN_CANCEL"):
                 res = cancel_order(order_sn) or {}
                 if res.get("ok"):
                     processed += 1
