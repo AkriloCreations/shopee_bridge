@@ -843,13 +843,26 @@ def _process_order_to_si(order_sn: str):
         qty = _safe_int(it.get("model_quantity_purchased") or it.get("variation_quantity_purchased"), 1)
         rate = (
             flt(it.get("model_discounted_price"))
-            or flt(it.get("model_original_price"))
-            or flt(it.get("order_price"))
-            or flt(it.get("item_price"))
+            if flt(it.get("model_discounted_price")) > 0 else
+            flt(it.get("model_original_price"))
+            if flt(it.get("model_original_price")) > 0 else
+            flt(it.get("order_price"))
+            if flt(it.get("order_price")) > 0 else
+            flt(it.get("item_price"))
         )
-        # beberapa payload bisa datang dalam cents
-        if rate > 1_000_000:
-            rate = rate / 100000.0
+        # Normalisasi rate: beberapa toko memakai harga jutaan, hindari heuristik salah bagi
+        # Jika Shopee mengirim dalam 'cents', biasanya angkanya jauh lebih kecil (misal 1100000 -> sudah rupiah)
+        # Aturan: jika rate < 1000 dan ada kemungkinan total > 1e6, kita coba periksa 'price * qty * 100' dsb.
+        try:
+            if rate < 1000 and rate * qty < 1000:
+                # cek apakah dengan mengalikan 100 atau 1000 mendekati item original price fields mentah
+                raw_orig = flt(it.get("model_original_price")) or flt(it.get("model_discounted_price"))
+                for mul in (100, 1000, 10000):
+                    if abs(raw_orig - (rate * mul)) < 1:  # beda kurang dari Rp1 dianggap match
+                        rate = rate * mul
+                        break
+        except Exception:
+            pass
 
         item_code = _ensure_item_exists(sku, it, rate)
 

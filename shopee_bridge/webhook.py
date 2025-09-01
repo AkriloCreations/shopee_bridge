@@ -914,28 +914,49 @@ def create_payment_entry_from_shopee(
         pe.paid_amount = flt(net, precision)
         pe.received_amount = flt(net, precision)
 
-        # Build deductions dengan presisi PE
+        # === Rebuild deductions agar TEPAT = gross_r - paid_amount (tidak overshoot) ===
+        gross_r = flt(gross, precision)
+        if pe.paid_amount > gross_r:
+            frappe.logger().warning(
+                f"[Shopee PE] Net ({pe.paid_amount}) > Gross ({gross_r}) SI {si.name}, skip PE"
+            )
+            return None
+
+        remaining = flt(gross_r - pe.paid_amount, precision)
         total_deductions = 0.0
-        for k, v in fees_raw.items():
-            v = flt(v, precision)
-            if v > 0:
+        if remaining <= 0:
+            # Invoice sudah net / tidak perlu deductions (kemungkinan invoice net mode)
+            allocated = pe.paid_amount
+        else:
+            # Urutan prioritas: commission, service, protection, shipdiff, voucher
+            ordered_keys = ["commission", "service", "protection", "shipdiff", "voucher"]
+            for k in ordered_keys:
+                raw_v = flt(fees_raw.get(k), precision)
+                if raw_v <= 0 or remaining <= 0:
+                    continue
+                use_v = raw_v if raw_v <= remaining else remaining
+                if use_v > 0:
+                    row = pe.append("deductions", {})
+                    row.account = fee_accounts[k]
+                    row.amount = use_v
+                    row.cost_center = default_cc
+                    total_deductions += use_v
+                    remaining = flt(remaining - use_v, precision)
+
+            # Tambahkan diff row untuk sisa rounding saja
+            if remaining > (1 / (10 ** max(precision, 0))):
                 row = pe.append("deductions", {})
-                row.account = fee_accounts[k]
-                row.amount = v
+                row.account = diff_account
+                row.amount = remaining
                 row.cost_center = default_cc
-                total_deductions += v
+                total_deductions += remaining
+                remaining = 0.0
 
-        # Tambahkan 1 baris selisih supaya balance pas di presisi PE
-        diff_fee = flt(diff_fee_raw, precision)
-        if abs(diff_fee) >= (1 / (10 ** max(precision, 0))):
-            row = pe.append("deductions", {})
-            row.account = diff_account
-            row.amount = diff_fee
-            row.cost_center = default_cc
-            total_deductions += diff_fee
+            allocated = flt(pe.paid_amount + total_deductions, precision)
 
-        # allocated_amount harus = paid_amount + total_deductions (dibulatkan) → sama dengan GROSS setelah rounding
-        allocated = flt(pe.paid_amount + total_deductions, precision)
+        # Guard: jangan alokasikan lebih besar dari grand_total
+        if allocated > gross_r:
+            allocated = gross_r
 
         ref = pe.append("references", {})
         ref.reference_doctype = "Sales Invoice"
