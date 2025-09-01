@@ -233,36 +233,41 @@ def shopee_webhook():
                 log_webhook_activity(None, headers, raw_body, result, processing_time)
                 return result
 
-        # Try both live and test push keys for verification
+        # Try both live and test push keys for verification (dynamic URL)
         s = _settings()
-        live_push_key = (getattr(s, "live_push_partner_key", "") or "").strip()
+        live_push_key = (getattr(s, "live_push_partner_key", "") or getattr(s, "webhook_key", "") or "").strip()
         test_push_key = (getattr(s, "webhook_test_key", "") or "").strip()
-        
-        # Get the exact webhook URL used by Shopee
-        full_url = "https://erp.managerio.ddns.net/api/method/shopee_bridge.webhook.shopee_webhook"
-        
-        # Debug URL construction
-        req_host = frappe.request.host_url.rstrip('/')
-        req_path = frappe.request.path
-        req_full = req_host + req_path
-        frappe.logger().debug(f"""[Shopee Webhook] URL details:
-            Using URL    : {full_url}
-            Request Host: {req_host}
-            Request Path: {req_path}
-            Full Request: {req_full}
-        """)
-        
-        # Try verification with both keys
-        frappe.logger().debug(f"""[Shopee Webhook] Attempting signature verification:
-            Full URL: {full_url}
-            Live key prefix: {live_push_key[:5] if live_push_key else 'not set'}...
-            Test key prefix: {test_push_key[:5] if test_push_key else 'not set'}...
-        """)
-        
-        verified = verify_webhook_signature(full_url, raw_body, headers, live_push_key)
-        if not verified and test_push_key:
-            verified = verify_webhook_signature(full_url, raw_body, headers, test_push_key)
-            
+
+        # Build full request URL exactly as received (scheme + host + path)
+        def _build_full_url():
+            env = frappe.request.environ or {}
+            # Prefer forwarded proto/host when behind proxy
+            scheme = (env.get("HTTP_X_FORWARDED_PROTO") or env.get("X_FORWARDED_PROTO") or env.get("wsgi.url_scheme") or getattr(frappe.request, "scheme", "https") or "https").split(",")[0].strip()
+            host = (env.get("HTTP_X_FORWARDED_HOST") or env.get("X_FORWARDED_HOST") or env.get("HTTP_HOST") or getattr(frappe.request, "host", "") or frappe.request.host).split(",")[0].strip()
+            path = frappe.request.path
+            return f"{scheme}://{host}{path}"
+        full_url = _build_full_url()
+        frappe.logger().debug(f"[Shopee Webhook] Computed full URL for signature: {full_url}")
+
+        skip_signature = False
+        env_mode = (getattr(s, "environment", "Test") or "Test").lower()
+        if env_mode != "production" and not live_push_key:
+            # Allow skipping signature in non-production if no key is configured
+            skip_signature = True
+            frappe.logger().info("[Shopee Webhook] Skipping signature verification (non-production & no live key)")
+
+        verified = True if skip_signature else False
+        if not skip_signature:
+            frappe.logger().debug(
+                f"[Shopee Webhook] Attempting signature verification (env={env_mode}) live_key={'yes' if live_push_key else 'no'} test_key={'yes' if test_push_key else 'no'}"
+            )
+            # Primary key first
+            if live_push_key:
+                verified = verify_webhook_signature(full_url, raw_body, headers, live_push_key)
+            # Fallback to test key if primary failed
+            if not verified and test_push_key:
+                verified = verify_webhook_signature(full_url, raw_body, headers, test_push_key)
+
         if not verified:
             processing_time = (time.time() - start_time) * 1000
             result = {"success": False, "error": "invalid_signature"}
@@ -350,6 +355,49 @@ def shopee_webhook():
         frappe.log_error(traceback, "Shopee Webhook Critical Error")
         return result
 
+def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, push_key: str) -> bool:
+    """Verify Shopee Push v2 signature using HMAC-SHA256 (hex digest).
+
+    Shopee spec:
+      base_string = full_url + '|' + raw_body (raw bytes, not re-serialized)
+      signature   = hex( HMAC_SHA256(partner_key, base_string) )
+      Compare against Authorization header value (case sensitive hex)
+    """
+    try:
+        if not push_key:
+            frappe.logger().error("[Shopee Webhook] Missing partner push key for verification")
+            return False
+
+        # Case-insensitive header lookup
+        auth = None
+        for k, v in headers.items():
+            if k.lower() == "authorization":
+                auth = (v or "").strip()
+                break
+        if not auth:
+            frappe.logger().warning("[Shopee Webhook] Authorization header absent")
+            return False
+
+        # Base string: url|body (use raw bytes to avoid encoding drift)
+        # Build as bytes directly to avoid intermediate UTF-8 decoding errors
+        base_bytes = url.encode("utf-8") + b"|" + (raw_body or b"")
+        calc_hex = hmac.new(push_key.encode("utf-8"), base_bytes, hashlib.sha256).hexdigest()
+
+        if hmac.compare_digest(calc_hex, auth):
+            frappe.logger().info("[Shopee Webhook] ✓ Signature verified")
+            return True
+
+        # Mismatch – log concise diff (truncate body to protect logs)
+        body_preview = (raw_body[:120].decode('utf-8', errors='replace') + ('...' if len(raw_body) > 120 else '')) if raw_body else ''
+        frappe.logger().warning(
+            "[Shopee Webhook] ✗ Signature mismatch | auth=%s calc=%s url=%s body_len=%s body_preview=%s" % (
+                auth[:16], calc_hex[:16], url, len(raw_body), body_preview
+            )
+        )
+        return False
+    except Exception as e:
+        frappe.logger().error(f"[Shopee Webhook] Signature verification error: {e}")
+        return False
 
 def test_webhook_signature(body: str | bytes, key: str) -> str:
     """Test utility to generate webhook signature for a given body and key.
@@ -361,95 +409,17 @@ def test_webhook_signature(body: str | bytes, key: str) -> str:
     Returns:
         str: Calculated signature in hex format
     """
-    url = "https://erp.managerio.ddns.net/api/method/shopee_bridge.webhook.shopee_webhook"
+    # Use current site URL so generated signature matches current environment
+    try:
+        base = frappe.utils.get_url()
+    except Exception:
+        base = "https://example.com"  # fallback for contexts without request
+    url = f"{base}/api/method/shopee_bridge.webhook.shopee_webhook"
     if isinstance(body, str):
         body = body.encode("utf-8")
     key_bytes = key.encode("utf-8")
     base_string = f"{url}|{body.decode('utf-8')}"
     return hmac.new(key_bytes, base_string.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def verify_webhook_signature(url: str, raw_body: bytes, headers: dict, push_key: str) -> bool:
-    """Verify Shopee Push v2 signature using HMAC-SHA256.
-    
-    Args:
-        url: The full URL of the webhook endpoint
-            (should be https://erp.managerio.ddns.net/api/method/shopee_bridge.webhook.shopee_webhook)
-        raw_body: Raw request body bytes
-        headers: Request headers containing Authorization
-        push_key: Shopee partner key (live or test) from settings
-        
-    Returns:
-        bool: True if signature matches
-        
-    The signature is calculated as:
-    1. base_string = url + "|" + raw_body 
-    2. signature = hmac_sha256(partner_key, base_string).hexdigest()
-    3. Compare with Authorization header
-    
-    Note:
-        - URL must include full scheme and host (e.g., https://your.domain/path)
-        - Body must be raw bytes without any modification
-        - Authorization header must contain the hex signature without prefix
-    """
-    import hashlib, hmac
-    
-    try:
-        # Get authorization header
-        auth = (headers.get("Authorization") or "").strip()
-        if not auth:
-            frappe.logger().error("[Shopee Webhook] No Authorization header found")
-            return False
-            
-        # Verify partner key is configured
-        key = (push_key or "").strip()
-        if not key:
-            frappe.logger().error("[Shopee Webhook] No push key provided")
-            return False
-            
-        # Build base string exactly as specified: url|body
-        body_str = raw_body.decode("utf-8")
-        base_string = f"{url}|{body_str}"
-        
-        # Calculate signature using partner key
-        key_bytes = key.encode("utf-8")
-        calc_auth = hmac.new(
-            key_bytes,
-            base_string.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        
-        # Use constant-time comparison
-        if hmac.compare_digest(calc_auth, auth):
-            frappe.logger().info("[Shopee Webhook] ✓ Signature verified")
-            return True
-            
-        # Log details if verification fails
-        frappe.logger().warning(f"""[Shopee Webhook] ✗ Signature verification failed:
-            URL               : {url}
-            Authorization    : {auth}
-            Body length     : {len(raw_body)}
-            Body preview    : {body_str[:100]}...
-            Key prefix      : {key[:5]}...
-            Calculated auth : {calc_auth}
-            Base string     : {base_string[:100]}...
-        """)
-        return False
-
-        # If we get here, no match was found - log details for debugging
-        frappe.logger().warning(f"""[Shopee Webhook] Signature verification failed:
-            Incoming (raw)     : {incoming}
-            Incoming (cleaned) : {incoming_clean}
-            Key prefix        : {key[:5]}...
-            Body preview      : {raw_body[:100].decode('utf-8', errors='replace')}...
-            Body length      : {len(raw_body)}
-            Headers          : {json.dumps({k:v for k,v in headers.items() if k.lower() in ('authorization', 'x-shopee-signature')}, indent=2)}
-            Calculated sigs  : {json.dumps(signatures, indent=2)}
-        """)
-        return False
-
-    except Exception as e:
-        frappe.logger().error(f"[Shopee Webhook] Signature verification error: {e}")
-        return False
 
 
 def _normalize_signature(sig_raw: str) -> str:
