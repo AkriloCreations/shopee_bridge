@@ -14,7 +14,7 @@ app_license = "MIT"
 # include js, css files in header of desk.html
 # app_include_css = "/assets/shopee_bridge/css/shopee_bridge.css"
 app_include_js = [
-    "shopee_bridge/js/oauth_handler.js"
+    "public/js/oauth_handler.js"
 ]
 
 # include js, css files in header of web template

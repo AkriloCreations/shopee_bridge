@@ -2813,11 +2813,18 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
             )
             stats["api_calls"] += 1
             if resp.get("error"):
+                error_msg = resp.get('message') or resp.get('error') or 'Unknown API error'
+                # Check for rate limiting
+                if 'rate limit' in error_msg.lower() or 'too many requests' in error_msg.lower():
+                    frappe.logger().warning(f"[Shopee Backfill] Rate limited, sleeping for 60 seconds")
+                    import time
+                    time.sleep(60)
+                    continue
                 frappe.log_error(
-                    f"get_order_list[{status},{time_field}] {resp.get('error')} - {resp.get('message')}",
+                    f"get_order_list[{status},{time_field}] {resp.get('error')} - {error_msg}",
                     "Shopee Backfill"
                 )
-                raise Exception(resp.get("message") or resp.get("error"))
+                raise Exception(error_msg)
             body = resp.get("response") or {}
             batch = body.get("order_list", []) or []
             items.extend(batch)
@@ -2865,7 +2872,11 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         )
         stats["api_calls"] += 1
         if esc.get("error"):
-            frappe.logger().warning(f"[Shopee Backfill] escrow_detail fail {order_sn}: {esc.get('message')}")
+            error_msg = esc.get('message') or esc.get('error') or 'Unknown escrow error'
+            if 'rate limit' in error_msg.lower() or 'too many requests' in error_msg.lower():
+                frappe.logger().warning(f"[Shopee Backfill] Escrow rate limited for {order_sn}, skipping payment creation")
+                return
+            frappe.logger().warning(f"[Shopee Backfill] escrow_detail fail {order_sn}: {error_msg}")
             return
         try:
             from .webhook import _normalize_escrow_payload
@@ -2984,6 +2995,13 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
                         {"order_sn": order_sn}
                     )
                     stats["api_calls"] += 1
+                    if esc.get("error"):
+                        error_msg = esc.get('message') or esc.get('error') or 'Unknown escrow error'
+                        if 'rate limit' in error_msg.lower() or 'too many requests' in error_msg.lower():
+                            frappe.logger().warning(f"[Shopee Backfill] Escrow rate limited for cancelled order {order_sn}, skipping refund processing")
+                            continue
+                        frappe.logger().warning(f"[Shopee Backfill] escrow_detail fail for cancelled {order_sn}: {error_msg}")
+                        continue
                     from .webhook import _normalize_escrow_payload
                     esc_n = _normalize_escrow_payload(esc)
                     refund_amount = flt(esc_n.get("refund_amount"))
@@ -3077,6 +3095,9 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
             except Exception as e:
                 stats["errors"] += 1
                 frappe.log_error(f"Process {order_sn} [{status}] fail: {e}", "Shopee Backfill Loop")
+                # Add delay to prevent overwhelming the system
+                import time
+                time.sleep(0.1)
 
     # Fallback create_time jika tidak ada hasil & tidak ada error
     if stats["SO"] + stats["SI"] + stats["CANCELLED"] == 0 and stats["errors"] == 0:
@@ -3198,7 +3219,28 @@ def sync_orders_range(time_from: int, time_to: int, page_size: int = 50, order_s
         "order_sns": list(processed_order_sns),  # untuk dedup akurat di wrapper
     }
 
-def _find_existing_so_by_order_sn(order_sn: str) -> str | None:
+def _handle_api_error(error_response: dict, operation: str, order_sn: str = "") -> bool:
+    """Handle API errors and return True if should retry, False if should skip."""
+    if not error_response.get("error"):
+        return False
+
+    error_msg = error_response.get('message') or error_response.get('error') or 'Unknown API error'
+
+    # Check for rate limiting
+    if 'rate limit' in error_msg.lower() or 'too many requests' in error_msg.lower():
+        frappe.logger().warning(f"[Shopee API] Rate limited on {operation} for {order_sn or 'N/A'}, sleeping for 60 seconds")
+        import time
+        time.sleep(60)
+        return True  # Should retry
+
+    # Check for authentication errors
+    if 'invalid token' in error_msg.lower() or 'unauthorized' in error_msg.lower():
+        frappe.logger().error(f"[Shopee API] Authentication error on {operation}: {error_msg}")
+        return False  # Don't retry
+
+    # Log other errors
+    frappe.log_error(f"[Shopee API] {operation} failed for {order_sn or 'N/A'}: {error_msg}", "Shopee API Error")
+    return False  # Don't retry for other errors
     """Cari Sales Order existing: prioritas po_no (Customer's PO), fallback custom_shopee_order_sn."""
     if not order_sn:
         return None
@@ -3281,9 +3323,9 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
 # migrate
 
 @frappe.whitelist()
-def migrate_orders_from(start_timestamp: int | None = None, year: int | None = None,
-                        chunk_days: int = 10, page_size: int = 50,
-                        order_status: str | None = None):
+def migrate_orders_from(start_timestamp=None, year=None,
+                        chunk_days=10, page_size=50,
+                        order_status=None):
     """Backfill / migrasi orders Shopee dari titik waktu (default 1 Jan tahun berjalan) sampai sekarang.
        Window per chunk <=15 hari memanggil sync_orders_range. Dedup 100% via set order_sns.
     """
