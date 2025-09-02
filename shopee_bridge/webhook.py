@@ -690,7 +690,6 @@ def handle_order_created(data: Dict[str, Any]) -> Dict[str, Any]:
         )
         result["order_processing_job"] = job_id
         result["action"] = "order_processing_enqueued"
-        
     except Exception as e:
         result["order_error"] = str(e)
         frappe.logger().warning(f"[Shopee] Order processing failed: {str(e)}")
@@ -729,6 +728,7 @@ def _normalize_escrow_payload(payload: dict) -> dict:
     coin_cash_back = flt(oi.get("coins") or oi.get("coin_cash_back"))
     voucher_code_seller = flt(oi.get("voucher_code_seller"))
     credit_card_fee = flt(oi.get("credit_card_transaction_fee") or oi.get("credit_card_fee"))
+    final_shipping_fee = flt(oi.get("final_shipping_fee"))  # can be negative; use abs later when creating PE
 
     payout_time = root.get("payout_time") or root.get("update_time")
     is_refund = (refund_amount > 0) or (net_amount <= 0)
@@ -747,6 +747,7 @@ def _normalize_escrow_payload(payload: dict) -> dict:
         "coin_cash_back": coin_cash_back,
         "voucher_code_seller": voucher_code_seller,
         "credit_card_transaction_fee": credit_card_fee,
+    "final_shipping_fee": final_shipping_fee,
         "payout_time": payout_time,
         "is_refund": is_refund,
         "return_to_seller_amount": return_to_seller,
@@ -754,149 +755,190 @@ def _normalize_escrow_payload(payload: dict) -> dict:
         "shipping_rebate": shipping_rebate,
     }
 
-def create_payment_entry_from_shopee(si_name: str, escrow: dict, net_amount: float, 
-                                    order_sn: str, posting_ts: int = None, enqueue: bool = True):
+def create_payment_entry_from_shopee(si_name: str, escrow: dict, net_amount: float,
+                                     order_sn: str, posting_ts: int | None = None, enqueue: bool = True):
+    """Create a Payment Entry reflecting Shopee escrow payout and fees.
+
+    Logic:
+      - paid_amount = Sales Invoice grand_total
+      - received_amount = escrow net (payout after fees)
+      - deductions rows = individual Shopee fees (commission, service, etc.)
+      - reference_date & posting_date = payout date (uang masuk)
     """
-    Enhanced Payment Entry creation yang menambahkan semua komponen escrow sebagai deductions.
-    """
+    # Defensive: SI must exist. If missing and we have order_sn, try to build via complete_order_to_si.
+    if not si_name:
+        try:
+            frappe.logger().warning(f"[PE Debug] {order_sn}: si_name missing → attempting auto SI creation via complete_order_to_si")
+            from .api import complete_order_to_si  # local import to avoid cycles at module import
+            res = complete_order_to_si(order_sn)
+            if isinstance(res, dict):
+                si_name = res.get("sales_invoice") or si_name
+                if not si_name and res.get("status") == "already_invoiced":
+                    si_name = res.get("sales_invoice")
+        except Exception as auto_e:
+            frappe.logger().error(f"[PE Debug] {order_sn}: auto create SI failed: {auto_e}")
+    if not si_name:
+        frappe.logger().error(f"[PE Debug] {order_sn}: abort PE, SI still missing after attempt")
+        return None
+    # Pre-initialize to avoid UnboundLocalError if an early reference happens on failure paths
+    esc_n = {}
     try:
         si = frappe.get_doc("Sales Invoice", si_name)
-        
-        # Normalize escrow details
-        esc_n = _normalize_escrow_payload(escrow)
-        
-        # Calculate actual net amount dari escrow
+
+        # Accept either raw escrow payload (with nested response/order_income) OR an already-normalized dict
+        if escrow and ("net_amount" in escrow and any(k in escrow for k in ("commission_fee", "service_fee"))):
+            esc_n = escrow  # already normalized
+        else:
+            esc_n = _normalize_escrow_payload(escrow) or {}
         actual_net = flt(esc_n.get("net_amount") or esc_n.get("payout_amount") or net_amount)
-        
         if actual_net <= 0:
-            frappe.logger().info(f"No payment needed for {order_sn}: net_amount = {actual_net}")
+            frappe.logger().info(f"[PE Debug] {order_sn}: skip PE (actual_net={actual_net})")
             return None
-        
-        # Determine posting date dari escrow payout time
-        posting_date = nowdate()
-        if posting_ts:
+
+        # Determine payout timestamp (tanggal uang masuk). Prioritization:
+        # release_time > complete_time > payout_time (normalized/raw) > provided posting_ts > update_time
+        raw = escrow if isinstance(escrow, dict) else {}
+        raw_release = raw.get("release_time") or raw.get("escrow_release_time")
+        raw_complete = raw.get("complete_time")
+        raw_payout = raw.get("payout_time") or esc_n.get("payout_time")
+        raw_update = raw.get("update_time") or esc_n.get("update_time")
+        order_provided = posting_ts
+        ordered = [raw_release, raw_complete, raw_payout, order_provided, raw_update]
+        payout_ts = None
+        for cand in ordered:
             try:
-                posting_date = datetime.fromtimestamp(posting_ts).date().isoformat()
-            except:
-                pass
-        elif esc_n.get("payout_time"):
+                if cand and int(cand) > 0:
+                    payout_ts = int(cand)
+                    break
+            except Exception:
+                continue
+        debug_times = {
+            "release_time": raw_release,
+            "complete_time": raw_complete,
+            "payout_time": raw_payout,
+            "arg_posting_ts": order_provided,
+            "update_time": raw_update,
+            "chosen": payout_ts,
+        }
+        frappe.logger().info(f"[PE DateDebug] {order_sn}: times={debug_times}")
+        if payout_ts:
             try:
-                posting_date = datetime.fromtimestamp(int(esc_n.get("payout_time"))).date().isoformat()
-            except:
-                pass
-        
-        # Prevent future dates
+                posting_date = datetime.datetime.fromtimestamp(payout_ts).date().isoformat()
+            except Exception:
+                posting_date = nowdate()
+        else:
+            # Fallback: gunakan tanggal Sales Invoice (permintaan user) kalau tidak ada payout ts
+            si_fallback = str(getattr(si, "posting_date", "") or "")
+            if not si_fallback:
+                posting_date = nowdate()
+                frappe.logger().info(f"[PE DateDebug] {order_sn}: fallback to today (SI missing posting_date)")
+            else:
+                posting_date = si_fallback
+                frappe.logger().info(f"[PE DateDebug] {order_sn}: using SI posting_date fallback {posting_date}")
         if posting_date > nowdate():
             posting_date = nowdate()
-        
-        # Create Payment Entry
+
         pe = frappe.new_doc("Payment Entry")
         pe.payment_type = "Receive"
-        pe.party_type = "Customer" 
+        pe.party_type = "Customer"
         pe.party = si.customer
         pe.company = si.company
         pe.posting_date = posting_date
         pe.reference_no = order_sn
+        # Ensure reference_date ALWAYS matches payout posting_date
         pe.reference_date = posting_date
         pe.remarks = f"Shopee Order {order_sn} Payment (Auto-created)"
-        
-        # Set accounts
-        pe.paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account")
-        pe.paid_to = _get_or_create_bank_account("Shopee (Escrow)")
+
+        receivable = (frappe.db.get_value("Company", si.company, "default_receivable_account") or
+                       getattr(si, "debit_to", None) or
+                       frappe.db.get_value("Account", {"company": si.company, "account_type": "Receivable"}, "name"))
+        bank_acc = _get_or_create_bank_account("Shopee (Escrow)")
+        if not receivable or not bank_acc:
+            frappe.logger().error(f"[PE Debug] {order_sn}: missing accounts receivable={receivable} bank={bank_acc}")
+            return None
+        pe.paid_from = receivable
+        pe.paid_to = bank_acc
         pe.mode_of_payment = "Shopee"
-        
-        # Set amounts - paid_amount adalah gross (sebelum fee), received_amount adalah net
+
         gross_amount = flt(si.grand_total)
         pe.paid_amount = gross_amount
         pe.received_amount = actual_net
-        
-        # Add SI reference
+
         ref = pe.append("references", {})
         ref.reference_doctype = "Sales Invoice"
         ref.reference_name = si.name
         ref.allocated_amount = gross_amount
-        
-        # === ADD ESCROW DEDUCTIONS ===
-        # Mapping escrow components ke expense accounts
-        escrow_components = [
-            {
-                "key": "commission_fee",
-                "account_name": "Komisi Shopee",
-                "amount": flt(esc_n.get("commission_fee", 0))
-            },
-            {
-                "key": "service_fee", 
-                "account_name": "Biaya Layanan Shopee",
-                "amount": flt(esc_n.get("service_fee", 0))
-            },
-            {
-                "key": "shipping_seller_protection_fee_amount",
-                "account_name": "Proteksi Pengiriman Shopee", 
-                "amount": flt(esc_n.get("shipping_seller_protection_fee_amount", 0))
-            },
-            {
-                "key": "shipping_fee_difference",
-                "account_name": "Selisih Ongkir Shopee",
-                "amount": flt(esc_n.get("shipping_fee_difference", 0))
-            },
-            {
-                "key": "voucher_seller",
-                "account_name": "Voucher Shopee (Seller)",
-                "amount": flt(esc_n.get("voucher_seller", 0))
-            },
-            {
-                "key": "coin_cash_back", 
-                "account_name": "Coin Cashback Shopee",
-                "amount": flt(esc_n.get("coin_cash_back", 0))
-            }
+
+        # Gather deductions
+        components = [
+            ("commission_fee", "Komisi Shopee"),
+            ("service_fee", "Biaya Layanan Shopee"),
+            ("shipping_seller_protection_fee_amount", "Proteksi Pengiriman Shopee"),
+            ("shipping_fee_difference", "Selisih Ongkir Shopee"),
+            ("voucher_seller", "Voucher Shopee (Seller)"),
+            ("coin_cash_back", "Coin Cashback Shopee"),
         ]
-        
-        # Add deductions untuk setiap komponen yang ada
-        for component in escrow_components:
-            amount = component["amount"]
-            if amount > 0:  # Hanya tambahkan jika ada nilai
-                try:
-                    # Get or create expense account
-                    expense_account = _get_or_create_expense_account(component["account_name"])
-                    
-                    # Add deduction row
-                    deduction = pe.append("deductions", {})
-                    deduction.account = expense_account
-                    deduction.amount = amount
-                    deduction.description = f"{component['account_name']} - {order_sn}"
-                    
-                except Exception as e:
-                    frappe.log_error(f"Failed to add deduction {component['key']}: {e}", "PE Deduction")
-        
-        # Validate total deductions
-        total_deductions = sum(flt(d.amount) for d in pe.deductions)
-        expected_deductions = gross_amount - actual_net
-        
-        # Log untuk debugging
-        frappe.logger().info(f"PE {order_sn}: Gross={gross_amount}, Net={actual_net}, "
-                           f"Deductions={total_deductions}, Expected={expected_deductions}")
-        
-        # Adjust jika ada perbedaan kecil (rounding)
-        if abs(total_deductions - expected_deductions) > 1:
-            # Add atau adjust "Other Shopee Charges" untuk balance
-            diff = expected_deductions - total_deductions
-            if abs(diff) > 1:  # Hanya jika perbedaan > Rp 1
-                other_account = _get_or_create_expense_account("Biaya Shopee Lainnya")
-                other_deduction = pe.append("deductions", {})
-                other_deduction.account = other_account
-                other_deduction.amount = diff
-                other_deduction.description = f"Penyesuaian Biaya Shopee - {order_sn}"
-        
-        # Insert dan submit
+        try:
+            deductions_cc = _get_default_cost_center_for_si(si)
+        except Exception:
+            deductions_cc = None
+        for key, label in components:
+            amt = flt(esc_n.get(key) or 0)
+            if amt > 0:
+                acc = _get_or_create_expense_account(label)
+                if not acc:
+                    continue
+                row = pe.append("deductions", {})
+                row.account = acc
+                row.amount = amt
+                row.description = f"{label} - {order_sn}"
+                if deductions_cc and hasattr(row, "cost_center"):
+                    row.cost_center = deductions_cc
+
+        # Explicit shipping fee (final_shipping_fee) – Shopee sometimes sends negative value meaning cost to seller
+        try:
+            fsf = esc_n.get("final_shipping_fee")
+            if fsf is not None and flt(fsf) != 0:
+                shipping_cost = abs(flt(fsf))  # treat as positive deduction
+                acc_ship = _get_or_create_expense_account("Biaya Ongkir Shopee")
+                if acc_ship and shipping_cost > 0:
+                    row = pe.append("deductions", {})
+                    row.account = acc_ship
+                    row.amount = shipping_cost
+                    row.description = f"Biaya Ongkir Shopee (final_shipping_fee) - {order_sn}"
+                    if deductions_cc and hasattr(row, "cost_center"):
+                        row.cost_center = deductions_cc
+        except Exception:
+            pass
+
+        expected = flt(gross_amount - actual_net)
+        total_deduct = sum(flt(d.amount) for d in pe.deductions)
+        diff = flt(expected - total_deduct)
+        if abs(diff) > 1:
+            acc = _get_or_create_expense_account("Biaya Shopee Lainnya")
+            if acc:
+                row = pe.append("deductions", {})
+                row.account = acc
+                row.amount = diff
+                row.description = f"Penyesuaian Biaya Shopee - {order_sn}"
+                if deductions_cc and hasattr(row, "cost_center"):
+                    row.cost_center = deductions_cc
+                total_deduct += diff
+
+        calc_received = flt(gross_amount - total_deduct)
+        if abs(calc_received - actual_net) > 1:
+            frappe.logger().warning(f"[PE Debug] {order_sn}: mismatch calc_received={calc_received} net={actual_net}")
+
         pe.insert(ignore_permissions=True)
         pe.submit()
-        
-        frappe.logger().info(f"Created Payment Entry {pe.name} for {order_sn} with {len(pe.deductions)} deductions")
+        frappe.logger().info(f"[PE Debug] Created PE {pe.name} for {order_sn} gross={gross_amount} net={actual_net} deductions={total_deduct}")
         return pe.name
-        
     except Exception as e:
-        frappe.log_error(f"Failed to create Payment Entry for {order_sn}: {e}\n"
-                        f"Escrow details: {frappe.as_json(esc_n)}", "Payment Entry Creation")
+        try:
+            esc_dump = frappe.as_json(escrow)[:500]
+        except Exception:
+            esc_dump = str(escrow)[:500]
+        frappe.log_error(f"PE creation failed {order_sn}: {e}\nEscrow: {esc_dump}", "Shopee PE Error")
         return None
 
 def _get_or_create_expense_account(account_name: str) -> str:
@@ -904,12 +946,11 @@ def _get_or_create_expense_account(account_name: str) -> str:
     # Clean account name (max 140 chars)
     clean_name = account_name.strip()[:140]
     
-    # Check if exists
-    if frappe.db.exists("Account", clean_name):
-        return clean_name
-    
-    # Get company dan parent account
+    # Get company dan cek existing by account_name + company (not by full name only)
     company = frappe.db.get_single_value("Global Defaults", "default_company")
+    existing = frappe.db.get_value("Account", {"account_name": clean_name, "company": company}, "name")
+    if existing:
+        return existing
     
     # Cari parent expense account
     parent_account = None
@@ -927,30 +968,45 @@ def _get_or_create_expense_account(account_name: str) -> str:
             break
     
     if not parent_account:
-        # Fallback: cari account bertipe "Expense" 
-        parent_accounts = frappe.get_all("Account", 
-            filters={"company": company, "account_type": "Expense", "is_group": 1},
-            limit=1, pluck="name")
-        parent_account = parent_accounts[0] if parent_accounts else None
-    
+        # Try broader fallbacks before throwing to reduce noisy errors:
+        # 1. Any group account with root_type Expense
+        if not parent_account:
+            any_expense_group = frappe.db.get_value("Account", {"company": company, "root_type": "Expense", "is_group": 1}, "name")
+            if any_expense_group:
+                parent_account = any_expense_group
+        # 2. Company default expense account (if a custom field exists) – ignore if missing
+        # 3. As last resort: pick first non-group Expense type account's parent
+        if not parent_account:
+            leaf_expense = frappe.db.get_list("Account", filters={"company": company, "account_type": "Expense", "is_group": 0}, fields=["parent_account"], limit=1)
+            if leaf_expense and leaf_expense[0].get("parent_account"):
+                parent_account = leaf_expense[0].get("parent_account")
+
     if not parent_account:
-        frappe.throw(f"Cannot find parent expense account for {clean_name}")
-    
+        # Instead of throwing (which spammed logs), just log once and abort creation
+        frappe.logger().error(f"[Shopee Bridge] Unable to locate parent expense account for '{clean_name}'. Please create an Expense group (e.g. 'Indirect Expenses').")
+        return None
+
     # Create account
     try:
         account = frappe.new_doc("Account")
         account.account_name = clean_name
         account.parent_account = parent_account
-        account.account_type = "Expense"
+        account.account_type = "Indirect Expense"
+        # Force root_type for safety if field exists
+        if hasattr(account, "root_type"):
+            account.root_type = "Expense"
         account.company = company
         account.is_group = 0
         account.insert(ignore_permissions=True)
         return account.name
-        
     except Exception as e:
+        # Handle duplicate race condition gracefully
+        dup_existing = frappe.db.get_value("Account", {"account_name": clean_name, "company": company}, "name")
+        if dup_existing:
+            frappe.logger().info(f"[Shopee Bridge] Detected existing expense account after race: {dup_existing}")
+            return dup_existing
         frappe.log_error(f"Failed to create expense account {clean_name}: {e}", "Account Creation")
-        # Return generic expense account as fallback
-        return parent_account
+        return None
 def _get_or_create_bank_account(account_name: str) -> str:
     """Pastikan akun escrow Bank ada & valid."""
     company = frappe.db.get_single_value("Global Defaults", "default_company")
@@ -1478,3 +1534,4 @@ def dbg_verify_signature():
         },
         "compare": results,
     }
+
