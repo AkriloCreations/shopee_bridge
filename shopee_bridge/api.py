@@ -3287,126 +3287,130 @@ def migrate_orders_from(start_timestamp: int | None = None, year: int | None = N
     """Backfill / migrasi orders Shopee dari titik waktu (default 1 Jan tahun berjalan) sampai sekarang.
        Window per chunk <=15 hari memanggil sync_orders_range. Dedup 100% via set order_sns.
     """
-    # Defensive coercion: frappe.call sering kirim semua arg sebagai string
-    def _to_int_or_none(v):
-        if v in (None, "", "null", "None"):  # treat empty as None
-            return None
+    try:
+        # Defensive coercion: frappe.call sering kirim semua arg sebagai string
+        def _to_int_or_none(v):
+            if v in (None, "", "null", "None"):  # treat empty as None
+                return None
+            try:
+                return int(v)  # works for str or int
+            except Exception:
+                return None
+
+        # Coerce numeric params
+        start_timestamp = _to_int_or_none(start_timestamp)
+        year = _to_int_or_none(year)
         try:
-            return int(v)  # works for str or int
+            chunk_days = int(chunk_days)
         except Exception:
-            return None
-
-    # Coerce numeric params
-    start_timestamp = _to_int_or_none(start_timestamp)
-    year = _to_int_or_none(year)
-    try:
-        chunk_days = int(chunk_days)
-    except Exception:
-        chunk_days = 10
-    try:
-        page_size = int(page_size)
-    except Exception:
-        page_size = 50
-
-    s = _settings()
-    if not getattr(s, "access_token", ""):
-        frappe.throw("Access token required. Please authenticate with Shopee first.")
-
-    if chunk_days <= 0:
-        frappe.throw("chunk_days must be > 0")
-    if chunk_days > 15:
-        frappe.throw("chunk_days cannot exceed 15 (Shopee API limit)")
-
-    try:
-        if callable(globals().get("refresh_if_needed")):
-            refresh_if_needed()
-    except Exception:
-        pass
-
-    from datetime import datetime, timezone
-    import time as _t
-
-    now_ts = int(_t.time())
-    if start_timestamp is not None:
-        start_ts = int(start_timestamp)
-        start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    else:
-        if year is None:
-            year = datetime.fromtimestamp(now_ts, tz=timezone.utc).year
-        start_dt = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        start_ts = int(start_dt.timestamp())
-    if start_ts > now_ts:
-        frappe.throw("Start time is in the future")
-
-    chunk_sec = int(chunk_days * 24 * 3600)
-
-    windows: list[dict] = []
-    agg_processed = {"SO": 0, "SI": 0, "PE": 0, "CANCELLED": 0}
-    agg_errors = 0
-    agg_api_calls = 0
-    total_orders = 0
-    all_order_sns: set[str] = set()
-    last_update_time = int(getattr(s, "last_success_update_time", 0) or 0)
-
-    cur_start = start_ts
-    while cur_start <= now_ts:
-        cur_end = min(cur_start + chunk_sec - 1, now_ts)
+            chunk_days = 10
         try:
-            res = sync_orders_range(
-                time_from=cur_start,
-                time_to=cur_end,
-                page_size=page_size,
-                order_status=order_status,
-            ) or {}
-            processed_break = res.get("processed") or {}
-            for k in agg_processed.keys():
-                agg_processed[k] += int(processed_break.get(k, 0) or 0)
-            agg_errors += int(res.get("errors", 0) or 0)
-            agg_api_calls += int(res.get("api_calls", 0) or 0)
-            total_orders += int(res.get("processed_orders", 0) or 0)
-            for osn in (res.get("order_sns") or []):
-                if osn:
-                    all_order_sns.add(osn)
-            lut = int(res.get("last_update_time", 0) or 0)
-            if lut > last_update_time:
-                last_update_time = lut
-            windows.append({
-                "from": cur_start,
-                "to": cur_end,
-                "processed_orders": res.get("processed_orders"),
-                "errors": res.get("errors"),
-                "api_calls": res.get("api_calls"),
-            })
-        except Exception as e:
-            agg_errors += 1
-            frappe.log_error(f"Window {cur_start}->{cur_end} failed: {e}", "Shopee Migrate From")
-            windows.append({"from": cur_start, "to": cur_end, "error": str(e)})
-        cur_start = cur_end + 1
+            page_size = int(page_size)
+        except Exception:
+            page_size = 50
 
-    result = {
-        "year": year,
-        "from": start_ts,
-        "to": now_ts,
-        "from_iso": start_dt.isoformat(),
-        "to_iso": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
-        "chunk_days": chunk_days,
-        "windows": windows,
-        "processed_total": len(all_order_sns),
-        "raw_processed_total": total_orders,
-        "processed_breakdown": agg_processed,
-        "errors": agg_errors,
-        "api_calls": agg_api_calls,
-        "last_update_time": last_update_time,
-        "success": agg_errors == 0,
-        "range_mode": True,
-        "migrate_from": True,
-        "order_status_filter": order_status,
-        "start_timestamp_param": start_timestamp,
-        "unique_order_sns": len(all_order_sns),
-    }
-    frappe.logger().info(f"[Shopee Migrate From] DONE start={start_ts} windows={len(windows)} "
-                         f"processed_raw={total_orders} unique={len(all_order_sns)} errors={agg_errors}")
-    return result
+        s = _settings()
+        if not getattr(s, "access_token", ""):
+            frappe.throw("Access token required. Please authenticate with Shopee first.")
+
+        if chunk_days <= 0:
+            frappe.throw("chunk_days must be > 0")
+        if chunk_days > 15:
+            frappe.throw("chunk_days cannot exceed 15 (Shopee API limit)")
+
+        try:
+            if callable(globals().get("refresh_if_needed")):
+                refresh_if_needed()
+        except Exception:
+            pass
+
+        from datetime import datetime, timezone
+        import time as _t
+
+        now_ts = int(_t.time())
+        if start_timestamp is not None:
+            start_ts = int(start_timestamp)
+            start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        else:
+            if year is None:
+                year = datetime.fromtimestamp(now_ts, tz=timezone.utc).year
+            start_dt = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+            start_ts = int(start_dt.timestamp())
+        if start_ts > now_ts:
+            frappe.throw("Start time is in the future")
+
+        chunk_sec = int(chunk_days * 24 * 3600)
+
+        windows: list[dict] = []
+        agg_processed = {"SO": 0, "SI": 0, "PE": 0, "CANCELLED": 0}
+        agg_errors = 0
+        agg_api_calls = 0
+        total_orders = 0
+        all_order_sns: set[str] = set()
+        last_update_time = int(getattr(s, "last_success_update_time", 0) or 0)
+
+        cur_start = start_ts
+        while cur_start <= now_ts:
+            cur_end = min(cur_start + chunk_sec - 1, now_ts)
+            try:
+                res = sync_orders_range(
+                    time_from=cur_start,
+                    time_to=cur_end,
+                    page_size=page_size,
+                    order_status=order_status,
+                ) or {}
+                processed_break = res.get("processed") or {}
+                for k in agg_processed.keys():
+                    agg_processed[k] += int(processed_break.get(k, 0) or 0)
+                agg_errors += int(res.get("errors", 0) or 0)
+                agg_api_calls += int(res.get("api_calls", 0) or 0)
+                total_orders += int(res.get("processed_orders", 0) or 0)
+                for osn in (res.get("order_sns") or []):
+                    if osn:
+                        all_order_sns.add(osn)
+                lut = int(res.get("last_update_time", 0) or 0)
+                if lut > last_update_time:
+                    last_update_time = lut
+                windows.append({
+                    "from": cur_start,
+                    "to": cur_end,
+                    "processed_orders": res.get("processed_orders"),
+                    "errors": res.get("errors"),
+                    "api_calls": res.get("api_calls"),
+                })
+            except Exception as e:
+                agg_errors += 1
+                frappe.log_error(f"Window {cur_start}->{cur_end} failed: {e}", "Shopee Migrate From")
+                windows.append({"from": cur_start, "to": cur_end, "error": str(e)})
+            cur_start = cur_end + 1
+
+        result = {
+            "year": year,
+            "from": start_ts,
+            "to": now_ts,
+            "from_iso": start_dt.isoformat(),
+            "to_iso": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+            "chunk_days": chunk_days,
+            "windows": windows,
+            "processed_total": len(all_order_sns),
+            "raw_processed_total": total_orders,
+            "processed_breakdown": agg_processed,
+            "errors": agg_errors,
+            "api_calls": agg_api_calls,
+            "last_update_time": last_update_time,
+            "success": agg_errors == 0,
+            "range_mode": True,
+            "migrate_from": True,
+            "order_status_filter": order_status,
+            "start_timestamp_param": start_timestamp,
+            "unique_order_sns": len(all_order_sns),
+        }
+        frappe.logger().info(f"[Shopee Migrate From] DONE start={start_ts} windows={len(windows)} "
+                             f"processed_raw={total_orders} unique={len(all_order_sns)} errors={agg_errors}")
+        return result
+    except Exception as e:
+        frappe.log_error(f"migrate_orders_from failed: {str(e)}", "Shopee Migrate From")
+        return {"success": False, "error": str(e)}
 
 @frappe.whitelist()
 def force_cancel_shopee_orders(batch_size=250):
