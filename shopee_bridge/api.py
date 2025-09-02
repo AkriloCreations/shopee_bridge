@@ -362,7 +362,14 @@ def _process_order(order_sn: str):
                       + float(esc.get("voucher_code_seller") or 0),
     }
 
-    paid_from = frappe.db.get_single_value("Accounts Settings", "default_receivable_account") or "Debtors - AC"
+    # Resolve receivable account: use Company.default_receivable_account, fallback to Debtors - <abbr>
+    company = frappe.db.get_single_value("Global Defaults", "default_company")
+    paid_from = frappe.db.get_value("Company", company, "default_receivable_account")
+    if not paid_from:
+        # Try invoice's debit_to if available later (after SI creation) else generic pattern
+        paid_from = getattr(si, "debit_to", None) or frappe.db.get_value("Account", {"company": company, "account_type": "Receivable"}, "name")
+    if not paid_from:
+        paid_from = "Debtors - AC"
     paid_to   = "Bank - Shopee (Escrow)"
 
     pe = frappe.new_doc("Payment Entry")
