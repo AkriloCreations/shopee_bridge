@@ -3283,19 +3283,9 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
     """Realtime wrapper yang memanfaatkan logic inti `sync_orders_range`.
     Hitung window (last_success_update_time ± overlap) lalu panggil `sync_orders_range` agar single source of truth.
     Return shape dipertahankan (range_mode=False)."""
-    s = _settings()
-    if not getattr(s, "access_token", ""):
-        frappe.throw("Access token required. Please authenticate with Shopee first.")
-
-    # Refresh token sekali jika tersedia
-    try:
-        if callable(globals().get("refresh_if_needed")):
-            refresh_if_needed()
-    except Exception:
-        pass
-
     import time as _t
     now = int(_t.time())
+    s = _settings()
     last = int(getattr(s, "last_success_update_time", 0) or 0)
     overlap = int(getattr(s, "overlap_seconds", 600) or 600)
     if last == 0:
@@ -3303,15 +3293,13 @@ def sync_recent_orders(hours: int = 24, page_size: int = 50):
     else:
         time_from = max(0, last - overlap)
     time_to = now
-
-    # Delegasi ke sync_orders_range
+    # Accept order_status passthrough for UI flexibility
+    order_status = getattr(s, "order_status", None)
     try:
-        res = sync_orders_range(time_from=time_from, time_to=time_to, page_size=page_size)
+        res = sync_orders_range(time_from=time_from, time_to=time_to, page_size=page_size, order_status=order_status)
     except Exception as e:
         frappe.log_error(f"sync_recent_orders wrapper failed: {e}", "Shopee Sync Wrapper")
         raise
-
-    # Adjust metadata supaya tetap backward-compatible
     res["range_mode"] = False
     res["recent_mode"] = True
     res["from"] = time_from
