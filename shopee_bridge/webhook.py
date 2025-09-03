@@ -1569,3 +1569,100 @@ def dbg_verify_signature():
         "compare": results,
     }
 
+@frappe.whitelist()
+def get_shopee_return_list(page_no: int = 1, page_size: int = 20,
+                           create_time_from: int = None, create_time_to: int = None,
+                           update_time_from: int = None, update_time_to: int = None,
+                           status: str = None, negotiation_status: str = None,
+                           seller_proof_status: str = None, seller_compensation_status: str = None):
+    """
+    Call Shopee API /api/v2/returns/get_return_list and return the result.
+    """
+    import time
+    from frappe.utils import flt
+    s = frappe.get_single("Shopee Settings")
+    partner_id = str(s.partner_id).strip()
+    partner_key = (s.partner_key or "").strip()
+    shop_id = s.shop_id
+    access_token = s.access_token
+    path = "/api/v2/returns/get_return_list"
+    ts = int(time.time())
+
+    # Build signature base string
+    base_string = f"{partner_id}{path}{ts}{access_token}{shop_id}"
+    sign = hmac.new(partner_key.encode(), base_string.encode(), hashlib.sha256).hexdigest()
+
+    params = {
+        "partner_id": partner_id,
+        "timestamp": ts,
+        "access_token": access_token,
+        "shop_id": shop_id,
+        "sign": sign,
+        "page_no": int(page_no),
+        "page_size": int(page_size),
+    }
+    # Optional filters
+    if create_time_from: params["create_time_from"] = int(create_time_from)
+    if create_time_to: params["create_time_to"] = int(create_time_to)
+    if update_time_from: params["update_time_from"] = int(update_time_from)
+    if update_time_to: params["update_time_to"] = int(update_time_to)
+    if status: params["status"] = status
+    if negotiation_status: params["negotiation_status"] = negotiation_status
+
+    if seller_proof_status: params["seller_proof_status"] = seller_proof_status
+    if seller_compensation_status: params["seller_compensation_status"] = seller_compensation_status
+
+    # Use requests.get for Shopee GET API
+    import requests
+    url = f"{s.environment == 'Production' and 'https://partner.shopeemobile.com' or 'https://partner.test-stable.shopeemobile.com'}{path}"
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            data = resp.json()
+        else:
+            data = {"error": "HTTP", "message": resp.text}
+        return data
+    except Exception as e:
+        frappe.log_error(f"get_return_list failed: {e}", "Shopee Return List")
+        return {"error": "exception", "message": str(e)}
+
+@frappe.whitelist()
+def get_shopee_return_detail(return_sn: str):
+    """
+    Call Shopee API /api/v2/returns/get_return_detail for a specific return_sn.
+    """
+    import time
+    s = frappe.get_single("Shopee Settings")
+    partner_id = str(s.partner_id).strip()
+    partner_key = (s.partner_key or "").strip()
+    shop_id = s.shop_id
+    access_token = s.access_token
+    path = "/api/v2/returns/get_return_detail"
+    ts = int(time.time())
+
+    # Build signature base string
+    base_string = f"{partner_id}{path}{ts}{access_token}{shop_id}"
+    sign = hmac.new(partner_key.encode(), base_string.encode(), hashlib.sha256).hexdigest()
+
+    params = {
+        "partner_id": partner_id,
+        "timestamp": ts,
+        "access_token": access_token,
+        "shop_id": shop_id,
+        "sign": sign,
+        "return_sn": return_sn,
+    }
+
+    import requests
+    url = f"{s.environment == 'Production' and 'https://partner.shopeemobile.com' or 'https://partner.test-stable.shopeemobile.com'}{path}"
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            data = resp.json()
+        else:
+            data = {"error": "HTTP", "message": resp.text}
+        return data
+    except Exception as e:
+        frappe.log_error(f"get_return_detail failed: {e}", "Shopee Return Detail")
+        return {"error": "exception", "message": str(e)}
+
