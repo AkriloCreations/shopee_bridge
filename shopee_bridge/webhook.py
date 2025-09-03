@@ -791,42 +791,30 @@ def create_payment_entry_from_shopee(si_name: str, escrow: dict, net_amount: flo
         else:
             esc_n = _normalize_escrow_payload(escrow) or {}
         actual_net = flt(esc_n.get("net_amount") or esc_n.get("payout_amount") or net_amount)
+
         if actual_net <= 0:
-            # Fallback: create Journal Entry to clear SI if negative escrow/net (refund/return)
-            try:
-                abs_amount = abs(actual_net)
-                receivable = (frappe.db.get_value("Company", si.company, "default_receivable_account") or
-                              getattr(si, "debit_to", None) or
-                              frappe.db.get_value("Account", {"company": si.company, "account_type": "Receivable"}, "name"))
-                bank_acc = _get_or_create_bank_account("Shopee (Escrow)")
-                if not receivable or not bank_acc:
-                    frappe.logger().error(f"[PE Debug] {order_sn}: missing accounts for JE fallback receivable={receivable} bank={bank_acc}")
-                    return None
-                je = frappe.new_doc("Journal Entry")
-                je.voucher_type = "Credit Note"
-                je.posting_date = nowdate()
-                je.company = si.company
-                je.remark = f"Shopee Refund/Return for {order_sn} (Auto-created)"
-                # Credit Shopee bank, debit receivable
-                je.append("accounts", {
-                    "account": bank_acc,
-                    "credit_in_account_currency": abs_amount,
-                    "reference_type": "Sales Invoice",
-                    "reference_name": si.name,
-                })
-                je.append("accounts", {
-                    "account": receivable,
-                    "debit_in_account_currency": abs_amount,
-                    "reference_type": "Sales Invoice",
-                    "reference_name": si.name,
-                })
-                je.insert(ignore_permissions=True)
-                je.submit()
-                frappe.logger().info(f"[PE Debug] Created JE {je.name} for negative escrow/net {actual_net} on {order_sn}")
-                return je.name
-            except Exception as je_err:
-                frappe.log_error(f"JE fallback failed for {order_sn}: {je_err}", "Shopee PE Fallback JE")
-            frappe.logger().info(f"[PE Debug] {order_sn}: skip PE (actual_net={actual_net})")
+            # Use Shopee return API to fetch return details for this order
+            return_list = get_shopee_return_list(page_size=50, status="REFUND")
+            return_sn = None
+            if return_list and isinstance(return_list, dict):
+                for ret in return_list.get("response", {}).get("return_list", []):
+                    if ret.get("order_sn") == order_sn:
+                        return_sn = ret.get("return_sn")
+                        break
+            return_detail = None
+            if return_sn:
+                return_detail = get_shopee_return_detail(return_sn)
+                frappe.logger().info(f"[PE Debug] Shopee return detail for {order_sn}: {return_detail}")
+            # Use normalized payload for refund journal
+            norm_payload = esc_n.copy()
+            if return_detail and isinstance(return_detail, dict):
+                norm_payload.update(return_detail.get("response", {}))
+            # Create Credit Note (Sales Invoice Return) linked to SI
+            cn_name = create_refund_journal_from_shopee(si_name, norm_payload, order_sn)
+            if cn_name:
+                frappe.logger().info(f"[PE Debug] Created Credit Note {cn_name} for refund/return {order_sn}")
+                return cn_name
+            frappe.logger().info(f"[PE Debug] {order_sn}: skip PE (actual_net={actual_net}) - refund CN not created")
             return None
 
         # Determine payout timestamp (tanggal uang masuk). Prioritization:
@@ -1579,7 +1567,7 @@ def get_shopee_return_list(page_no: int = 1, page_size: int = 20,
     Call Shopee API /api/v2/returns/get_return_list and return the result.
     """
     import time
-    from frappe.utils import flt
+    from frappe.utils import flt # pyright: ignore[reportMissingImports]
     s = frappe.get_single("Shopee Settings")
     partner_id = str(s.partner_id).strip()
     partner_key = (s.partner_key or "").strip()

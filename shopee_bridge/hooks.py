@@ -67,7 +67,7 @@ app_include_js = [
 # ------------
 
 # before_install = "shopee_bridge.install.before_install"
-after_install = "shopee_bridge.setup.install.after_install"
+#after_install = "shopee_bridge.setup.install.after_install"
 
 # Uninstallation
 # ---------------
