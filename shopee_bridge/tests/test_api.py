@@ -4,12 +4,14 @@ import json
 import hmac
 import hashlib
 
+from shopee_bridge.shopee_bridge.utils import _settings
+
 class TestWebhookSignature(unittest.TestCase):
     def setUp(self):
         frappe.set_user("Administrator")
     
     def test_valid_signature(self):
-        from shopee_bridge.api import verify_webhook_signature, _settings
+        from shopee_bridge.api import verify_webhook_signature
         
         # Get actual webhook key
         s = _settings()
@@ -96,4 +98,6 @@ def test_webhook_verification():
     except Exception as e:
         frappe.log_error(f"Test webhook error: {str(e)}", "Shopee Test")
         return {"success": False, "error": str(e)}
+
+
 # Don't redefine the function here - it should be in api.py

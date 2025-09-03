@@ -1,7 +1,7 @@
-import frappe
+import frappe # pyright: ignore[reportMissingImports]
 from datetime import datetime, timedelta
-from .api import complete_order_to_si
 
+frappe.whitelist(allow_guest=True)
 def audit_shopee_orders_for_month(year: int, month: int, auto_fix: bool = True):
     """
     Audit and sync all Shopee orders for a given month.
@@ -11,6 +11,7 @@ def audit_shopee_orders_for_month(year: int, month: int, auto_fix: bool = True):
       - If missing, auto-fix (create) if auto_fix=True
     Returns a report of discrepancies and actions taken.
     """
+    from .orders import complete_order_to_si  # moved import here to avoid circular import
     # Calculate start/end date for the month
     start_date = datetime(year, month, 1)
     if month == 12:
