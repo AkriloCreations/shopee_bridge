@@ -1,0 +1,17 @@
+{
+  "doctype": "Shopee Webhook Inbox",
+  "fields": [
+    {"fieldname": "event_type", "fieldtype": "Data"},
+    {"fieldname": "source_env", "fieldtype": "Data"},
+    {"fieldname": "idempotency_key", "fieldtype": "Data", "unique": 1},
+    {"fieldname": "signature_valid", "fieldtype": "Check"},
+    {"fieldname": "status", "fieldtype": "Select", "options": "queued\nprocessing\ndone\nfailed\nskipped"},
+    {"fieldname": "attempts", "fieldtype": "Int"},
+    {"fieldname": "next_retry_at", "fieldtype": "Datetime"},
+    {"fieldname": "payload_hash", "fieldtype": "Data"},
+    {"fieldname": "payload_json", "fieldtype": "Text"},
+    {"fieldname": "error_message", "fieldtype": "Text"},
+    {"fieldname": "processed_at", "fieldtype": "Datetime"},
+    {"fieldname": "creation", "fieldtype": "Datetime"}
+  ]
+}

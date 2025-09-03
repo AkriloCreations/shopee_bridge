@@ -1,0 +1,27 @@
+{
+  "doctype": "Shopee Settings",
+  "name": "Shopee Settings",
+  "issingle": 1,
+  "fields": [
+    {"fieldname": "partner_id", "fieldtype": "Data"},
+    {"fieldname": "partner_key", "fieldtype": "Data"},
+    {"fieldname": "region", "fieldtype": "Data"},
+    {"fieldname": "redirect_url", "fieldtype": "Data"},
+    {"fieldname": "shop_id", "fieldtype": "Data"},
+    {"fieldname": "access_token", "fieldtype": "Data"},
+    {"fieldname": "refresh_token", "fieldtype": "Data"},
+    {"fieldname": "token_expires_at", "fieldtype": "Datetime"},
+    {"fieldname": "scopes", "fieldtype": "Data"},
+    {"fieldname": "oauth_state", "fieldtype": "Data"},
+    {"fieldname": "live_partner_push_key", "fieldtype": "Data"},
+    {"fieldname": "test_partner_push_key", "fieldtype": "Data"},
+    {"fieldname": "webhook_live_enabled", "fieldtype": "Check"},
+    {"fieldname": "webhook_test_enabled", "fieldtype": "Check"},
+    {"fieldname": "shopee_bank_account", "fieldtype": "Data"},
+    {"fieldname": "fee_account_uuid", "fieldtype": "Data"},
+    {"fieldname": "voucher_account_uuid", "fieldtype": "Data"},
+    {"fieldname": "delivery_protection_account_uuid", "fieldtype": "Data"},
+    {"fieldname": "shipping_diff_account_uuid", "fieldtype": "Data"},
+    {"fieldname": "last_auth_error", "fieldtype": "Data"}
+  ]
+}

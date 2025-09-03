@@ -1,0 +1,13 @@
+{
+  "doctype": "Shopee Sync Log",
+  "fields": [
+    {"fieldname": "job", "fieldtype": "Data"},
+    {"fieldname": "key", "fieldtype": "Data"},
+    {"fieldname": "status", "fieldtype": "Select", "options": "ok\nfail\nskip"},
+    {"fieldname": "payload_hash", "fieldtype": "Data"},
+    {"fieldname": "message", "fieldtype": "Text"},
+    {"fieldname": "started_at", "fieldtype": "Datetime"},
+    {"fieldname": "ended_at", "fieldtype": "Datetime"},
+    {"fieldname": "meta_json", "fieldtype": "Text"}
+  ]
+}

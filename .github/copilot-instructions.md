@@ -1,282 +1,228 @@
-# Copilot Instructions for Shopee Bridge
+# Shopee Bridge — Copilot Instruction
 
-This document guides AI assistants in wo## System Architecture
+You are generating a brand new ERPNext app named **shopee_bridge** that integrates Shopee Open Platform v2. 
+Your output must be production-ready skeletons with clear separation of concerns, idempotent writes, 
+and minimal side effects. Write clean, typed Python where possible and add rich docstrings.
 
-### 1. API Integration (`api.py`)
+## Architecture rules
+- App name: `shopee_bridge`
+- Python package layout must be:
+  shopee_bridge/
+    api.py                     # thin façade, whitelisted ERPNext endpoints
+    auth.py                    # OAuth v2, token store, HMAC signing, webhook verification
+    clients.py                 # signed HTTP GET/POST wrappers + 401 rotate
+    mappers.py                 # pure mappers: Shopee → ERPNext rows (no frappe writes)
+    services/
+      orders.py                # order pull/upsert + SO/SI/DN "ensure_*" functions
+      logistics.py             # shipping status + label attach
+      returns.py               # returns/refunds upsert + CN/SR creation
+      finance.py               # escrow fees patch + bank transaction + reconcile
+      fiscal.py                # full-year backfill orchestrator
+      webhook_handlers.py      # handle_order_push/return/logistics (idempotent)
+    jobs/
+      sync_orders.py           # cron incremental pulls (10m)
+      sync_shipping.py
+      sync_returns.py
+      sync_finance.py          # hourly escrow batch
+      process_webhook.py       # dispatcher + retry_due
+      reconcile_bank.py
+      backfill_fy.py
+    shopee_bridge/doctype/
+      shopee_settings/
+        shopee_settings.json   # Single doctype schema
+        shopee_settings.py     # server methods (connect/test/webhooks buttons)
+      shopee_webhook_inbox/
+        shopee_webhook_inbox.json
+        shopee_webhook_inbox.py
+      shopee_sync_log/
+        shopee_sync_log.json
+        shopee_sync_log.py
+    setup/install.py           # after_install → create Custom Fields & defaults
+    patches.txt
+    patches/add_custom_fields.py
+    hooks.py
+    config/desktop.py
+    config/docs.py
+    docs/workflow.md           # functional workflow (already provided by user)
 
-Core functions:
-```python
-def _call(path, partner_id, partner_key, shop_id=None, access_token=None, params=None):
-    """All API calls go through here. Debug by checking:
-    1. Request URL formation
-    2. Signature generation
-    3. Response handling"""
+- Do not put business logic in `api.py`. It must only validate input, call services/jobs and return JSON.
+- Each "ensure_*" function must be **idempotent**. Keys:
+  - Sales Order / Sales Invoice / Delivery Note: `shopee_order_sn`
+  - Return/Issue: `return_sn`
+  - Logistics: `package_number` or `tracking_number`
+  - Escrow patch: `(order_sn, payout_batch_id)`
+  - Webhook event: `event_id` if present else `sha1("{event_type}:{entity}:{status}:{update_time}")`
+- Never downgrade statuses (anti-regression). Compare `update_time` from Shopee against stored `last_pushed_update_time`.
+- Always catch and log errors into **Shopee Sync Log** and **Shopee Webhook Inbox**.
 
-def _settings():
-    """Central settings access. Debug configuration issues here"""
+## Shopee API endpoints (v2)
+BASE (prod): https://partner.shopeemobile.com
+BASE (test): https://partner.test-stable.shopeemobile.com
 
-def _base():
-    """API URL based on environment. Check Test vs Production URLs"""
-```
+OAuth:
+- GET  /api/v2/shop/auth_partner
+- POST /api/v2/auth/token/get
+- POST /api/v2/auth/token/refresh
 
-Common error points:
-- Signature mismatch
-- Token expiration
-- API rate limits
-- Network timeouts
+Orders:
+- GET  /api/v2/order/get_order_list
+- GET  /api/v2/order/get_order_detail
 
-### 2. Document Creation
+Finance:
+- GET  /api/v2/payment/get_escrow_detail
 
-Order Documents:
-```python
-def _process_order_to_so(order_sn):
-    """Debug points:
-    1. Order detail API response
-    2. Customer mapping
-    3. Item resolution
-    4. Stock validation"""
+Logistics:
+- GET  /api/v2/logistics/get_channel_list
+- GET  /api/v2/logistics/get_shipping_parameter
+- POST /api/v2/logistics/ship_order
+- GET  /api/v2/logistics/get_tracking_number
+- GET  /api/v2/logistics/get_shipping_document_parameter
+- GET  /api/v2/logistics/get_shipping_document
+- GET  /api/v2/logistics/download_shipping_document
 
-def _process_order_to_si(order_sn):
-    """Similar to SO but adds:
-    1. Payment entry creation
-    2. Stock update handling"""
-```
+Products/Media:
+- POST /api/v2/media_space/upload_image
+- POST /api/v2/media_space/init_video_upload
+- POST /api/v2/media_space/upload_video_part
+- POST /api/v2/media_space/complete_video_upload
+- GET  /api/v2/media_space/get_video_upload_result
+- GET  /api/v2/product/get_category
+- GET  /api/v2/product/get_attributes
+- GET  /api/v2/product/get_brand_list
+- GET  /api/v2/product/get_dts_limit
+- POST /api/v2/product/init_tier_variation
+- POST /api/v2/product/add_item
+- POST /api/v2/product/update_size_chart
 
-Item Management:
-```python
-def _match_or_create_item(it, rate):
-    """Debug points:
-    1. SKU matching logic
-    2. Item creation fallbacks
-    3. Custom field mapping"""
-```
+Returns:
+- GET  /api/v2/returns/get_return_list
+- GET  /api/v2/returns/get_return_detail
+- GET  /api/v2/returns/get_available_solution
+- POST /api/v2/returns/offer
+- POST /api/v2/returns/accept_offer
+- POST /api/v2/returns/dispute
+- POST /api/v2/returns/upload_proof
+- POST /api/v2/returns/confirm
 
-### 3. Data Migration
+Webhooks (Push Management):
+- ERP endpoints to expose:
+  - POST `/api/method/shopee_bridge.api.webhook_live`
+  - POST `/api/method/shopee_bridge.api.webhook_test`
+- Verify signature header (e.g., `X-Shopee-Signature`) using HMAC-SHA256 over **raw body** with push key (live/test).
+- Validate timestamp drift ≤ 300s if timestamp header exists.
+- Write an Inbox record with `status=queued` then quickly return 200. Do processing async.
 
-Migration Control:
-```python
-def migrate_completed_orders_execute(start_date, end_date, batch_size=50):
-    """Debug points:
-    1. Migration mode settings
-    2. Batch processing
-    3. Error handling per batch"""
-```
+## Doctypes & custom fields
+- Shopee Settings (Single):
+  partner_id, partner_key, region, redirect_url, shop_id,
+  access_token, refresh_token, token_expires_at, scopes, oauth_state,
+  live_partner_push_key, test_partner_push_key, webhook_live_enabled, webhook_test_enabled,
+  shopee_bank_account, fee_account_uuid, voucher_account_uuid, delivery_protection_account_uuid, shipping_diff_account_uuid,
+  last_auth_error
+- Shopee Webhook Inbox (Standard):
+  event_type, source_env, idempotency_key (Unique), signature_valid, status (queued|processing|done|failed|skipped),
+  attempts, next_retry_at, payload_hash, payload_json, error_message, processed_at, creation
+- Shopee Sync Log (Standard):
+  job, key, status (ok|fail|skip), payload_hash, message, started_at, ended_at, meta_json
+- Add Custom Fields to core doctypes:
+  - Sales Order: shopee_order_sn (Unique, Index), buyer_user_id, shopee_sync_hash, last_pushed_update_time
+  - Sales Invoice: shopee_order_sn (Unique, Index), escrow_synced (Check), escrow_synced_at, escrow_fee_total, escrow_net, payout_batch_id, last_pushed_update_time
+  - Delivery Note: shopee_order_sn, package_number, tracking_number (Index), status_pickup, status_delivery, delivered_at
+  - Customer Issue (optional): return_sn (Unique, Index), shopee_payload_json
 
-Common Issues:
-- Duplicate prevention
-- Stock update conflicts 
-- Database deadlocksee Bridge codebase, an ERPNext integration for Shopee e-commerce platform.
+## Required functions per file (stubs to generate)
 
-## Debug Guide by Function
+auth.py
+- build_authorize_url(scopes: list[str]) -> str
+- handle_oauth_callback(params: dict) -> None
+- exchange_code_for_token(code: str, shop_id: str|int) -> dict
+- refresh_if_needed(buffer_seconds: int = 600) -> bool
+- refresh_token_via_api() -> dict
+- sign_request(path: str, params: dict, body: bytes|str|None) -> dict
+- verify_webhook_signature(path: str, raw_body: bytes, headers: dict, push_key: str) -> bool
+- schedule_token_renewal_cron() -> dict
 
-### 1. OAuth Flow Debugging
+clients.py
+- http_get(path: str, params: dict) -> dict
+- http_post(path: str, json: dict|None = None, files: dict|None = None) -> dict
+- rotate_on_401(send_callable: callable) -> dict
 
-```mermaid
-graph TD
-    A[connect_url] -->|Generate URL| B[User Authorization]
-    B --> C[oauth_callback]
-    C -->|Exchange code| D[exchange_code]
-    D -->|Store tokens| E[ShopeeSettings]
-```
+services/orders.py
+- get_order_list(time_from: int, time_to: int, status: str|None, page_size: int = 100) -> list[str]
+- get_order_detail(order_sn_list: list[str]) -> list[dict]
+- ensure_customer_and_addresses(order: dict) -> tuple[str, str]
+- upsert_sales_order(order: dict) -> str
+- ensure_sales_invoice_for_paid(so_name: str, order: dict) -> str
+- ensure_delivery_note_for_ready(so_or_si: str, order: dict) -> str
+- on_completed(order_sn: str) -> None
+- sync_incremental_orders(updated_since_minutes: int = 15) -> dict
 
-Debug points:
-1. URL Generation (`connect_url`):
-   - Check partner_id and partner_key in Shopee Settings
-   - Verify signature generation in `_sign()`
-   - Validate redirect URL configuration
+services/logistics.py
+- get_shipping_parameter(order_sn: str) -> dict
+- ship_order(order_sn: str, method: str, params: dict) -> dict
+- get_tracking_number(order_sn: str) -> str
+- get_shipping_document_parameter(order_sn: str) -> dict
+- get_shipping_document(order_sn: str) -> dict
+- download_shipping_document(doc_id: str) -> bytes
+- attach_shipping_label(dn_name: str, pdf_bytes: bytes, filename: str) -> None
+- update_tracking_status(dn_name: str, status_payload: dict) -> bool
+- sync_shipping_status(updated_since_minutes: int = 30) -> dict
 
-2. Token Exchange (`oauth_callback`, `exchange_code`):
-   - Log request/response in `_call()`
-   - Check error responses from Shopee API
-   - Verify token storage in settings
+services/returns.py
+- get_return_list(time_from: int, time_to: int, status: str|None) -> list[str]
+- get_return_detail(return_sn: str) -> dict
+- get_available_solution(return_sn: str) -> list[dict]
+- offer_solution(return_sn: str, solution: dict) -> dict
+- accept_offer(return_sn: str) -> dict
+- raise_dispute(return_sn: str, reason: str) -> dict
+- upload_proof(return_sn: str, files: list[bytes]) -> dict
+- confirm_return(return_sn: str) -> dict
+- upsert_customer_issue_from_return(payload: dict) -> str
+- create_sales_return_or_credit_note(issue_name: str) -> str
+- close_return_case(issue_name: str) -> None
+- sync_returns_incremental(updated_since_minutes: int = 30) -> dict
 
-3. Token Refresh (`refresh_if_needed`):
-   - Monitor token expiration via `token_expire_at`
-   - Check refresh token validity
-   - Verify new token storage
+services/finance.py
+- get_escrow_detail(order_sn: str) -> dict
+- patch_invoice_with_fees(escrow: dict) -> str
+- ensure_bank_transaction_from_escrow(escrow: dict) -> str
+- sync_escrow_for_order(order_sn: str) -> dict
+- sync_escrow_for_completed_orders(min_age_hours: int = 3, limit: int = 200) -> dict
+- reconcile_bank_strict(days_back: int = 2) -> dict
+- finance_backfill_range(start: str, end: str) -> dict
 
-### 2. Order Processing Flow
+services/fiscal.py
+- run_fiscal_year_full_sync(company: str, fiscal_year_name: str) -> dict
+- backfill_orders_for_range(start: str, end: str, chunk_days: int = 7) -> dict
+- backfill_returns_for_range(start: str, end: str, chunk_days: int = 7) -> dict
+- backfill_shipping_for_range(start: str, end: str, chunk_days: int = 7) -> dict
+- backfill_finance_for_range(start: str, end: str, min_age_hours: int = 3, chunk_days: int = 7) -> dict
+- reconcile_bank_for_range(start: str, end: str) -> dict
+- generate_integrity_report(start: str, end: str) -> str
 
-```mermaid
-graph TD
-    A[Webhook/Sync] -->|order_sn| B[_process_order]
-    B -->|use_sales_order_flow=1| C[_process_order_to_so]
-    B -->|use_sales_order_flow=0| D[_process_order_to_si]
-    C --> E[Create SO]
-    D --> F[Create SI]
-    F --> G[Create Payment]
-```
+services/webhook_handlers.py
+- handle_order_push(event: dict, env: str) -> None
+- handle_return_push(event: dict, env: str) -> None
+- handle_logistics_push(event: dict, env: str) -> None
 
-Debug points:
-1. Order Detection:
-   - Webhook payload in `webhook_handler`
-   - Sync parameters in `sync_recent_orders`
-   - Order status filtering
+jobs/process_webhook.py
+- run(inbox: str) -> None
+- retry_due() -> dict
+- derive_idempotency_key(event: dict) -> str
 
-2. Order Processing:
-   - Order details API response
-   - Customer creation/mapping
-   - Item code resolution
-   - Stock availability checks
+api.py (whitelisted)
+- connect_to_shopee(scopes: list[str]) -> str
+- oauth_callback(**params) -> dict
+- test_shopee_connection() -> dict
+- webhook_live() -> dict
+- webhook_test() -> dict
+- sync_orders_api(minutes: int = 15) -> dict
+- sync_finance_api() -> dict
 
-3. Document Creation:
-   - Duplicate prevention via po_no
-   - Item creation fallbacks
-   - Payment entry creation
-
-### 3. Item Sync Flow
-
-```mermaid
-graph TD
-    A[sync_items] -->|Get items| B[Get Item Base Info]
-    B --> C[Get Model List]
-    C -->|For each variant| D[_match_or_create_item]
-    D -->|Update| E[Update Item + Price]
-```
-
-Debug points:
-1. API Calls:
-   - Base item info response
-   - Model/variant details
-   - Price information
-
-2. Item Creation:
-   - SKU generation logic
-   - Mapping fields update
-   - Price list updates
-
-## Project Overview
-
-### 1. API Layer (`api.py`)
-- Core API interaction with Shopee using `_call()` helper
-- OAuth2 flow handled by `connect_url()` and `oauth_callback()`
-- Order processing via `_process_order()` which routes to either:
-  - `_process_order_to_so()` for Sales Order flow
-  - `_process_order_to_si()` for direct Sales Invoice flow
-
-### 2. Settings (`shopee_bridge/doctype/shopee_settings/`)
-- Stores credentials and configuration
-- Key fields: partner_id, partner_key, shop_id, environment
-- Controls flow selection via `use_sales_order_flow`
-- Migration mode settings for historical data import
-
-### 3. Webhooks (`webhook.py`)
-- Handles real-time order updates from Shopee
-- Creates payment entries automatically
-- Logs webhook data for debugging
-
-## Troubleshooting Guides
-
-### 1. API Connection Issues
-
-Check in sequence:
-```python
-# 1. Settings validation
-s = _settings()
-if not s.partner_id or not s.partner_key:
-    # Configuration incomplete
-
-# 2. API URL formation
-base_url = _base()  # Check environment setting
-
-payload = f"{partner_id}{path}{ts}{access_token or ''}{shop_id or ''}"
-sign = _sign(partner_key, payload)  # Compare with Shopee's error message
-
-# 4. Response handling in _call()
-if data.get("error"):
-    # Check error code and message
-```
-
-### 2. Order Sync Problems
-
-Debug flow:
-```python
-# 1. Check webhook reception
-@frappe.whitelist(allow_guest=True)
-def webhook_handler():
-    # Verify signature
-    # Extract order_sn
-
-# 2. Verify order processing
-def _process_order(order_sn):
-    # Monitor API calls
-
-# 3. Document creation issues
-def _create_or_get_customer(order_detail):
-    # Item resolution
-    # Fallback creation
-```
-### 3. Migration Debugging
-
-Key points:
-```python
-# 1. Migration mode check
-s.migration_cutoff_date = frappe.utils.today()
-# 2. Batch processing monitoring
-def migrate_completed_orders_execute():
-    # Log errors separately
-    # Monitor performance
-
-# 3. Stock updates
-else:
-    # Normal stock flow
-```
-1. Setup:
-```bash
-cd $BENCH_DIR
-bench install-app shopee_bridge
-```
-
-- Pre-commit hooks for formatting (ruff, eslint, prettier)
-- Run `pre-commit install` in the repo root
-
-- Unit tests in `tests/` directory
-- Test webhooks via `test_webhook()` function
-
-## Common Integration Points
-1. ERPNext Doctypes:
-- Sales Order
-- Sales Invoice
-- Item
-- Customer
-- Payment Entry
-
-2. Shopee API Endpoints:
-- `/api/v2/shop/auth_partner` - OAuth
-- `/api/v2/order/get_order_detail` - Order fetching
-- `/api/v2/payment/get_escrow_detail` - Payment processing
-
-## Error Handling Patterns
-
-1. Use `_short_log()` for concise error logging:
-```python
-_short_log(f"Failed to process order {order_sn}: {e}", "Shopee Order Processing")
-```
-
-2. Implement retries for database operations:
-```python
-_insert_submit_with_retry(doc, max_tries=3, sleep_base=1.0)
-```
-
-## Migration Utilities
-
-- `migrate_completed_orders_execute()` - Batch migration with migration mode
-- Toggle migration mode to control stock updates
-- Use `migration_cutoff_date` for historical data
-
-## Scheduling
-
-Configured in `hooks.py`:
-```python
-scheduler_events = {
-    "cron": {
-        "*/15 * * * *": [
-            "shopee_bridge.api.scheduled_token_refresh",
-            "shopee_bridge.api.scheduled_order_sync"
-        ],
-        "0 2 * * *": [
-            "shopee_bridge.api.scheduled_item_sync"
-        ]
-    }
-}
-```
+## Acceptance Criteria (each file)
+- All functions exist with complete docstrings (purpose, params, returns, idempotency notes, raises).
+- No business logic in api.py; services & jobs are imported and called.
+- Webhook endpoints: insert Shopee Webhook Inbox row, enqueue job, return 200 quickly.
+- Every ERP write uses deterministic keys & "ensure_*" patterns to be idempotent.
+- Logging: create helper to write Shopee Sync Log records with payload hash SHA1.
+- Add TODO markers where implementation specifics are needed (mapping, field names).
