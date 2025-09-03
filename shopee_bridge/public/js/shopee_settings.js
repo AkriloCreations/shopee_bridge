@@ -16,7 +16,63 @@ frappe.ui.form.on('Shopee Settings', {
         frm.add_custom_button(__('Migrate Orders (Backfill)'), () => open_migrate_dialog(frm), __('Sync Actions'));
         frm.add_custom_button(__('Sync Items'), () => sync_shopee_items(frm), __('Sync Actions'));
         frm.add_custom_button(__('Sync Status'), () => get_sync_status(frm), __('Sync Actions'));
+  frm.add_custom_button(__('Audit Shopee Orders (Month)'), () => audit_shopee_orders_dialog(frm), __('Sync Actions'));
       }
+/* AUDIT SHOPEE ORDERS */
+function audit_shopee_orders_dialog(frm) {
+  const d = new frappe.ui.Dialog({
+    title: __('Audit Shopee Orders for Month'),
+    fields: [
+      { fieldtype: 'Int', fieldname: 'year', label: 'Year', reqd: 1, default: new Date().getFullYear() },
+      { fieldtype: 'Select', fieldname: 'month', label: 'Month', reqd: 1,
+        options: [
+          { label: 'January', value: 1 },
+          { label: 'February', value: 2 },
+          { label: 'March', value: 3 },
+          { label: 'April', value: 4 },
+          { label: 'May', value: 5 },
+          { label: 'June', value: 6 },
+          { label: 'July', value: 7 },
+          { label: 'August', value: 8 },
+          { label: 'September', value: 9 },
+          { label: 'October', value: 10 },
+          { label: 'November', value: 11 },
+          { label: 'December', value: 12 }
+        ],
+        default: new Date().getMonth() + 1
+      },
+      { fieldtype: 'Check', fieldname: 'auto_fix', label: 'Auto-fix missing SI/PE', default: 1 }
+    ],
+    primary_action_label: __('Run Audit'),
+    primary_action(values) {
+      frappe.show_progress(__('Auditing Shopee Orders...'), 40, 100, 'Please wait');
+      frappe.call({
+        method: "shopee_bridge.api.audit_shopee_orders_for_month",
+        args: {
+          year: values.year,
+          month: parseInt(values.month, 10),
+          auto_fix: !!values.auto_fix
+        },
+        callback(r) {
+          frappe.hide_progress();
+          const report = r.message || [];
+          let html = `<div class='alert alert-info'><strong>Audit Results:</strong><br><table class='table table-bordered'><thead><tr><th>Order SN</th><th>SO</th><th>SI</th><th>PE</th><th>Auto-Fixed</th></tr></thead><tbody>`;
+          for (const row of report) {
+            html += `<tr><td>${row.order_sn}</td><td>${row.sales_order}</td><td>${row.sales_invoice || '-'}</td><td>${row.payment_entry_exists ? '✔️' : '❌'}</td><td>${row.auto_fixed ? '✔️' : '-'}</td></tr>`;
+          }
+          html += '</tbody></table></div>';
+          frappe.msgprint({ title: __('Audit Shopee Orders'), message: html, wide: 1 });
+        },
+        error(r) {
+          frappe.hide_progress();
+          frappe.msgprint({ title: __('Audit Failed'), message: r.message || 'Server error', indicator: 'red' });
+        }
+      });
+      d.hide();
+    }
+  });
+  d.show();
+}
 
       if (frm.doc.use_sales_order_flow) {
         frm.add_custom_button(__('Make DN + SI (by Order SN)'), () => make_dn_si_prompt(frm), __('Phase 2'));
