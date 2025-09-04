@@ -1,140 +1,171 @@
+# shopee_bridge/setup/install.py
+
 from frappe import _
 import frappe
+import json
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
-def after_install():
-    """
-    Post-install hook for Shopee Bridge app.
+# Field types yang wajib string/JSON (bukan None)
+TEXTY = {
+    "Data", "Small Text", "Text", "Long Text", "Text Editor",
+    "Markdown Editor", "HTML Editor", "Link", "Select", "Code", "JSON"
+}
 
-    Tasks:
-    1. Ensure Shopee Settings Single doctype exists (auto-created on first save).
-    2. Create required Custom Fields on core doctypes if not present.
-    3. Print a clear success message.
 
-    Idempotency:
-    - Custom fields are only created if missing.
-    - No duplicate writes.
+def has_field(doctype: str, fieldname: str) -> bool:
+    """Cek apakah sebuah field ada pada skema doctype (lintas-versi)."""
+    return any(df.fieldname == fieldname for df in frappe.get_meta(doctype).fields)
 
-    Raises:
-        Logs errors to frappe.log_error and prints failure message.
-    """
-    # Custom fields to add to core doctypes
-    custom_fields = {
-        "Sales Order": [
-            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1, idx=1, insert_after="order_id"),
-            dict(fieldname="buyer_user_id", label="Shopee Buyer User ID", fieldtype="Data", insert_after="shopee_order_sn"),
-            dict(fieldname="buyer_username", label="Shopee Buyer Username", fieldtype="Data", insert_after="buyer_user_id"),
-            dict(fieldname="shopee_sync_hash", label="Shopee Sync Hash", fieldtype="Data", insert_after="buyer_user_id"),
-            dict(fieldname="last_pushed_update_time", label="Shopee Last Pushed Update Time", fieldtype="Datetime", insert_after="shopee_sync_hash"),
-        ],
-        "Sales Invoice": [
-            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1, idx=1, insert_after="order_id"),
-            dict(fieldname="escrow_synced", label="Shopee Escrow Synced", fieldtype="Check", insert_after="shopee_order_sn"),
-            dict(fieldname="escrow_synced_at", label="Shopee Escrow Synced At", fieldtype="Datetime", insert_after="escrow_synced"),
-            dict(fieldname="escrow_fee_total", label="Shopee Escrow Fee Total", fieldtype="Currency", insert_after="escrow_synced_at"),
-            dict(fieldname="escrow_net", label="Shopee Escrow Net", fieldtype="Currency", insert_after="escrow_fee_total"),
-            dict(fieldname="payout_batch_id", label="Shopee Payout Batch ID", fieldtype="Data", insert_after="escrow_net"),
-            dict(fieldname="last_pushed_update_time", label="Shopee Last Pushed Update Time", fieldtype="Datetime", insert_after="payout_batch_id"),
-        ],
-        "Delivery Note": [
-            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", idx=1, insert_after="order_id"),
-            dict(fieldname="package_number", label="Shopee Package Number", fieldtype="Data", idx=1, insert_after="shopee_order_sn"),
-            dict(fieldname="tracking_number", label="Shopee Tracking Number", fieldtype="Data", idx=1, insert_after="package_number"),
-            dict(fieldname="status_pickup", label="Shopee Pickup Status", fieldtype="Data", insert_after="tracking_number"),
-            dict(fieldname="status_delivery", label="Shopee Delivery Status", fieldtype="Data", insert_after="status_pickup"),
-            dict(fieldname="delivered_at", label="Shopee Delivered At", fieldtype="Datetime", insert_after="status_delivery"),
-        ],
-    }
 
-    try:
-        # Shopee Settings Single doctype: nothing to do, auto-created on first save
+def sanitize_doc_strings(doc) -> bool:
+    """Pastikan SEMUA field teks/JSON (termasuk child) tidak None."""
+    meta = frappe.get_meta(doc.doctype)
+    changed = False
 
-        # Create custom fields (skip errors)
-        try:
-            create_custom_fields(custom_fields, update=True)
-        except Exception as cf_err:
-            frappe.log_error(message=str(cf_err), title="Shopee Bridge custom fields error")
+    # parent fields
+    for df in meta.fields:
+        if df.fieldtype in TEXTY:
+            val = getattr(doc, df.fieldname, None)
+            if val is None:
+                setattr(doc, df.fieldname, "[]" if df.fieldtype == "JSON" else "")
+                changed = True
+        elif df.fieldtype in ("Table", "Table MultiSelect"):
+            rows = doc.get(df.fieldname) or []
+            if not rows:
+                continue
+            child_meta = frappe.get_meta(df.options)
+            for row in rows:
+                for cdf in child_meta.fields:
+                    if cdf.fieldtype in TEXTY and row.get(cdf.fieldname) is None:
+                        row.set(cdf.fieldname, "[]" if cdf.fieldtype == "JSON" else "")
+                        changed = True
 
-        # Sanitize existing Workspace documents
-        import json
+    return changed
 
-        TEXTY = {"Data","Small Text","Text","Long Text","Text Editor","Markdown Editor","HTML Editor","Link","Select","Code","JSON"}
 
-        def has_field(doctype, fieldname):
-            meta = frappe.get_meta(doctype)
-            return any(df.fieldname == fieldname for df in meta.fields)
+def ensure_module_def(mod_name: str):
+    """Pastikan Module Def ada (dipakai Workspace/Desk)."""
+    if not frappe.db.exists("Module Def", {"name": mod_name}):
+        frappe.get_doc({
+            "doctype": "Module Def",
+            "module_name": mod_name,
+            "custom": 1
+        }).insert(ignore_permissions=True)
 
-        def sanitize_doc(doctype, name):
-            meta = frappe.get_meta(doctype)
-            doc = frappe.get_doc(doctype, name)
-            changed = False
-            # Critical fields
-            if has_field(doctype, "label") and not (doc.get("label") or "").strip():
-                doc.label = doc.name; changed = True
-            if has_field(doctype, "content") and doc.get("content") is None:
-                doc.content = "[]"; changed = True
-            if has_field(doctype, "description") and doc.get("description") is None:
-                doc.description = ""; changed = True
-            if has_field(doctype, "icon") and doc.get("icon") is None:
-                doc.icon = ""; changed = True
-            # Sanitize text fields
-            for df in meta.fields:
-                if df.fieldtype in TEXTY and getattr(doc, df.fieldname, None) is None:
-                    setattr(doc, df.fieldname, "[]" if df.fieldtype == "JSON" else "")
-                    changed = True
-                elif df.fieldtype in ("Table", "Table MultiSelect"):
-                    rows = doc.get(df.fieldname) or []
-                    if rows:
-                        child_meta = frappe.get_meta(df.options)
-                        for row in rows:
-                            for cdf in child_meta.fields:
-                                if cdf.fieldtype in TEXTY and row.get(cdf.fieldname) is None:
-                                    row.set(cdf.fieldname, "[]" if cdf.fieldtype == "JSON" else "")
-                                    changed = True
-            if changed:
-                doc.save(ignore_permissions=True)
-            return changed
 
-        fixed = 0
-        for nm in frappe.get_all("Workspace", pluck="name"):
-            try:
-                if sanitize_doc("Workspace", nm):
-                    fixed += 1
-            except Exception:
-                pass
-        frappe.db.commit()
+def ensure_workspace(mod_name: str, ws_name: str):
+    """Buat/perbarui Workspace secara aman lintas-versi."""
+    dt = "Workspace"
+    ws = frappe.get_doc(dt, ws_name) if frappe.db.exists(dt, ws_name) else frappe.new_doc(dt)
+    if not ws.get("name"):
+        ws.name = ws_name
+        ws.flags.name_set = True
 
-    # Ensure Module Def exists for menu
-        MOD = "Shopee Bridge"
-        if not frappe.db.exists("Module Def", {"name": MOD}):
-            frappe.get_doc({"doctype": "Module Def", "module_name": MOD, "custom": 1}).insert(ignore_permissions=True)
-            frappe.db.commit()
+    # Versi terbaru mewajibkan 'title'; beberapa versi pakai 'label'
+    if has_field(dt, "title") and not (ws.get("title") or "").strip():
+        ws.title = mod_name or ws_name
+    if has_field(dt, "label") and not (ws.get("label") or "").strip():
+        ws.label = mod_name or ws_name
 
-        # Create or update Workspace for Shopee Bridge
-        NAME = "Shopee Bridge"
-        if frappe.db.exists("Workspace", NAME):
-            ws = frappe.get_doc("Workspace", NAME)
-        else:
-            ws = frappe.new_doc("Workspace")
-            ws.name = NAME
-            ws.flags.name_set = True
-        ws.label = MOD
-        ws.module = MOD
-        ws.category = "Modules"
+    if has_field(dt, "module"):
+        ws.module = mod_name
+    if has_field(dt, "public"):
         ws.public = 1
+    if has_field(dt, "is_hidden"):
         ws.is_hidden = 0
+    if has_field(dt, "description") and ws.get("description") is None:
         ws.description = ""
+    if has_field(dt, "icon") and ws.get("icon") is None:
         ws.icon = ""
+
+    # Konten minimal (shortcut) — hanya jika field ada
+    if has_field(dt, "content"):
         ws.content = json.dumps([
             {"type": "shortcut", "label": "Shopee", "items": [
                 {"label": "Shopee Settings", "type": "DocType", "link_to": "DocType/Shopee Settings"}
             ]}
         ])
-        ws.save(ignore_permissions=True)
-        frappe.db.commit()
 
-        # Success message
-        print(_("Shopee Bridge install: Custom fields and workspace ensured."))
-    except Exception as e:
-        frappe.log_error(message=str(e), title="Shopee Bridge after_install error")
-        print(_("Shopee Bridge install failed: {0}").format(e))
+    # Guard terakhir: tidak ada field teks/JSON yang None
+    sanitize_doc_strings(ws)
+    ws.save(ignore_permissions=True)
+
+
+def after_install():
+    """Idempotent post-install: create custom fields, ensure module/workspace, seed empty Shopee Settings.
+
+    Requirements (per user request):
+    - Use the exact custom fields spec from patch add_custom_fields.execute() plus buyer_username for Sales Order.
+    - Ignore duplicates / safely retryable.
+    - Optionally create single doctype record Shopee Settings with blank token fields if missing.
+    - Print clear completion message.
+    """
+
+    # Copy from patches/add_custom_fields.py (kept aligned) + buyer_username insertion.
+    fields = {
+        "Sales Order": [
+            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", insert_after="title", unique=1, reqd=0, in_standard_filter=1),
+            dict(fieldname="buyer_user_id", label="Shopee Buyer User ID", fieldtype="Data", insert_after="shopee_order_sn"),
+            dict(fieldname="buyer_username", label="Shopee Buyer Username", fieldtype="Data", insert_after="buyer_user_id"),
+            dict(fieldname="shopee_sync_hash", label="Shopee Sync Hash", fieldtype="Data"),
+            dict(fieldname="last_pushed_update_time", label="Shopee Last Pushed Update Time", fieldtype="Datetime"),
+        ],
+        "Sales Invoice": [
+            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1, in_standard_filter=1),
+            dict(fieldname="escrow_synced", label="Shopee Escrow Synced", fieldtype="Check", default=0),
+            dict(fieldname="escrow_synced_at", label="Shopee Escrow Synced At", fieldtype="Datetime"),
+            dict(fieldname="escrow_fee_total", label="Shopee Fee Total", fieldtype="Currency"),
+            dict(fieldname="escrow_net", label="Shopee Net Payout", fieldtype="Currency"),
+            dict(fieldname="payout_batch_id", label="Shopee Payout Batch ID", fieldtype="Data"),
+            dict(fieldname="last_pushed_update_time", label="Shopee Last Pushed Update Time", fieldtype="Datetime"),
+        ],
+        "Delivery Note": [
+            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", in_standard_filter=1),
+            dict(fieldname="package_number", label="Shopee Package Number", fieldtype="Data", in_standard_filter=1),
+            dict(fieldname="tracking_number", label="Shopee Tracking Number", fieldtype="Data", in_standard_filter=1),
+            dict(fieldname="status_pickup", label="Shopee Pickup Status", fieldtype="Data"),
+            dict(fieldname="status_delivery", label="Shopee Delivery Status", fieldtype="Data"),
+            dict(fieldname="delivered_at", label="Shopee Delivered At", fieldtype="Datetime"),
+        ],
+    }
+
+    mod = "Shopee Bridge"
+
+    try:
+        # 1. Custom fields (ignore validation to avoid break on existing)
+        try:
+            create_custom_fields(fields, ignore_validate=True)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Shopee Bridge create_custom_fields")
+
+        # 2. Ensure Module & Workspace (for Desk visibility)
+        try:
+            ensure_module_def(mod)
+            ensure_workspace(mod, mod)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Shopee Bridge ensure workspace")
+
+        # 3. Seed single Shopee Settings doc with empty token fields if not existing
+        try:
+            if not frappe.db.exists("Shopee Settings"):
+                doc = frappe.get_doc({
+                    "doctype": "Shopee Settings",
+                    "partner_id": 0,
+                    "partner_key": "",
+                    "region": "",
+                    "redirect_url": "",
+                    "access_token": "",
+                    "refresh_token": "",
+                    "token_expires_at": None,
+                })
+                sanitize_doc_strings(doc)
+                doc.insert(ignore_permissions=True)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Shopee Bridge seed Shopee Settings")
+
+        frappe.db.commit()
+        print("[Shopee Bridge] Install complete: custom fields, workspace & defaults ensured.")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Shopee Bridge after_install fatal")
+        print("[Shopee Bridge] Install encountered errors. Check Error Log.")
+        raise
