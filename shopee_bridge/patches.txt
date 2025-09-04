@@ -1,4 +1,1 @@
-shopee_bridge.patches.add_custom_fields
-shopee_bridge.patches.0001_setup_defaults_and_custom_fields
-shopee_bridge.patches.0002_sync_workspace_and_doctypes
-shopee_bridge.patches.0003_fix_module_mapping
+shopee_bridge.patches.0001_bootstrap

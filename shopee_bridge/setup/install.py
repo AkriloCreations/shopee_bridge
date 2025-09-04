@@ -1,42 +1,50 @@
 # shopee_bridge/setup/install.py
 
-from frappe import _
-import frappe
+from __future__ import annotations
+
 import json
+import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 # Field types yang wajib string/JSON (bukan None)
 TEXTY = {
     "Data", "Small Text", "Text", "Long Text", "Text Editor",
-    "Markdown Editor", "HTML Editor", "Link", "Select", "Code", "JSON"
+    "Markdown Editor", "HTML Editor", "Link", "Select", "Code", "JSON",
 }
 
 
 def has_field(doctype: str, fieldname: str) -> bool:
     """Cek apakah sebuah field ada pada skema doctype (lintas-versi)."""
-    return any(df.fieldname == fieldname for df in frappe.get_meta(doctype).fields)
+    try:
+        return any(df.fieldname == fieldname for df in frappe.get_meta(doctype).fields)
+    except Exception:
+        return False
 
 
 def sanitize_doc_strings(doc) -> bool:
     """Pastikan SEMUA field teks/JSON (termasuk child) tidak None."""
-    meta = frappe.get_meta(doc.doctype)
     changed = False
+    meta = frappe.get_meta(doc.doctype)
 
     # parent fields
     for df in meta.fields:
         if df.fieldtype in TEXTY:
-            val = getattr(doc, df.fieldname, None)
+            val = doc.get(df.fieldname)
             if val is None:
-                setattr(doc, df.fieldname, "[]" if df.fieldtype == "JSON" else "")
+                doc.set(df.fieldname, "[]" if df.fieldtype == "JSON" else "")
                 changed = True
+
         elif df.fieldtype in ("Table", "Table MultiSelect"):
             rows = doc.get(df.fieldname) or []
             if not rows:
                 continue
-            child_meta = frappe.get_meta(df.options)
+            try:
+                child_meta = frappe.get_meta(df.options)
+            except Exception:
+                continue
             for row in rows:
                 for cdf in child_meta.fields:
-                    if cdf.fieldtype in TEXTY and row.get(cdf.fieldname) is None:
+                    if cdf.fieldtype in TEXTY and (row.get(cdf.fieldname) is None):
                         row.set(cdf.fieldname, "[]" if cdf.fieldtype == "JSON" else "")
                         changed = True
 
@@ -46,27 +54,45 @@ def sanitize_doc_strings(doc) -> bool:
 def ensure_module_def(mod_name: str):
     """Pastikan Module Def ada (dipakai Workspace/Desk)."""
     if not frappe.db.exists("Module Def", {"name": mod_name}):
-        frappe.get_doc({
+        doc = frappe.get_doc({
             "doctype": "Module Def",
             "module_name": mod_name,
-            "custom": 1
-        }).insert(ignore_permissions=True)
+            "custom": 1,
+        })
+        sanitize_doc_strings(doc)
+        doc.insert(ignore_permissions=True)
 
 
-def ensure_workspace(mod_name: str, ws_name: str):
-    """Buat/perbarui Workspace secara aman lintas-versi."""
+def ensure_workspace(mod_name: str, ws_name: str, seq: int | None = None):
+    """Buat/perbarui Workspace secara aman lintas-versi.
+
+    Args:
+        mod_name: Nama Module (Module Def)
+        ws_name:  Nama Workspace (docname)
+        seq:      Urutan tampilan. Jika None, biarkan default.
+                  Kalau kamu mau “ke-2 dari bawah”, taruh angka besar (mis. 998).
+    """
     dt = "Workspace"
+
+    # selalu reload meta agar field lintas-versi tercover
+    try:
+        frappe.reload_doc("desk", "doctype", "workspace")
+    except Exception:
+        pass
+
     ws = frappe.get_doc(dt, ws_name) if frappe.db.exists(dt, ws_name) else frappe.new_doc(dt)
     if not ws.get("name"):
-        ws.name = ws_name
+        ws.set("name", ws_name)
         ws.flags.name_set = True
 
-    # Versi terbaru mewajibkan 'title'; beberapa versi pakai 'label'
-    if has_field(dt, "title") and not (ws.get("title") or "").strip():
-        ws.title = mod_name or ws_name
-    if has_field(dt, "label") and not (ws.get("label") or "").strip():
-        ws.label = mod_name or ws_name
+    def set_if_empty(field, value):
+        if has_field(dt, field):
+            if (ws.get(field) is None) or (isinstance(ws.get(field), str) and not ws.get(field).strip()):
+                ws.set(field, value)
 
+    # title/label/module/visibility
+    set_if_empty("title", mod_name or ws_name)
+    set_if_empty("label", mod_name or ws_name)
     if has_field(dt, "module"):
         ws.module = mod_name
     if has_field(dt, "public"):
@@ -78,7 +104,14 @@ def ensure_workspace(mod_name: str, ws_name: str):
     if has_field(dt, "icon") and ws.get("icon") is None:
         ws.icon = ""
 
-    # Konten minimal (shortcut) — hanya jika field ada
+    # urutan (cover sequence_id / sequence)
+    if seq is not None:
+        if has_field(dt, "sequence_id"):
+            ws.sequence_id = seq
+        if has_field(dt, "sequence"):
+            ws.sequence = seq
+
+    # konten minimal → string JSON (bukan list)
     if has_field(dt, "content"):
         ws.content = json.dumps([
             {"type": "shortcut", "label": "Shopee", "items": [
@@ -86,32 +119,32 @@ def ensure_workspace(mod_name: str, ws_name: str):
             ]}
         ])
 
-    # Guard terakhir: tidak ada field teks/JSON yang None
+    # guard terakhir: zero None untuk semua field teks/json
     sanitize_doc_strings(ws)
+    ws.flags.ignore_mandatory = True
     ws.save(ignore_permissions=True)
 
 
 def after_install():
-    """Idempotent post-install: create custom fields, ensure module/workspace, seed empty Shopee Settings.
-
-    Requirements (per user request):
-    - Use the exact custom fields spec from patch add_custom_fields.execute() plus buyer_username for Sales Order.
-    - Ignore duplicates / safely retryable.
-    - Optionally create single doctype record Shopee Settings with blank token fields if missing.
-    - Print clear completion message.
+    """Idempotent post-install:
+    - create custom fields
+    - ensure module/workspace
+    - seed empty Shopee Settings (single)
     """
-
-    # Copy from patches/add_custom_fields.py (kept aligned) + buyer_username insertion.
     fields = {
         "Sales Order": [
-            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", insert_after="title", unique=1, reqd=0, in_standard_filter=1),
-            dict(fieldname="buyer_user_id", label="Shopee Buyer User ID", fieldtype="Data", insert_after="shopee_order_sn"),
-            dict(fieldname="buyer_username", label="Shopee Buyer Username", fieldtype="Data", insert_after="buyer_user_id"),
+            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data",
+                 insert_after="title", unique=1, reqd=0, in_standard_filter=1),
+            dict(fieldname="buyer_user_id", label="Shopee Buyer User ID", fieldtype="Data",
+                 insert_after="shopee_order_sn"),
+            dict(fieldname="buyer_username", label="Shopee Buyer Username", fieldtype="Data",
+                 insert_after="buyer_user_id"),
             dict(fieldname="shopee_sync_hash", label="Shopee Sync Hash", fieldtype="Data"),
             dict(fieldname="last_pushed_update_time", label="Shopee Last Pushed Update Time", fieldtype="Datetime"),
         ],
         "Sales Invoice": [
-            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1, in_standard_filter=1),
+            dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1,
+                 in_standard_filter=1),
             dict(fieldname="escrow_synced", label="Shopee Escrow Synced", fieldtype="Check", default=0),
             dict(fieldname="escrow_synced_at", label="Shopee Escrow Synced At", fieldtype="Datetime"),
             dict(fieldname="escrow_fee_total", label="Shopee Fee Total", fieldtype="Currency"),
@@ -132,20 +165,20 @@ def after_install():
     mod = "Shopee Bridge"
 
     try:
-        # 1. Custom fields (ignore validation to avoid break on existing)
+        # 1) Custom fields
         try:
             create_custom_fields(fields, ignore_validate=True)
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Shopee Bridge create_custom_fields")
 
-        # 2. Ensure Module & Workspace (for Desk visibility)
+        # 2) Module & Workspace (sequence diset 998 = “kedua dari bawah” biasanya)
         try:
             ensure_module_def(mod)
-            ensure_workspace(mod, mod)
+            ensure_workspace(mod, mod, seq=998)  # ubah angka kalau perlu posisi lain
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Shopee Bridge ensure workspace")
 
-        # 3. Seed single Shopee Settings doc with empty token fields if not existing
+        # 3) Seed Single Shopee Settings kosong (jika belum ada)
         try:
             if not frappe.db.exists("Shopee Settings"):
                 doc = frappe.get_doc({
