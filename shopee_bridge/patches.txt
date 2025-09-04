@@ -1,1 +1,2 @@
 shopee_bridge.patches.add_custom_fields
+shopee_bridge.patches.0001_setup_defaults_and_custom_fields

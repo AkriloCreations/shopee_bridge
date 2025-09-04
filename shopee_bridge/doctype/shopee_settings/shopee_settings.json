@@ -1,123 +1,64 @@
 {
-    "doctype": "DocType",
-    "name": "Shopee Settings",
-    "module": "Shopee Bridge",
-    "is_single": 1,
-    "fields": [
-        {
-            "fieldname": "partner_id",
-            "label": "partner_id",
-            "fieldtype": "Int",
-            "reqd": 1
-        },
-        {
-            "fieldname": "partner_key",
-            "label": "partner_key",
-            "fieldtype": "Password",
-            "reqd": 1
-        },
-        {
-            "fieldname": "region",
-            "label": "region",
-            "fieldtype": "Select",
-            "options": "SG\nID\nTH\nMY\nPH\nVN",
-            "reqd": 1
-        },
-        {
-            "fieldname": "redirect_url",
-            "label": "redirect_url",
-            "fieldtype": "Data",
-            "reqd": 1
-        },
-        {
-            "fieldname": "shop_id",
-            "label": "shop_id",
-            "fieldtype": "Data"
-        },
-        {
-            "fieldname": "access_token",
-            "label": "access_token",
-            "fieldtype": "Password"
-        },
-        {
-            "fieldname": "refresh_token",
-            "label": "refresh_token",
-            "fieldtype": "Password"
-        },
-        {
-            "fieldname": "token_expires_at",
-            "label": "token_expires_at",
-            "fieldtype": "Datetime"
-        },
-        {
-            "fieldname": "scopes",
-            "label": "scopes",
-            "fieldtype": "Data"
-        },
-        {
-            "fieldname": "oauth_state",
-            "label": "oauth_state",
-            "fieldtype": "Data",
-            "hidden": 1
-        },
-        {
-            "fieldname": "live_partner_push_key",
-            "label": "live_partner_push_key",
-            "fieldtype": "Password"
-        },
-        {
-            "fieldname": "test_partner_push_key",
-            "label": "test_partner_push_key",
-            "fieldtype": "Password"
-        },
-        {
-            "fieldname": "webhook_live_enabled",
-            "label": "webhook_live_enabled",
-            "fieldtype": "Check"
-        },
-        {
-            "fieldname": "webhook_test_enabled",
-            "label": "webhook_test_enabled",
-            "fieldtype": "Check"
-        },
-        {
-            "fieldname": "shopee_bank_account",
-            "label": "shopee_bank_account",
-            "fieldtype": "Link",
-            "options": "Bank Account"
-        },
-        {
-            "fieldname": "fee_account_uuid",
-            "label": "fee_account_uuid",
-            "fieldtype": "Data"
-        },
-        {
-            "fieldname": "voucher_account_uuid",
-            "label": "voucher_account_uuid",
-            "fieldtype": "Data"
-        },
-        {
-            "fieldname": "delivery_protection_account_uuid",
-            "label": "delivery_protection_account_uuid",
-            "fieldtype": "Data"
-        },
-        {
-            "fieldname": "shipping_diff_account_uuid",
-            "label": "shipping_diff_account_uuid",
-            "fieldtype": "Data"
-        },
-        {
-            "fieldname": "last_auth_error",
-            "label": "last_auth_error",
-            "fieldtype": "Small Text",
-            "read_only": 1
-        }
-    ],
-    "permissions": [
-        {
-            "role": "System Manager",
-            "read": 1,
-            "write": 1
-        }
-    ]
+ "doctype": "DocType",
+ "name": "Shopee Settings",
+ "module": "Shopee Bridge",
+ "custom": 0,
+ "istable": 0,
+ "is_single": 1,
+ "editable_grid": 0,
+ "track_changes": 0,
+ "allow_copy": 0,
+ "allow_rename": 0,
+ "field_order": [
+  "partner_id",
+  "partner_key",
+  "region",
+  "redirect_url",
+  "shop_id",
+  "access_token",
+  "refresh_token",
+  "token_expires_at",
+  "scopes",
+  "oauth_state",
+  "live_partner_push_key",
+  "test_partner_push_key",
+  "webhook_live_enabled",
+  "webhook_test_enabled",
+  "shopee_bank_account",
+  "fee_account_uuid",
+  "voucher_account_uuid",
+  "delivery_protection_account_uuid",
+  "shipping_diff_account_uuid",
+  "last_auth_error"
+ ],
+ "fields": [
+  {"fieldname": "partner_id", "fieldtype": "Data", "label": "Partner ID", "reqd": 1},
+  {"fieldname": "partner_key", "fieldtype": "Password", "label": "Partner Key", "reqd": 1},
+  {"fieldname": "region", "fieldtype": "Select", "label": "Region", "options": "ID\nSG\nMY\nTH\nPH\nVN", "reqd": 1},
+  {"fieldname": "redirect_url", "fieldtype": "Data", "label": "Redirect URL", "reqd": 1},
+  {"fieldname": "shop_id", "fieldtype": "Data", "label": "Shop ID"},
+  {"fieldname": "access_token", "fieldtype": "Password", "label": "Access Token"},
+  {"fieldname": "refresh_token", "fieldtype": "Password", "label": "Refresh Token"},
+  {"fieldname": "token_expires_at", "fieldtype": "Datetime", "label": "Token Expires At"},
+  {"fieldname": "scopes", "fieldtype": "Data", "label": "Scopes"},
+  {"fieldname": "oauth_state", "fieldtype": "Data", "label": "OAuth State", "hidden": 1},
+  {"fieldname": "live_partner_push_key", "fieldtype": "Password", "label": "Live Partner Push Key"},
+  {"fieldname": "test_partner_push_key", "fieldtype": "Password", "label": "Test Partner Push Key"},
+  {"fieldname": "webhook_live_enabled", "fieldtype": "Check", "label": "Enable LIVE Webhook", "default": 0},
+  {"fieldname": "webhook_test_enabled", "fieldtype": "Check", "label": "Enable TEST Webhook", "default": 0},
+  {"fieldname": "shopee_bank_account", "fieldtype": "Link", "label": "Shopee Bank Account", "options": "Bank Account"},
+  {"fieldname": "fee_account_uuid", "fieldtype": "Data", "label": "Fee Account UUID"},
+  {"fieldname": "voucher_account_uuid", "fieldtype": "Data", "label": "Voucher Account UUID"},
+  {"fieldname": "delivery_protection_account_uuid", "fieldtype": "Data", "label": "Delivery Protection Account UUID"},
+  {"fieldname": "shipping_diff_account_uuid", "fieldtype": "Data", "label": "Shipping Diff Account UUID"},
+  {"fieldname": "last_auth_error", "fieldtype": "Small Text", "label": "Last Auth Error", "read_only": 1}
+ ],
+ "permissions": [
+  {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "print": 1, "email": 1},
+  {"role": "Integration User", "read": 1}
+ ],
+ "listview_settings": {
+  "fields": ["partner_id", "region", "shop_id", "token_expires_at"],
+  "hide_name_column": 1
+ }
 }
