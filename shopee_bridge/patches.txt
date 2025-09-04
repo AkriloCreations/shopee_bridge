@@ -1,1 +1,1 @@
-shopee_bridge.patches.0001_bootstrap.execute
+shopee_bridge.patches.0001_bootstrap
