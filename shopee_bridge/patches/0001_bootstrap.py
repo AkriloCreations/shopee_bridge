@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+from frappe.utils import scrub
 from datetime import datetime
 
 TEXTY = {
@@ -36,84 +38,130 @@ def _sanitize_doc_strings(doc) -> None:
                         row.set(cdf.fieldname, "[]" if cdf.fieldtype == "JSON" else "")
 
 def _ensure_module_def(name: str) -> None:
-    """Ensure Module Def exists and module path is available (with manual fallback).
-
-    Jika get_module_path gagal tetapi folder scrubbed memang ada di app path, kita anggap OK
-    (registry mungkin belum ter-refresh). Kalau tidak ada, log error untuk perhatian manual.
-    """
-    if not frappe.db.exists("Module Def", {"name": name}):
-        doc = frappe.get_doc({"doctype": "Module Def", "module_name": name, "custom": 1})
+    """Ensure Module Def exists properly for ERPNext module registration."""
+    
+    # Check if Module Def already exists
+    if not frappe.db.exists("Module Def", name):
+        print(f"Creating Module Def for '{name}'...")
+        doc = frappe.get_doc({
+            "doctype": "Module Def", 
+            "name": name,
+            "module_name": name,
+            "custom": 1
+        })
         _sanitize_doc_strings(doc)
         doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        print(f"Module Def '{name}' created successfully")
+    else:
+        print(f"Module Def '{name}' already exists")
+    
+    # Ensure module folder exists at correct path
     try:
+        app_path = frappe.get_app_path("shopee_bridge")
+        scrubbed_name = scrub(name)  # "Shopee Bridge" -> "shopee_bridge" 
+        module_path = os.path.join(app_path, scrubbed_name)
+        
+        if not os.path.isdir(module_path):
+            print(f"ERROR: Module folder missing at {module_path}")
+            return
+            
+        # Clear cache to reload modules
         frappe.clear_cache()
-        frappe.get_module_path(name)
-    except Exception:
-        from frappe.utils import scrub
-        import os
-        try:
-            app_path = frappe.get_app_path("shopee_bridge")
-            candidate = os.path.join(app_path, scrub(name))
-            if os.path.isdir(candidate):
-                return
-        except Exception:  # pragma: no cover
-            pass
+        
+        # Test module path resolution
+        resolved_path = frappe.get_module_path(name)
+        print(f"Module path resolved: {resolved_path}")
+        
+    except Exception as e:
+        print(f"Module path resolution failed: {e}")
         frappe.log_error(
-            f"Module path unresolved for '{name}'. Pastikan modules.txt & folder scrub '{scrub(name)}' ada.",
-            "Shopee Bridge 0001 bootstrap"
+            f"Module path error for '{name}': {str(e)}",
+            "Shopee Bridge Module Setup"
         )
 
 def _ensure_workspace(module_name: str, ws_name: str, seq: int = 998) -> None:
-    # Workspace schema berubah antar versi → reload jika ada
+    """Ensure workspace exists with proper shortcuts."""
+    print(f"Setting up workspace: {ws_name}")
+    
+    # Reload workspace doctype to handle schema changes
     try:
         frappe.reload_doc("desk", "doctype", "workspace")
     except Exception:
         pass
 
     dt = "Workspace"
-    ws = frappe.get_doc(dt, ws_name) if frappe.db.exists(dt, ws_name) else frappe.new_doc(dt)
-    if not ws.get("name"):
+    
+    # Get existing workspace or create new one
+    if frappe.db.exists(dt, ws_name):
+        ws = frappe.get_doc(dt, ws_name)
+        print(f"Found existing workspace: {ws_name}")
+    else:
+        ws = frappe.new_doc(dt)
         ws.name = ws_name
         ws.flags.name_set = True
+        print(f"Creating new workspace: {ws_name}")
 
-    def set_if(field: str, value):
-        if _has_field(dt, field):
-            cur = ws.get(field)
-            if cur is None or (isinstance(cur, str) and not cur.strip()):
-                ws.set(field, value)
-
-    set_if("title", module_name or ws_name)
-    set_if("label", module_name or ws_name)
-    if _has_field(dt, "module"):
-        ws.module = module_name
-    if _has_field(dt, "public"):
-        ws.public = 1
-    if _has_field(dt, "is_hidden"):
-        ws.is_hidden = 0
-    if _has_field(dt, "description") and ws.get("description") is None:
+    # Set basic workspace properties
+    ws.title = module_name or ws_name
+    ws.label = module_name or ws_name
+    ws.module = module_name
+    ws.public = 1
+    ws.is_hidden = 0
+    ws.sequence_id = seq
+    
+    # Ensure description and icon fields are set
+    if not ws.get("description"):
         ws.description = ""
-    if _has_field(dt, "icon") and ws.get("icon") is None:
+    if not ws.get("icon"):
         ws.icon = ""
 
-    # urutan (pakai field yang tersedia)
-    if _has_field(dt, "sequence_id"):
-        ws.sequence_id = seq
-    if _has_field(dt, "sequence"):
-        ws.sequence = seq
+    # Set content with shortcuts (JSON string format)
+    shortcuts_content = [
+        {"type": "shortcut", "label": "Shopee", "items": [
+            {"label": "Shopee Settings", "type": "DocType", "link_to": "Shopee Settings"},
+            {"label": "Webhook Inbox", "type": "DocType", "link_to": "List/Shopee Webhook Inbox"},
+            {"label": "Customer Issues", "type": "DocType", "link_to": "List/Customer Issue"},
+        ]}
+    ]
+    ws.content = json.dumps(shortcuts_content)
+    print(f"Set workspace content: {ws.content}")
 
-    # content harus STRING JSON (bukan list) - REMOVED Sync Log
-    if _has_field(dt, "content"):
-        ws.content = json.dumps([
-            {"type": "shortcut", "label": "Shopee", "items": [
-                {"label": "Shopee Settings", "type": "DocType", "link_to": "Shopee Settings"},
-                {"label": "Webhook Inbox", "type": "DocType", "link_to": "List/Shopee Webhook Inbox"},
-                {"label": "Customer Issues", "type": "DocType", "link_to": "List/Customer Issue"},
-            ]}
-        ])
+    # Clear any existing shortcuts and add new ones
+    ws.shortcuts = []
+    
+    # Add shortcuts to the child table
+    shortcuts_to_add = [
+        ("Shopee Settings", "Shopee Settings", "Form"),
+        ("Webhook Inbox", "Shopee Webhook Inbox", "List"),
+        ("Customer Issues", "Customer Issue", "List"),
+    ]
+    
+    for label, doctype, view in shortcuts_to_add:
+        # Only add if the DocType exists
+        if frappe.db.exists("DocType", doctype):
+            shortcut = ws.append("shortcuts", {})
+            shortcut.label = label
+            shortcut.type = "DocType"
+            shortcut.link_to = doctype
+            shortcut.doc_view = view
+            shortcut.color = "Grey"
+            print(f"Added shortcut: {label} -> {doctype}")
+        else:
+            print(f"Skipped shortcut {label}: DocType {doctype} not found")
 
+    # Save the workspace
     _sanitize_doc_strings(ws)
     ws.flags.ignore_mandatory = True
-    ws.save(ignore_permissions=True)
+    ws.flags.ignore_permissions = True
+    
+    try:
+        ws.save(ignore_permissions=True)
+        frappe.db.commit()
+        print(f"Workspace '{ws_name}' saved successfully with {len(ws.shortcuts)} shortcuts")
+    except Exception as e:
+        print(f"Error saving workspace: {e}")
+        frappe.log_error(frappe.get_traceback(), "Shopee Bridge Workspace Save Error")
 
 def _ensure_single_settings():
     if not frappe.db.exists("Shopee Settings"):
@@ -266,28 +314,46 @@ def execute():
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopee Bridge create_custom_fields")
 
-    # 2) Module & Workspace
+    # 2) Module Definition - CRITICAL FIRST
+    print("Step 2: Setting up Module Definition...")
     try:
         _ensure_module_def("Shopee Bridge")
-        _ensure_workspace("Shopee Bridge", "Shopee Bridge", seq=998)  # adjust bila mau posisi lain
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Shopee Bridge ensure workspace")
+    except Exception as e:
+        print(f"ERROR in module definition: {e}")
+        frappe.log_error(frappe.get_traceback(), "Shopee Bridge Module Setup")
 
-    # 3) Single Settings
+    # 3) Single Settings - Before Workspace (needed for shortcuts)
+    print("Step 3: Setting up Shopee Settings...")
     try:
         _ensure_single_settings()
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Shopee Bridge seed Shopee Settings")
+    except Exception as e:
+        print(f"ERROR in settings setup: {e}")
+        frappe.log_error(frappe.get_traceback(), "Shopee Bridge Settings Setup")
 
-    # 4) Ensure workspace shortcuts
+    # 4) Workspace - After Module Def and Settings exist
+    print("Step 4: Setting up Workspace...")
+    try:
+        _ensure_workspace("Shopee Bridge", "Shopee Bridge", seq=998)
+    except Exception as e:
+        print(f"ERROR in workspace setup: {e}")
+        frappe.log_error(frappe.get_traceback(), "Shopee Bridge Workspace Setup")
+
+    # 5) Additional workspace shortcuts (legacy compatibility)  
+    print("Step 5: Ensuring additional shortcuts...")
     try:
         _workspace_json_shortcuts()
         _ensure_workspace_shortcuts_child()
         _ensure_workspace_shortcut()
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Shopee Bridge consolidated bootstrap follow-ups")
+    except Exception as e:
+        print(f"ERROR in additional shortcuts: {e}")
+        frappe.log_error(frappe.get_traceback(), "Shopee Bridge Additional Shortcuts")
 
+    # Final commit and success message
     frappe.db.commit()
-    print("[Shopee Bridge] Patch bootstrap complete.")
-    print("[Shopee Bridge] Consolidated bootstrap (shortcuts) ensured.")
-    print("[Shopee Bridge] Workspace link ensured.")
+    print("=" * 60)
+    print("[Shopee Bridge] Bootstrap patch completed successfully!")
+    print(f"- Module 'Shopee Bridge' registered")
+    print(f"- Workspace created with shortcuts")
+    print(f"- Custom fields added to Sales Order, Sales Invoice, Delivery Note")
+    print(f"- Shopee Settings initialized")
+    print("=" * 60)

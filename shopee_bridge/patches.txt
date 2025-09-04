@@ -1,2 +1,3 @@
-shopee_bridge.patches.0001_bootstrap
+shopee_bridge.patches.fix_workspace
+shopee_bridge.patches.create_workspace_shortcuts
 shopee_bridge.patches.v2_0.migrate_to_v2

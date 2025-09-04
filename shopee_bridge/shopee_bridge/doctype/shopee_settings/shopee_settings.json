@@ -19,6 +19,14 @@
       "reqd": 1
     },
     {
+      "fieldname": "environment",
+      "fieldtype": "Select",
+      "label": "Environment",
+      "options": "live\ntest",
+      "reqd": 1,
+      "default": "test"
+    },
+    {
       "fieldname": "region",
       "fieldtype": "Select",
       "label": "Region",
