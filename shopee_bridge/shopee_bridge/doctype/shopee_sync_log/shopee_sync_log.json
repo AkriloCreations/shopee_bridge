@@ -2,10 +2,10 @@
   "doctype": "DocType",
   "name": "Shopee Sync Log",
   "module": "Shopee Bridge",
-  "issingle": 0,
+  "issingle": 1,
   "custom": 0,
   "istable": 0,
-  "autoname": "hash",
+  "autoname": "",
   "fields": [
     {
       "fieldname": "sync_type",
@@ -54,6 +54,19 @@
       "fieldname": "payload_sample",
       "fieldtype": "Long Text",
       "label": "Payload Sample"
+    },
+    {
+      "fieldname": "log_tail",
+      "fieldtype": "Long Text",
+      "label": "Recent Log Lines",
+      "read_only": 1,
+      "description": "Appended by write_log helper; last ~200 lines"
+    },
+    {
+      "fieldname": "last_updated",
+      "fieldtype": "Datetime",
+      "label": "Last Updated",
+      "read_only": 1
     }
   ]
 }

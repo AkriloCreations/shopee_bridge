@@ -12,7 +12,7 @@ def execute():
         {"type":"shortcut","label":"Shopee","items":[
             {"label":"Shopee Settings","type":"DocType","link_to":"DocType/Shopee Settings"},
             {"label":"Webhook Inbox","type":"DocType","link_to":"List/Shopee Webhook Inbox"},
-            {"label":"Sync Log","type":"DocType","link_to":"List/Shopee Sync Log"},
+            {"label":"Sync Log","type":"DocType","link_to":"Form/Shopee Sync Log"},
         ]}
     ])
     ws.flags.ignore_mandatory = True
