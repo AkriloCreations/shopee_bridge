@@ -2,12 +2,17 @@
 # Datetime helpers
 # ---------------------------------------------------------------------------
 from datetime import datetime, timedelta, timezone
+import frappe
 
-def _utc_naive(seconds: int):
-    """Return naive UTC datetime for Shopee token expiry storage."""
-    dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)  # aware UTC
-    return dt.replace(tzinfo=None)  # convert to naive UTC
+def _utc_naive(expires_in_seconds: int):
+    """Hitung expiry dalam UTC aware lalu simpan sebagai naive UTC."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).replace(tzinfo=None)
 
+def _persist_single(doctype: str, field: str, value):
+    """Set nilai Single Doctype via DB API agar tidak ke-cache."""
+    frappe.db.set_single_value(doctype, field, value)
+    frappe.db.commit()
+    frappe.clear_cache(doctype=doctype)
 
 from typing import List, Dict, Any, Union, Optional
 import time
