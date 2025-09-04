@@ -70,9 +70,10 @@ def connect_to_shopee(scopes: Optional[List[str]] = None) -> Dict[str, Any]:
 
 @frappe.whitelist()
 def oauth_callback(**params) -> Dict[str, Any]:
-	"""Handle OAuth redirect callback.
-
-	All params passed through **params.
+	"""
+	Endpoint untuk menerima callback dari Shopee OAuth.
+	Proses simpan access_token, refresh_token, shop_id, dll dilakukan di auth.handle_oauth_callback.
+	Semua logic tetap di auth.py, api.py hanya wrapper tipis.
 	"""
 	try:
 		auth.handle_oauth_callback(params)
