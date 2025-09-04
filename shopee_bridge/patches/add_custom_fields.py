@@ -31,11 +31,6 @@ def execute():
             dict(fieldname="status_delivery", label="Shopee Delivery Status", fieldtype="Data"),
             dict(fieldname="delivered_at", label="Shopee Delivered At", fieldtype="Datetime"),
         ],
-        # Optional if you use Customer Issue as RMA container
-        "Customer Issue": [
-            dict(fieldname="return_sn", label="Shopee Return SN", fieldtype="Data", unique=1),
-            dict(fieldname="shopee_payload_json", label="Shopee Payload JSON", fieldtype="Long Text"),
-        ],
     }
 
     create_custom_fields(fields, ignore_validate=True)

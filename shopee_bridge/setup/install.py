@@ -18,6 +18,7 @@ def after_install():
     Raises:
         Logs errors to frappe.log_error and prints failure message.
     """
+    # Custom fields to add to core doctypes
     custom_fields = {
         "Sales Order": [
             dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1, idx=1, insert_after="order_id"),
@@ -43,17 +44,16 @@ def after_install():
             dict(fieldname="status_delivery", label="Shopee Delivery Status", fieldtype="Data", insert_after="status_pickup"),
             dict(fieldname="delivered_at", label="Shopee Delivered At", fieldtype="Datetime", insert_after="status_delivery"),
         ],
-        "Customer Issue": [
-            dict(fieldname="return_sn", label="Shopee Return SN", fieldtype="Data", unique=1, idx=1, insert_after="issue_type"),
-            dict(fieldname="shopee_payload_json", label="Shopee Payload JSON", fieldtype="Long Text", insert_after="return_sn"),
-        ],
     }
 
     try:
         # Shopee Settings Single doctype: nothing to do, auto-created on first save
 
-        # Create custom fields
-        create_custom_fields(custom_fields, update=True)
+        # Create custom fields (skip errors)
+        try:
+            create_custom_fields(custom_fields, update=True)
+        except Exception as cf_err:
+            frappe.log_error(message=str(cf_err), title="Shopee Bridge custom fields error")
 
         # Sanitize existing Workspace documents
         import json
@@ -104,10 +104,10 @@ def after_install():
                 pass
         frappe.db.commit()
 
-        # Ensure Module Def exists
+    # Ensure Module Def exists for menu
         MOD = "Shopee Bridge"
         if not frappe.db.exists("Module Def", {"name": MOD}):
-            frappe.get_doc({"doctype": "Module Def", "name": MOD}).insert(ignore_permissions=True)
+            frappe.get_doc({"doctype": "Module Def", "module_name": MOD, "custom": 1}).insert(ignore_permissions=True)
             frappe.db.commit()
 
         # Create or update Workspace for Shopee Bridge
@@ -120,6 +120,7 @@ def after_install():
             ws.flags.name_set = True
         ws.label = MOD
         ws.module = MOD
+        ws.category = "Modules"
         ws.public = 1
         ws.is_hidden = 0
         ws.description = ""
@@ -132,6 +133,7 @@ def after_install():
         ws.save(ignore_permissions=True)
         frappe.db.commit()
 
+        # Success message
         print(_("Shopee Bridge install: Custom fields and workspace ensured."))
     except Exception as e:
         frappe.log_error(message=str(e), title="Shopee Bridge after_install error")
