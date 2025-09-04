@@ -22,6 +22,7 @@ def after_install():
         "Sales Order": [
             dict(fieldname="shopee_order_sn", label="Shopee Order SN", fieldtype="Data", unique=1, idx=1, insert_after="order_id"),
             dict(fieldname="buyer_user_id", label="Shopee Buyer User ID", fieldtype="Data", insert_after="shopee_order_sn"),
+            dict(fieldname="buyer_username", label="Shopee Buyer Username", fieldtype="Data", insert_after="buyer_user_id"),
             dict(fieldname="shopee_sync_hash", label="Shopee Sync Hash", fieldtype="Data", insert_after="buyer_user_id"),
             dict(fieldname="last_pushed_update_time", label="Shopee Last Pushed Update Time", fieldtype="Datetime", insert_after="shopee_sync_hash"),
         ],
@@ -54,7 +55,84 @@ def after_install():
         # Create custom fields
         create_custom_fields(custom_fields, update=True)
 
-        print(_("Shopee Bridge install: Custom fields ensured."))
+        # Sanitize existing Workspace documents
+        import json
+
+        TEXTY = {"Data","Small Text","Text","Long Text","Text Editor","Markdown Editor","HTML Editor","Link","Select","Code","JSON"}
+
+        def has_field(doctype, fieldname):
+            meta = frappe.get_meta(doctype)
+            return any(df.fieldname == fieldname for df in meta.fields)
+
+        def sanitize_doc(doctype, name):
+            meta = frappe.get_meta(doctype)
+            doc = frappe.get_doc(doctype, name)
+            changed = False
+            # Critical fields
+            if has_field(doctype, "label") and not (doc.get("label") or "").strip():
+                doc.label = doc.name; changed = True
+            if has_field(doctype, "content") and doc.get("content") is None:
+                doc.content = "[]"; changed = True
+            if has_field(doctype, "description") and doc.get("description") is None:
+                doc.description = ""; changed = True
+            if has_field(doctype, "icon") and doc.get("icon") is None:
+                doc.icon = ""; changed = True
+            # Sanitize text fields
+            for df in meta.fields:
+                if df.fieldtype in TEXTY and getattr(doc, df.fieldname, None) is None:
+                    setattr(doc, df.fieldname, "[]" if df.fieldtype == "JSON" else "")
+                    changed = True
+                elif df.fieldtype in ("Table", "Table MultiSelect"):
+                    rows = doc.get(df.fieldname) or []
+                    if rows:
+                        child_meta = frappe.get_meta(df.options)
+                        for row in rows:
+                            for cdf in child_meta.fields:
+                                if cdf.fieldtype in TEXTY and row.get(cdf.fieldname) is None:
+                                    row.set(cdf.fieldname, "[]" if cdf.fieldtype == "JSON" else "")
+                                    changed = True
+            if changed:
+                doc.save(ignore_permissions=True)
+            return changed
+
+        fixed = 0
+        for nm in frappe.get_all("Workspace", pluck="name"):
+            try:
+                if sanitize_doc("Workspace", nm):
+                    fixed += 1
+            except Exception:
+                pass
+        frappe.db.commit()
+
+        # Ensure Module Def exists
+        MOD = "Shopee Bridge"
+        if not frappe.db.exists("Module Def", {"name": MOD}):
+            frappe.get_doc({"doctype": "Module Def", "name": MOD}).insert(ignore_permissions=True)
+            frappe.db.commit()
+
+        # Create or update Workspace for Shopee Bridge
+        NAME = "Shopee Bridge"
+        if frappe.db.exists("Workspace", NAME):
+            ws = frappe.get_doc("Workspace", NAME)
+        else:
+            ws = frappe.new_doc("Workspace")
+            ws.name = NAME
+            ws.flags.name_set = True
+        ws.label = MOD
+        ws.module = MOD
+        ws.public = 1
+        ws.is_hidden = 0
+        ws.description = ""
+        ws.icon = ""
+        ws.content = json.dumps([
+            {"type": "shortcut", "label": "Shopee", "items": [
+                {"label": "Shopee Settings", "type": "DocType", "link_to": "DocType/Shopee Settings"}
+            ]}
+        ])
+        ws.save(ignore_permissions=True)
+        frappe.db.commit()
+
+        print(_("Shopee Bridge install: Custom fields and workspace ensured."))
     except Exception as e:
         frappe.log_error(message=str(e), title="Shopee Bridge after_install error")
         print(_("Shopee Bridge install failed: {0}").format(e))

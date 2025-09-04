@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 def get_data():
-    """Expose Shopee Bridge desk module with Shopee Settings card."""
     return [
         {
             "label": "Shopee Bridge",
@@ -9,8 +10,8 @@ def get_data():
                     "name": "Shopee Settings",
                     "label": "Shopee Settings",
                     "icon": "octicon octicon-link",
-                    "description": "Connect and configure Shopee integration"
+                    "description": "Connect and configure Shopee integration",
                 }
-            ]
+            ],
         }
     ]

@@ -1,1 +1,1 @@
-shopee_bridge.patches.add_custom_fields.execute
+shopee_bridge.patches.add_custom_fields
