@@ -1,26 +1,356 @@
 frappe.ui.form.on("Shopee Settings", {
     refresh(frm) {
-        frm.add_custom_button("Test Connection", async () => {
-            // Use thin public API facade (architecture rule: no direct service logic in doctype JS)
-            try {
-                const r = await frappe.call({ method: "shopee_bridge.api.test_shopee_connection" });
-                frappe.msgprint(__("Shopee Connection Test Result:\n{0}", [JSON.stringify(r.message, null, 2)]));
-            } catch (e) { frappe.msgprint(String(e)); }
-        });
-
+        // Add button groups for better organization
+        frm.clear_custom_buttons();
+        
+        // === CONNECTION & AUTH GROUP ===
         const ready = !!(frm.doc.partner_id && frm.doc.partner_key && frm.doc.redirect_url);
+        
         if (ready) {
-            frm.add_custom_button("Connect to Shopee", async () => {
+            frm.add_custom_button(__("Connect to Shopee"), async () => {
                 try {
                     const r = await frappe.call({ method: "shopee_bridge.api.connect_to_shopee" });
                     if (r.message?.ok && r.message.url) {
+                        frappe.msgprint(__("Opening Shopee authorization page..."));
                         window.open(r.message.url, "_blank");
                     } else {
-                        frappe.msgprint(r.message?.error || __("Failed to build authorize URL"));
+                        frappe.msgprint(__("Error: {0}", [r.message?.error || "Failed to generate OAuth URL"]));
                     }
-                } catch (e) { frappe.msgprint(String(e)); }
+                } catch (e) { 
+                    frappe.msgprint(__("Error: {0}", [String(e)])); 
+                }
+            }, __("Connection"));
+
+            frm.add_custom_button(__("Test Connection"), async () => {
+                frappe.show_alert(__("Testing connection..."), 3);
+                try {
+                    const r = await frappe.call({ method: "shopee_bridge.api.test_shopee_connection" });
+                    if (r.message?.ok) {
+                        const shop = r.message.shop;
+                        let msg = `<b>Connection Status:</b><br>
+                            Environment: ${shop.environment}<br>
+                            Shop ID: ${shop.shop_id || 'Not connected'}<br>
+                            Has Token: ${shop.has_token ? 'Yes' : 'No'}`;
+                        
+                        if (shop.api_error) {
+                            msg += `<br><b>API Error:</b> ${shop.api_error}<br>
+                                    <b>Message:</b> ${shop.message}`;
+                        }
+                        
+                        frappe.msgprint(msg, __("Connection Test Result"));
+                    } else {
+                        frappe.msgprint(__("Error: {0}", [r.message?.error]));
+                    }
+                } catch (e) { 
+                    frappe.msgprint(__("Connection Error: {0}", [String(e)])); 
+                }
+            }, __("Connection"));
+
+            frm.add_custom_button(__("Refresh Token"), async () => {
+                if (!frm.doc.refresh_token) {
+                    frappe.msgprint(__("No refresh token available. Please reconnect to Shopee first."));
+                    return;
+                }
+                
+                frappe.show_alert(__("Refreshing access token..."), 3);
+                try {
+                    const r = await frappe.call({ method: "shopee_bridge.api.refresh_token" });
+                    if (r.message?.ok && r.message.token_refreshed) {
+                        frappe.show_alert(__("Token refreshed successfully!"), 5);
+                        frm.reload_doc();
+                    } else {
+                        frappe.msgprint(__("Token refresh failed: {0}", [r.message?.error]));
+                    }
+                } catch (e) {
+                    frappe.msgprint(__("Token refresh error: {0}", [String(e)]));
+                }
+            }, __("Connection"));
+        } else {
+            frm.add_custom_button(__("Setup Required"), () => {
+                frappe.msgprint(__("Please configure Partner ID, Partner Key, and Redirect URL first."));
+            }, __("Connection")).addClass("btn-warning");
+        }
+
+        // === SYNC & OPERATIONS GROUP ===
+        if (frm.doc.access_token) {
+            frm.add_custom_button(__("Sync Orders"), async () => {
+                const minutes = await new Promise(resolve => {
+                    frappe.prompt({
+                        label: __("Sync last N minutes"),
+                        fieldname: "minutes",
+                        fieldtype: "Int",
+                        default: 30,
+                        reqd: 1
+                    }, (values) => resolve(values.minutes), __("Sync Orders"));
+                });
+                
+                if (minutes) {
+                    frappe.show_alert(__("Starting order sync..."), 3);
+                    try {
+                        const r = await frappe.call({ 
+                            method: "shopee_bridge.api.sync_orders_api",
+                            args: { minutes: minutes }
+                        });
+                        
+                        if (r.message?.ok) {
+                            frappe.msgprint(__("Order sync completed: {0}", [JSON.stringify(r.message.sync, null, 2)]));
+                        } else {
+                            frappe.msgprint(__("Sync failed: {0}", [r.message?.error]));
+                        }
+                    } catch (e) {
+                        frappe.msgprint(__("Sync error: {0}", [String(e)]));
+                    }
+                }
+            }, __("Operations"));
+
+            frm.add_custom_button(__("Sync Shipping"), async () => {
+                frappe.show_alert(__("Starting shipping sync..."), 3);
+                try {
+                    const r = await frappe.call({ method: "shopee_bridge.api.sync_shipping_api" });
+                    if (r.message?.ok) {
+                        frappe.msgprint(__("Shipping sync completed: {0}", [JSON.stringify(r.message.sync, null, 2)]));
+                    } else {
+                        frappe.msgprint(__("Shipping sync failed: {0}", [r.message?.error]));
+                    }
+                } catch (e) {
+                    frappe.msgprint(__("Shipping sync error: {0}", [String(e)]));
+                }
+            }, __("Operations"));
+
+            frm.add_custom_button(__("Sync Returns"), async () => {
+                frappe.show_alert(__("Starting returns sync..."), 3);
+                try {
+                    const r = await frappe.call({ method: "shopee_bridge.api.sync_returns_api" });
+                    if (r.message?.ok) {
+                        frappe.msgprint(__("Returns sync completed: {0}", [JSON.stringify(r.message.sync, null, 2)]));
+                    } else {
+                        frappe.msgprint(__("Returns sync failed: {0}", [r.message?.error]));
+                    }
+                } catch (e) {
+                    frappe.msgprint(__("Returns sync error: {0}", [String(e)]));
+                }
+            }, __("Operations"));
+
+            frm.add_custom_button(__("Sync Finance"), async () => {
+                frappe.show_alert(__("Starting finance sync..."), 3);
+                try {
+                    const r = await frappe.call({ method: "shopee_bridge.api.sync_finance_api" });
+                    if (r.message?.ok) {
+                        frappe.msgprint(__("Finance sync completed: {0}", [JSON.stringify(r.message.sync, null, 2)]));
+                    } else {
+                        frappe.msgprint(__("Finance sync failed: {0}", [r.message?.error]));
+                    }
+                } catch (e) {
+                    frappe.msgprint(__("Finance sync error: {0}", [String(e)]));
+                }
+            }, __("Operations"));
+        }
+
+        // === MONITORING GROUP ===
+        frm.add_custom_button(__("System Health"), async () => {
+            frappe.show_alert(__("Checking system health..."), 3);
+            try {
+                const r = await frappe.call({ method: "shopee_bridge.api.get_health_status" });
+                if (r.message?.ok) {
+                    const health = r.message.health;
+                    let status_color = health.token_valid && health.settings_configured ? "green" : "orange";
+                    
+                    let msg = `<div style="color: ${status_color}"><b>System Health Status</b></div><br>
+                        <b>Token Valid:</b> ${health.token_valid ? '✅ Yes' : '❌ No'}<br>
+                        <b>Settings Configured:</b> ${health.settings_configured ? '✅ Yes' : '❌ No'}<br>
+                        <b>Recent Errors (24h):</b> ${health.recent_errors}<br>
+                        <b>Pending Webhooks (1h):</b> ${health.pending_webhooks}<br>
+                        <b>Last Check:</b> ${health.timestamp}`;
+                    
+                    frappe.msgprint(msg, __("System Health Status"));
+                } else {
+                    frappe.msgprint(__("Health check failed: {0}", [r.message?.error]));
+                }
+            } catch (e) {
+                frappe.msgprint(__("Health check error: {0}", [String(e)]));
+            }
+        }, __("Monitor"));
+
+        frm.add_custom_button(__("Webhook Logs"), async () => {
+            try {
+                const r = await frappe.call({ method: "shopee_bridge.api.get_webhook_logs" });
+                if (r.message?.ok) {
+                    const logs = r.message.logs;
+                    if (logs.length === 0) {
+                        frappe.msgprint(__("No recent webhook logs found."));
+                        return;
+                    }
+                    
+                    let msg = `<b>Recent Webhook Logs (${logs.length}):</b><br><br>`;
+                    logs.slice(0, 10).forEach(log => {
+                        const status_icon = log.status === 'done' ? '✅' : 
+                                          log.status === 'failed' ? '❌' : '⏳';
+                        const sig_icon = log.signature_valid ? '🔐' : '⚠️';
+                        
+                        msg += `${status_icon} ${sig_icon} <b>${log.event_type}</b> (${log.source_env})<br>
+                                &nbsp;&nbsp;&nbsp;&nbsp;Status: ${log.status}<br>
+                                &nbsp;&nbsp;&nbsp;&nbsp;Time: ${log.creation}<br><br>`;
+                    });
+                    
+                    const d = new frappe.ui.Dialog({
+                        title: __("Recent Webhook Logs"),
+                        fields: [{
+                            fieldtype: "HTML",
+                            fieldname: "webhook_logs",
+                            options: msg
+                        }],
+                        size: "large"
+                    });
+                    d.show();
+                } else {
+                    frappe.msgprint(__("Failed to fetch webhook logs: {0}", [r.message?.error]));
+                }
+            } catch (e) {
+                frappe.msgprint(__("Webhook logs error: {0}", [String(e)]));
+            }
+        }, __("Monitor"));
+
+        // === INFO DISPLAY ===
+        if (frm.doc.shop_id) {
+            frm.add_custom_button(__("Show Shop Info"), async () => {
+                try {
+                    const r = await frappe.call({ method: "shopee_bridge.api.test_shopee_connection" });
+                    if (r.message?.ok) {
+                        const info = r.message.shop;
+                        let msg = `<b>Shop Information:</b><br><br>`;
+                        
+                        Object.entries(info).forEach(([key, value]) => {
+                            if (value !== null && value !== undefined) {
+                                msg += `<b>${key.replace(/_/g, ' ').toUpperCase()}:</b> ${value}<br>`;
+                            }
+                        });
+                        
+                        frappe.msgprint(msg, __("Shop Information"));
+                    }
+                } catch (e) {
+                    frappe.msgprint(__("Error fetching shop info: {0}", [String(e)]));
+                }
+            }, __("Info"));
+        }
+    },
+
+    // Handle OAuth callback parameters and pre-fill form  
+    onload(frm) {
+        // Check for OAuth callback parameters directly in URL (from Shopee redirect)
+        const urlParams = new URLSearchParams(window.location.search);
+        const code = urlParams.get('code');
+        const shop_id = urlParams.get('shop_id');
+        const main_account_id = urlParams.get('main_account_id');
+        
+        // Only handle if we have actual OAuth parameters (not from our internal redirect)
+        if (code && (shop_id || main_account_id)) {
+            // Show loading message
+            frappe.show_alert(__('Processing OAuth callback automatically...'), 5);
+            
+            // Automatically exchange code for tokens
+            frappe.call({
+                method: "shopee_bridge.api.oauth_callback",
+                args: {
+                    code: code,
+                    shop_id: shop_id,
+                    main_account_id: main_account_id
+                },
+                callback: function(r) {
+                    if (r.message?.ok) {
+                        // Success - show success message and reload form
+                        frappe.msgprint({
+                            title: __('Shopee Connection Successful'),
+                            message: __('✅ OAuth flow completed successfully!<br><br><b>Shop ID:</b> {0}<br><b>Tokens:</b> Automatically saved<br><b>Status:</b> Connected', [
+                                r.message.shop_id || shop_id
+                            ]),
+                            indicator: 'green'
+                        });
+                        
+                        // Clean URL and reload form to show updated data
+                        window.history.replaceState({}, document.title, window.location.pathname);
+                        setTimeout(() => {
+                            frm.reload_doc();
+                        }, 2000);
+                        
+                    } else {
+                        // Failed - show error and fallback to manual
+                        const error = r.message?.error || 'Unknown error';
+                        frappe.msgprint({
+                            title: __('Automatic Token Exchange Failed'),
+                            message: __('❌ Error: {0}<br><br>Please try manual exchange:<br><b>Authorization Code:</b> {1}<br><b>Shop ID:</b> {2}', [
+                                error,
+                                code,
+                                shop_id || main_account_id
+                            ]),
+                            indicator: 'red'
+                        });
+                        
+                        // Try to fill fields for manual attempt
+                        setTimeout(() => {
+                            try {
+                                if (code && frm.fields_dict.last_auth_code) {
+                                    frm.set_value('last_auth_code', code);
+                                }
+                                if (shop_id && frm.fields_dict.shop_id) {
+                                    frm.set_value('shop_id', shop_id);
+                                }
+                                if (main_account_id && frm.fields_dict.merchant_id) {
+                                    frm.set_value('merchant_id', main_account_id);
+                                }
+                            } catch (e) {
+                                console.log('Field setting failed:', e);
+                            }
+                        }, 1000);
+                        
+                        // Clean URL after error handling
+                        window.history.replaceState({}, document.title, window.location.pathname);
+                    }
+                },
+                error: function(xhr) {
+                    // Network error - fallback to manual
+                    frappe.msgprint({
+                        title: __('Network Error'),
+                        message: __('❌ Could not connect to server for automatic token exchange.<br><br>Please try manual exchange:<br><b>Authorization Code:</b> {0}<br><b>Shop ID:</b> {1}', [
+                            code,
+                            shop_id || main_account_id
+                        ]),
+                        indicator: 'red'
+                    });
+                    
+                    // Clean URL after network error
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                }
             });
         }
     },
+
+    // Add manual token exchange button
+    last_auth_code(frm) {
+        if (frm.doc.last_auth_code && frm.doc.shop_id) {
+            frm.add_custom_button(__("Exchange Code for Tokens"), async () => {
+                frappe.show_alert(__("Exchanging authorization code for tokens..."), 5);
+                
+                try {
+                    const r = await frappe.call({
+                        method: "shopee_bridge.api.oauth_callback",
+                        args: {
+                            code: frm.doc.last_auth_code,
+                            shop_id: frm.doc.shop_id,
+                            main_account_id: frm.doc.merchant_id
+                        }
+                    });
+                    
+                    if (r.message?.ok) {
+                        frappe.show_alert(__("Token exchange successful! Tokens have been saved."), 5);
+                        frm.reload_doc();
+                    } else {
+                        frappe.msgprint(__("Token exchange failed: {0}", [r.message?.error || 'Unknown error']));
+                    }
+                } catch (e) {
+                    frappe.msgprint(__("Token exchange error: {0}", [String(e)]));
+                }
+            }, __("OAuth"));
+        }
+    }
 });
 

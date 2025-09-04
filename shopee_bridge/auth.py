@@ -81,7 +81,7 @@ def _settings() -> frappe.model.document.Document:
 
 
 def _base_url(env: str) -> str:
-    return PROD_BASE_URL if env == "Production" else TEST_BASE_URL
+    return PROD_BASE_URL if env.lower() in ("live", "production") else TEST_BASE_URL
 
 
 def _mask_secret(value: Optional[str], show: int = 4) -> str:
@@ -116,87 +116,248 @@ def _validate_state(state: str):
     frappe.cache().delete_value(STATE_CACHE_PREFIX + state)
 
 def get_shop_info() -> Dict[str, Any]:
-    """Return lightweight shop info placeholder.
+    """Get shop info from Shopee API.
 
-    Real implementation belongs in a client performing HTTP call. Kept here only as a
-    convenience placeholder so other code can probe readiness.
+    Makes actual API call to get shop information if tokens are available.
     """
-    # TODO: Replace with real shop.get request via clients.py
     settings = _settings()
-    return {
-        "shop_id": getattr(settings, "shop_id", None),
-        "environment": settings.environment,
-        "has_token": bool(getattr(settings, "access_token", None)),
-    }
+    
+    # If no access token, return basic info
+    access_token = getattr(settings, "access_token", None)
+    if not access_token:
+        return {
+            "shop_id": getattr(settings, "shop_id", None),
+            "environment": settings.environment,
+            "has_token": False,
+        }
+    
+    # Make API call to get shop info
+    try:
+        from . import clients
+        
+        # Use the shop/get_shop_info endpoint
+        result = clients.http_get("/api/v2/shop/get_shop_info", {})
+        
+        if result.get("error"):
+            # API error, return basic info with error
+            return {
+                "shop_id": getattr(settings, "shop_id", None),
+                "environment": settings.environment, 
+                "has_token": True,
+                "api_error": result.get("error"),
+                "message": result.get("message")
+            }
+        
+        # Success, return shop info from API
+        shop_info = result.get("shop_list", [{}])[0] if result.get("shop_list") else {}
+        
+        return {
+            "shop_id": shop_info.get("shop_id") or getattr(settings, "shop_id", None),
+            "shop_name": shop_info.get("shop_name"),
+            "region": shop_info.get("region"),
+            "environment": settings.environment,
+            "has_token": True,
+            "status": shop_info.get("status"),
+            "api_response": result
+        }
+        
+    except Exception as e:
+        # Network or other error
+        return {
+            "shop_id": getattr(settings, "shop_id", None),
+            "environment": settings.environment,
+            "has_token": True,
+            "error": str(e)
+        }
 
-def build_authorize_url(scopes: List[str]) -> str:
+def build_authorize_url(scopes: List[str] = None) -> str:
     """Build the Shopee OAuth v2 authorization URL.
 
-    Shopee expects partner_id, redirect URL, and optional scope CSV. We also add a
-    random `state` token stored in cache to mitigate CSRF / replay.
+    Per Shopee API specification, the authorization link requires:
+    - Fixed authorization URL (prod/sandbox)
+    - partner_id (from app settings)
+    - timestamp (valid for 5 minutes)
+    - sign (HMAC-SHA256 signature of partner_id + api_path + timestamp)
+    - redirect (redirect URL after authorization)
 
     Args:
-        scopes: List of scopes requested.
+        scopes: List of scopes requested (optional for authorization URL).
     Returns:
         Fully composed HTTPS URL for the authorization step.
     """
     settings = _settings()
     partner_id = settings.partner_id
+    partner_key = settings.get_password("partner_key")
     redirect_url = settings.redirect_url
     base_url = _base_url(settings.environment)
-    scope_str = ",".join(scopes)
-    state = _build_state()
-    qs = urllib.parse.urlencode(
-        {
-            "partner_id": partner_id,
-            "redirect": redirect_url,
-            "scope": scope_str,
-            "state": state,
-        }
-    )
+    timestamp = int(time.time())
+    
+    # Create signature base string: partner_id + api_path + timestamp
+    # For Public APIs (like auth_partner): partner_id, api path, timestamp
+    base_string = f"{partner_id}{OAUTH_AUTHORIZE_PATH}{timestamp}"
+    sign = hmac_sha256(base_string, partner_key)
+    
+    # Build query parameters
+    params = {
+        "partner_id": partner_id,
+        "timestamp": timestamp,
+        "sign": sign,
+        "redirect": redirect_url,
+    }
+    
+    # Add scopes if provided
+    if scopes:
+        params["scope"] = ",".join(scopes)
+    
+    qs = urllib.parse.urlencode(params)
     return f"{base_url}{OAUTH_AUTHORIZE_PATH}?{qs}"
 
-def handle_oauth_callback(params: Dict[str, Any]) -> None:
-    """Process the OAuth callback parameters.
+def handle_oauth_callback(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Process the OAuth callback parameters and complete token exchange.
 
     Steps:
-    1. Validate required params (code, shop_id, state)
-    2. Validate & consume `state` token
-    3. Build token exchange payload (returned for HTTP layer) & persist placeholders
-
-    NOTE: We store only *placeholder* token data here; the actual HTTP response parsing
-    (access_token, refresh_token, expires_in) must be done in clients then call a small
-    utility (TODO) to persist real values.
+    1. Validate required params (code, shop_id OR main_account_id)
+    2. Exchange code for tokens via HTTP call
+    3. Persist tokens and shop info
 
     Args:
         params: Dict of query parameters returned by Shopee to redirect URL.
+    Returns:
+        Dict with success status and token info.
     Raises:
         InvalidState: if validation fails.
     """
     code = params.get("code")
     shop_id = params.get("shop_id")
-    state = params.get("state")
-    if not code or not shop_id:
-        raise InvalidState("Missing code or shop_id in callback params")
-    _validate_state(state)
-    # Prepare exchange payload (for client to execute real HTTP)
-    exchange_code_for_token(code, shop_id)  # side effect free (returns payload)
-    # Persist preliminary context
-    settings = _settings()
-    settings.shop_id = shop_id
-    settings.last_auth_code = code  # for audit / debugging
-    settings.save(ignore_permissions=True)
-    frappe.cache().delete_value("Shopee Settings")
+    main_account_id = params.get("main_account_id")
+    
+    if not code:
+        raise InvalidState("Missing code in callback params")
+    
+    if not (shop_id or main_account_id):
+        raise InvalidState("Missing shop_id or main_account_id in callback params")
+    
+    # Complete token exchange
+    try:
+        result = complete_token_exchange(code, shop_id, main_account_id)
+        return result
+    except Exception as e:
+        frappe.log_error(f"OAuth callback failed: {str(e)}", "Shopee OAuth Error")
+        raise
 
-def exchange_code_for_token(code: str, shop_id: Union[str, int]) -> Dict[str, Any]:
+
+def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_account_id: Union[str, int] = None) -> Dict[str, Any]:
+    """Complete the token exchange process with HTTP call and persistence.
+    
+    Args:
+        code: Authorization code from OAuth callback
+        shop_id: Shop identifier from callback (optional)
+        main_account_id: Main account identifier from callback (optional)
+        
+    Returns:
+        Dict with exchange result and token info
+    """
+    from . import clients
+    
+    try:
+        # Get token exchange payload
+        payload = exchange_code_for_token(code, shop_id, main_account_id)
+        
+        # Execute HTTP request
+        response = clients._do_request(
+            payload["method"],
+            payload["url"],
+            {"Content-Type": "application/json"},
+            None,
+            payload["json"],
+            None
+        )
+        
+        status, text, headers = response
+        
+        if status != 200:
+            raise Exception(f"Token exchange failed: HTTP {status} - {text}")
+        
+        # Parse response
+        import json
+        data = json.loads(text)
+        
+        if data.get("error"):
+            raise Exception(f"Shopee API error: {data}")
+        
+        # Extract tokens and identifiers
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expires_in = data.get("expires_in", 14400)  # 4 hours default
+        
+        # API may return shop_id, merchant_id, or both
+        returned_shop_id = data.get("shop_id")
+        returned_merchant_id = data.get("merchant_id")
+        
+        if not access_token:
+            raise Exception("No access_token in exchange response")
+        
+        # Persist tokens and identifiers
+        settings = _settings()
+        settings.access_token = access_token
+        settings.refresh_token = refresh_token
+        
+        # Convert expires_in to datetime for the Datetime field 
+        # Use Frappe's utility to properly handle timezone conversion
+        from datetime import datetime, timedelta, timezone
+        expires_datetime = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        # Convert to Frappe's expected format (automatically handles timezone)
+        settings.token_expires_at = frappe.utils.get_datetime(expires_datetime)
+        
+        settings.last_auth_code = code  # for audit
+        
+        # Set shop_id from response or input parameter
+        if returned_shop_id:
+            settings.shop_id = str(returned_shop_id)
+        elif shop_id:
+            settings.shop_id = str(shop_id)
+        
+        # Set merchant_id if returned (for merchant apps)
+        if returned_merchant_id:
+            settings.merchant_id = str(returned_merchant_id)
+        
+        settings.save(ignore_permissions=True)
+        frappe.db.commit()
+        
+        # Clear cache
+        frappe.cache().delete_value("Shopee Settings")
+        
+        frappe.logger().info(f"[Shopee] OAuth completed - shop_id: {settings.shop_id}, merchant_id: {getattr(settings, 'merchant_id', 'N/A')}")
+        
+        return {
+            "success": True,
+            "shop_id": getattr(settings, "shop_id", None),
+            "merchant_id": getattr(settings, "merchant_id", None),
+            "expires_in": expires_in,
+            "expires_at": settings.token_expires_at,
+            "message": "OAuth flow completed successfully"
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        frappe.log_error(f"Token exchange failed: {error_msg}", "Shopee Token Exchange")
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+def exchange_code_for_token(code: str, shop_id: Union[str, int], main_account_id: Union[str, int] = None) -> Dict[str, Any]:
     """Produce payload for exchanging an authorization code for tokens.
 
-    Shopee signing pattern for token exchange includes code & shop_id appended to the
-    canonical path string.
+    Per Shopee API specification for GetAccessToken:
+    - For Public APIs: partner_id, api path, timestamp
+    - Common parameters: sign, partner_id, timestamp
+    - Request parameters: code, partner_id, shop_id OR main_account_id
 
     Args:
-        code: Authorization code received from redirect.
-        shop_id: Target shop identifier.
+        code: Authorization code received from redirect (valid for 10 minutes).
+        shop_id: Target shop identifier (use 1 for shop apps).
+        main_account_id: Main account identifier (alternative to shop_id).
     Returns:
         Dict representing the JSON body + metadata needed for HTTP layer.
     """
@@ -204,18 +365,30 @@ def exchange_code_for_token(code: str, shop_id: Union[str, int]) -> Dict[str, An
     partner_id = settings.partner_id
     partner_key = settings.get_password("partner_key")
     timestamp = int(time.time())
-    base_string = str(partner_id) + OAUTH_TOKEN_PATH + str(timestamp) + code + str(shop_id)
+    
+    # For Public APIs signature: partner_id + api_path + timestamp
+    base_string = f"{partner_id}{OAUTH_TOKEN_PATH}{timestamp}"
     sign = hmac_sha256(base_string, partner_key)
+    
+    # Build request body
+    request_body = {
+        "code": code,
+        "partner_id": partner_id,
+    }
+    
+    # Add either shop_id or main_account_id (shop_id takes precedence)
+    if shop_id:
+        request_body["shop_id"] = int(shop_id)
+    elif main_account_id:
+        request_body["main_account_id"] = int(main_account_id)
+    else:
+        # Default to shop_id = 1 for shop apps as per specification
+        request_body["shop_id"] = 1
+    
     return {
         "method": "POST",
-        "url": f"{_base_url(settings.environment)}{OAUTH_TOKEN_PATH}",
-        "json": {
-            "partner_id": partner_id,
-            "code": code,
-            "shop_id": int(shop_id),
-            "timestamp": timestamp,
-            "sign": sign,
-        },
+        "url": f"{_base_url(settings.environment)}{OAUTH_TOKEN_PATH}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}",
+        "json": request_body,
         "meta": {"signature_base": base_string},
     }
 
@@ -232,9 +405,27 @@ def refresh_if_needed(buffer_seconds: int = 600) -> bool:
         True if a refresh SHOULD happen now, else False.
     """
     settings = _settings()
-    expiry = int(getattr(settings, "token_expiry", 0) or 0)
-    if not expiry:
+    token_expires_at = getattr(settings, "token_expires_at", None)
+    if not token_expires_at:
         return False
+    
+    # Convert datetime to timestamp
+    try:
+        from datetime import datetime, timezone
+        if isinstance(token_expires_at, str):
+            # Parse as UTC datetime string
+            expiry_dt = datetime.strptime(token_expires_at, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+        elif hasattr(token_expires_at, 'timestamp'):
+            # Already a datetime object
+            expiry_dt = token_expires_at
+        else:
+            # Use Frappe's get_datetime to convert properly
+            expiry_dt = frappe.utils.get_datetime(token_expires_at)
+        
+        expiry = int(expiry_dt.timestamp())
+    except (ValueError, AttributeError):
+        return False
+        
     now = int(time.time())
     if expiry - now < buffer_seconds:
         # Prepare payload (not used here, but side effects minimal)
@@ -244,6 +435,11 @@ def refresh_if_needed(buffer_seconds: int = 600) -> bool:
 
 def refresh_token_via_api() -> Dict[str, Any]:
     """Produce payload for token refresh.
+
+    Per Shopee RefreshAccessToken API specification:
+    - For Public APIs: partner_id, api path, timestamp
+    - Common parameters: sign, partner_id, timestamp  
+    - Request parameters: partner_id, shop_id, refresh_token
 
     Returns:
         Dict containing method, url, json (body), and meta info.
@@ -255,23 +451,27 @@ def refresh_token_via_api() -> Dict[str, Any]:
     partner_key = settings.get_password("partner_key")
     refresh_token = getattr(settings, "refresh_token", None)
     shop_id = getattr(settings, "shop_id", None)
+    
     if not (refresh_token and shop_id):
         raise AuthRequired("Missing refresh_token or shop_id for refresh flow")
+    
     timestamp = int(time.time())
-    base_string = (
-        str(partner_id) + OAUTH_REFRESH_PATH + str(timestamp) + refresh_token + str(shop_id)
-    )
+    
+    # For Public APIs signature: partner_id + api_path + timestamp
+    base_string = f"{partner_id}{OAUTH_REFRESH_PATH}{timestamp}"
     sign = hmac_sha256(base_string, partner_key)
+    
+    # Build request body
+    request_body = {
+        "partner_id": partner_id,
+        "shop_id": int(shop_id),
+        "refresh_token": refresh_token,
+    }
+    
     return {
         "method": "POST",
-        "url": f"{_base_url(settings.environment)}{OAUTH_REFRESH_PATH}",
-        "json": {
-            "partner_id": partner_id,
-            "shop_id": int(shop_id),
-            "refresh_token": refresh_token,
-            "timestamp": timestamp,
-            "sign": sign,
-        },
+        "url": f"{_base_url(settings.environment)}{OAUTH_REFRESH_PATH}?partner_id={partner_id}&timestamp={timestamp}&sign={sign}",
+        "json": request_body,
         "meta": {"signature_base": base_string},
     }
 
@@ -320,32 +520,106 @@ def sign_request(
     return {"url": url, "headers": headers, "meta": {"timestamp": timestamp, "signature_base": base_string}}
 
 def verify_webhook_signature(
-    path: str,  # kept for future parity / auditing
+    path: str,
     raw_body: bytes,
     headers: Dict[str, str],
-    push_key: str
+    push_key: str,
+    full_url: str = None
 ) -> bool:
     """Validate a Shopee webhook request.
 
-    Current Shopee webhook signing (v2) uses the raw body HMAC-SHA256 with the push key.
-    We optionally validate timestamp drift when header is present.
+    Shopee webhook signing (v2) uses Push Authorization with the following signature:
+    base_string = full_url + '|' + raw_body_as_string
+    signature = HMAC-SHA256(base_string, push_key)
+    
+    The signature is provided in the Authorization header.
 
     Args:
-        path: Original request path (not currently used for signature – reserved for future use).
+        path: Original request path.
         raw_body: Raw request body bytes.
         headers: Incoming HTTP headers (case-sensitive keys expected as provided by Frappe).
         push_key: Shared secret key from Shopee dashboard (test or live push key).
+        full_url: Full URL including protocol and domain (required for Push Authorization).
     Returns:
-        True if signature (& optional timestamp) valid.
+        True if signature valid.
     Raises:
         SignatureMismatch: on any mismatch or malformed header.
     """
+    # Check for Authorization header (Push Authorization method)
+    auth_header = headers.get("Authorization")
+    if auth_header:
+        return _verify_push_authorization(full_url or f"https://erp.managerio.ddns.net{path}", 
+                                        raw_body, push_key, auth_header)
+    
+    # Fallback to legacy signature verification method
     signature_header = headers.get(WEBHOOK_SIGNATURE_HEADER)
-    if not signature_header:
-        raise SignatureMismatch(f"Missing {WEBHOOK_SIGNATURE_HEADER} header")
+    if signature_header:
+        return _verify_legacy_signature(raw_body, push_key, signature_header, headers)
+    
+    raise SignatureMismatch("Missing both Authorization and X-Shopee-Signature headers")
+
+
+def _verify_push_authorization(full_url: str, raw_body: bytes, push_key: str, authorization: str) -> bool:
+    """Verify Push Authorization signature.
+    
+    Per Shopee specification:
+    1. Create base string: full_url + '|' + request_body_as_string
+    2. Generate HMAC-SHA256 signature using partner_key
+    3. Compare with Authorization header value
+    
+    Args:
+        full_url: Complete URL including protocol and domain
+        raw_body: Raw request body bytes
+        push_key: Partner key for HMAC generation
+        authorization: Authorization header value
+    Returns:
+        True if signature matches
+    Raises:
+        SignatureMismatch: if signature doesn't match
+    """
+    try:
+        # Convert raw body to string
+        body_str = raw_body.decode('utf-8') if raw_body else ''
+        
+        # Create signature base string: URL + '|' + body
+        base_string = f"{full_url}|{body_str}"
+        
+        # Generate expected signature
+        computed_signature = hmac_sha256(base_string, push_key)
+        
+        # Compare signatures using constant-time comparison
+        if not constant_time_compare(authorization, computed_signature):
+            raise SignatureMismatch("Push Authorization signature mismatch")
+        
+        return True
+        
+    except UnicodeDecodeError:
+        raise SignatureMismatch("Unable to decode webhook body as UTF-8")
+    except Exception as e:
+        raise SignatureMismatch(f"Push Authorization verification failed: {str(e)}")
+
+
+def _verify_legacy_signature(raw_body: bytes, push_key: str, signature_header: str, headers: Dict[str, str]) -> bool:
+    """Verify legacy webhook signature method.
+    
+    Legacy method uses raw body HMAC-SHA256 with push key.
+    Also validates timestamp drift if present.
+    
+    Args:
+        raw_body: Raw request body bytes
+        push_key: Partner key for HMAC generation
+        signature_header: X-Shopee-Signature header value
+        headers: All request headers
+    Returns:
+        True if signature valid
+    Raises:
+        SignatureMismatch: if signature doesn't match
+    """
     computed = hmac_sha256(raw_body, push_key, raw=True)
     if not constant_time_compare(signature_header, computed):
-        raise SignatureMismatch("Webhook signature mismatch")
+        raise SignatureMismatch("Legacy webhook signature mismatch")
+    
+    # Validate timestamp drift if present
     ts_header = headers.get(WEBHOOK_TIMESTAMP_HEADER)
     if ts_header:
         try:
@@ -357,13 +631,92 @@ def verify_webhook_signature(
             raise
         except Exception:
             raise SignatureMismatch("Invalid webhook timestamp header")
+    
     return True
+
+def refresh_access_token() -> Dict[str, Any]:
+    """Complete token refresh flow with HTTP call and persistence.
+    
+    Returns:
+        Dict with refresh result and new token info.
+    """
+    from . import clients
+    
+    try:
+        # Get refresh payload 
+        payload = refresh_token_via_api()
+        
+        # Execute HTTP request
+        response = clients._do_request(
+            payload["method"],
+            payload["url"], 
+            {"Content-Type": "application/json"},
+            None,
+            payload["json"],
+            None
+        )
+        
+        status, text, headers = response
+        
+        if status != 200:
+            raise Exception(f"Refresh failed: HTTP {status} - {text}")
+        
+        # Parse response
+        import json
+        data = json.loads(text)
+        
+        if data.get("error"):
+            raise Exception(f"Shopee API error: {data}")
+        
+        # Extract new tokens
+        new_access_token = data.get("access_token")
+        new_refresh_token = data.get("refresh_token") 
+        expires_in = data.get("expires_in", 14400)  # 4 hours default
+        
+        if not new_access_token:
+            raise Exception("No access_token in refresh response")
+        
+        # Persist new tokens
+        settings = _settings()
+        settings.access_token = new_access_token
+        if new_refresh_token:
+            settings.refresh_token = new_refresh_token
+            
+        # Convert expires_in to datetime for the Datetime field
+        # Use Frappe's utility to properly handle timezone conversion  
+        from datetime import datetime, timedelta, timezone
+        expires_datetime = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        # Convert to Frappe's expected format (automatically handles timezone)
+        settings.token_expires_at = frappe.utils.get_datetime(expires_datetime)
+        
+        settings.save(ignore_permissions=True)
+        frappe.db.commit()
+        
+        # Clear cache
+        frappe.cache().delete_value("Shopee Settings")
+        
+        frappe.logger().info("[Shopee] Access token refreshed successfully")
+        
+        return {
+            "success": True,
+            "expires_in": expires_in,
+            "expires_at": settings.token_expires_at
+        }
+        
+    except Exception as e:
+        frappe.log_error(f"Token refresh failed: {str(e)}", "Shopee Token Refresh")
+        return {"success": False, "error": str(e)}
+
 
 def cron_refresh_job():  # pragma: no cover - scheduled job wrapper
     """Background job wrapper invoked by the scheduler (no arguments)."""
     try:
         if refresh_if_needed():
-            frappe.logger().info("[Shopee] Token refresh suggested by cron")
+            result = refresh_access_token()
+            if result.get("success"):
+                frappe.logger().info("[Shopee] Token refresh successful via cron")
+            else:
+                frappe.logger().warning(f"[Shopee] Token refresh failed: {result.get('error')}")
     except Exception as exc:  # swallow to avoid job crash
         frappe.logger().warning(f"[Shopee] cron refresh error: {exc}")
 
@@ -416,9 +769,11 @@ def constant_time_compare(val1: str, val2: str) -> bool:
 __all__ = [
     "build_authorize_url",
     "handle_oauth_callback",
+    "complete_token_exchange",
     "exchange_code_for_token",
     "refresh_if_needed",
     "refresh_token_via_api",
+    "refresh_access_token",
     "sign_request",
     "verify_webhook_signature",
     "schedule_token_renewal_cron",

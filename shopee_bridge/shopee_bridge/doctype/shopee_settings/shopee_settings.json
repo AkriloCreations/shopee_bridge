@@ -22,7 +22,7 @@
       "fieldname": "environment",
       "fieldtype": "Select",
       "label": "Environment",
-      "options": "live\ntest",
+      "options": "Test\nProduction",
       "reqd": 1,
       "default": "test"
     },
@@ -37,12 +37,25 @@
       "fieldname": "redirect_url",
       "fieldtype": "Data",
       "label": "Redirect URL",
-      "reqd": 1
+      "reqd": 1,
+      "default": "https://erp.managerio.ddns.net/app/shopee-settings"
     },
     {
       "fieldname": "shop_id",
       "fieldtype": "Data",
       "label": "Shop ID"
+    },
+    {
+      "fieldname": "merchant_id",
+      "fieldtype": "Data",
+      "label": "Merchant ID",
+      "description": "For merchant apps (optional)"
+    },
+    {
+      "fieldname": "last_auth_code",
+      "fieldtype": "Data",
+      "label": "Authorization Code",
+      "description": "Enter the code from OAuth callback (valid for 10 minutes)"
     },
     {
       "fieldname": "access_token",
@@ -99,24 +112,11 @@
       "options": "Bank Account"
     },
     {
-      "fieldname": "fee_account_uuid",
-      "fieldtype": "Data",
-      "label": "Fee Account UUID"
-    },
-    {
-      "fieldname": "voucher_account_uuid",
-      "fieldtype": "Data",
-      "label": "Voucher Account UUID"
-    },
-    {
-      "fieldname": "delivery_protection_account_uuid",
-      "fieldtype": "Data",
-      "label": "Delivery Protection Account UUID"
-    },
-    {
-      "fieldname": "shipping_diff_account_uuid",
-      "fieldtype": "Data",
-      "label": "Shipping Diff Account UUID"
+      "fieldname": "fee_account",
+      "fieldtype": "Link",
+      "label": "Fee Account",
+      "options": "Account",
+      "description": "Account for Shopee transaction fees (automatically managed)"
     },
     {
       "fieldname": "last_auth_error",
