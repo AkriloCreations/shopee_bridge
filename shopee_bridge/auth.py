@@ -8,12 +8,6 @@ def _utc_naive(expires_in_seconds: int):
     """Hitung expiry dalam UTC aware lalu simpan sebagai naive UTC."""
     return (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).replace(tzinfo=None)
 
-def _persist_single(doctype: str, field: str, value):
-    """Set nilai Single Doctype via DB API agar tidak ke-cache."""
-    frappe.db.set_single_value(doctype, field, value)
-    frappe.db.commit()
-    frappe.clear_cache(doctype=doctype)
-
 from typing import List, Dict, Any, Union, Optional
 import time
 import hmac
@@ -87,15 +81,9 @@ class ShopeeAuthError(Exception):
 # Internal helpers
 # ---------------------------------------------------------------------------
 def _settings() -> frappe.model.document.Document:
-    """Get cached Shopee Settings doc.
-
-    Returns:
-        The cached document instance.
-    Raises:
-        AuthRequired: if the document cannot be loaded (app not yet installed).
-    """
+    ## ambil data direct langsung dari DB ##
     try:
-        return frappe.get_cached_doc("Shopee Settings")
+        return frappe.get_doc("Shopee Settings")
     except Exception as exc:  # pragma: no cover - defensive guard
         raise AuthRequired("Shopee Settings not configured") from exc
 
@@ -316,7 +304,7 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         settings = _settings()
         settings.access_token = access_token
         settings.refresh_token = refresh_token
-        settings.token_expires_at = _utc_naive(expires_in)
+        settings.token_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in))
         settings.last_auth_code = code
         if returned_shop_id:
             settings.shop_id = str(returned_shop_id)
@@ -673,7 +661,7 @@ def refresh_access_token() -> Dict[str, Any]:
         settings.access_token = access_token
         if refresh_token:
             settings.refresh_token = refresh_token
-        settings.token_expires_at = _utc_naive(expires_in)
+        settings.token_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in))
         settings.save(ignore_permissions=True)
         frappe.db.commit()
         frappe.cache().delete_value("Shopee Settings")
