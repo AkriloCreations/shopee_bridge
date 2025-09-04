@@ -4,46 +4,64 @@ You are generating a brand new ERPNext app named **shopee_bridge** that integrat
 Your output must be production-ready skeletons with clear separation of concerns, idempotent writes, 
 and minimal side effects. Write clean, typed Python where possible and add rich docstrings.
 
-## Architecture rules
+## Architecture rules (UPDATED to match current repo)
 - App name: `shopee_bridge`
-- Python package layout must be:
+- Current Python package layout (outer folder is the app root, inner `shopee_bridge/` holds Frappe doctypes — keep this convention until a consolidation refactor is explicitly requested):
+
   shopee_bridge/
-    api.py                     # thin façade, whitelisted ERPNext endpoints
-    auth.py                    # OAuth v2, token store, HMAC signing, webhook verification
-    clients.py                 # signed HTTP GET/POST wrappers + 401 rotate
-    mappers.py                 # pure mappers: Shopee → ERPNext rows (no frappe writes)
+    api.py                      # thin façade, whitelisted ERPNext endpoints ONLY
+    auth.py                     # OAuth v2, token store helpers, HMAC signing, webhook verification
+    clients.py                  # signed HTTP GET/POST wrappers + 401 rotate logic
+    mappers.py                  # pure transformation functions (Shopee → ERPNext) — NO DB writes
     services/
-      orders.py                # order pull/upsert + SO/SI/DN "ensure_*" functions
-      logistics.py             # shipping status + label attach
-      returns.py               # returns/refunds upsert + CN/SR creation
-      finance.py               # escrow fees patch + bank transaction + reconcile
-      fiscal.py                # full-year backfill orchestrator
-      webhook_handlers.py      # handle_order_push/return/logistics (idempotent)
+      orders.py                 # order pull/upsert + SO/SI/DN ensure_* functions
+      logistics.py              # shipping status + label/airwaybill attach
+      returns.py                # returns/refunds ensure_* + CN/SR creation
+      finance.py                # escrow fees patch + bank transaction ensure_* + reconcile
+      fiscal.py                 # full-year / ranged backfill orchestrator
+      webhook_handlers.py       # push event handlers (idempotent, no HTTP logic)
     jobs/
-      sync_orders.py           # cron incremental pulls (10m)
-      sync_shipping.py
-      sync_returns.py
-      sync_finance.py          # hourly escrow batch
-      process_webhook.py       # dispatcher + retry_due
-      reconcile_bank.py
-      backfill_fy.py
-    shopee_bridge/doctype/
-      shopee_settings/
-        shopee_settings.json   # Single doctype schema
-        shopee_settings.py     # server methods (connect/test/webhooks buttons)
-      shopee_webhook_inbox/
-        shopee_webhook_inbox.json
-        shopee_webhook_inbox.py
-      shopee_sync_log/
-        shopee_sync_log.json
-        shopee_sync_log.py
-    setup/install.py           # after_install → create Custom Fields & defaults
-    patches.txt
-    patches/add_custom_fields.py
+      sync_orders.py            # cron incremental pulls (≈10m)
+      sync_shipping.py          # cron shipping status refresh
+      sync_returns.py           # cron returns refresh
+      sync_finance.py           # hourly escrow batch
+      process_webhook.py        # inbox dispatcher + retry_due logic
+      reconcile_bank.py         # bank strict reconcile job
+      backfill_fy.py            # fiscal year backfill orchestrator entry
+    config/
+      desktop.py
+      docs.py
+    docs/
+      workflow.md               # functional workflow reference
+    patches/
+      0001_bootstrap.py         # initial bootstrap (custom fields / setup)
+      0002_fix_workspace.py     # workspace / metadata adjustments
+      (add new patch files sequentially: 0003_*, 0004_* ...)
+    setup/
+      install.py                # after_install hook → create custom fields & defaults
     hooks.py
-    config/desktop.py
-    config/docs.py
-    docs/workflow.md           # functional workflow (already provided by user)
+    pyproject.toml              # dependencies & build metadata
+    README.md
+    license.txt
+    shopee_bridge/              # INNER package for doctypes (Frappe automatically discovers)
+      doctype/
+        shopee_settings/
+          shopee_settings.json
+          shopee_settings.py
+          shopee_settings.js
+        shopee_webhook_inbox/
+          shopee_webhook_inbox.json
+          shopee_webhook_inbox.py
+        shopee_sync_log/
+          shopee_sync_log.json
+          shopee_sync_log.py
+        customer_issue/         # optional / extended return integration
+          customer_issue.json
+          customer_issue.py
+
+- NOTE: Original plan referenced `patches/add_custom_fields.py`. Current implementation consolidated this into numbered patch files. Continue with incremental numeric naming to preserve migration ordering.
+
+- Potential future refactor (not immediate): flatten doctypes into the outer package once stability confirmed. Until then, instructions here intentionally mirror current layout for consistency.
 
 - Do not put business logic in `api.py`. It must only validate input, call services/jobs and return JSON.
 - Each "ensure_*" function must be **idempotent**. Keys:
