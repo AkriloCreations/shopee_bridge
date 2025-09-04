@@ -2,101 +2,21 @@
   "doctype": "DocType",
   "name": "Shopee Webhook Inbox",
   "module": "Shopee Bridge",
-  "standard": "Yes",
+  "issingle": 0,
+  "custom": 0,
+  "istable": 0,
+  "autoname": "hash",
   "fields": [
-    {
-      "fieldname": "event_type",
-      "label": "Event Type",
-      "fieldtype": "Data",
-      "reqd": 1,
-      "idx": 1
-    },
-    {
-      "fieldname": "source_env",
-      "label": "Source Environment",
-      "fieldtype": "Select",
-      "options": "live\ntest",
-      "reqd": 1,
-      "idx": 2
-    },
-    {
-      "fieldname": "idempotency_key",
-      "label": "Idempotency Key",
-      "fieldtype": "Data",
-      "unique": 1,
-      "reqd": 1,
-      "idx": 3
-    },
-    {
-      "fieldname": "signature_valid",
-      "label": "Signature Valid",
-      "fieldtype": "Check",
-      "default": "0",
-      "idx": 4
-    },
-    {
-      "fieldname": "status",
-      "label": "Status",
-      "fieldtype": "Select",
-      "options": "queued\nprocessing\ndone\nfailed\nskipped",
-      "default": "queued",
-      "reqd": 1,
-      "idx": 5
-    },
-    {
-      "fieldname": "attempts",
-      "label": "Attempts",
-      "fieldtype": "Int",
-      "default": "0",
-      "idx": 6
-    },
-    {
-      "fieldname": "next_retry_at",
-      "label": "Next Retry At",
-      "fieldtype": "Datetime",
-      "idx": 7
-    },
-    {
-      "fieldname": "payload_hash",
-      "label": "Payload Hash",
-      "fieldtype": "Data",
-      "idx": 8
-    },
-    {
-      "fieldname": "payload_json",
-      "label": "Payload JSON",
-      "fieldtype": "Long Text",
-      "idx": 9
-    },
-    {
-      "fieldname": "error_message",
-      "label": "Error Message",
-      "fieldtype": "Small Text",
-      "idx": 10
-    },
-    {
-      "fieldname": "processed_at",
-      "label": "Processed At",
-      "fieldtype": "Datetime",
-      "idx": 11
-    }
-  ],
-  "is_submittable": 0,
-  "track_seen": 0,
-  "permissions": [
-    {
-      "role": "System Manager",
-      "read": 1,
-      "write": 1
-    },
-    {
-      "role": "Integration User",
-      "read": 1,
-      "write": 1
-    }
-  ],
-  "autoname": "",
-  "editable_grid": 0,
-  "sort_field": "creation",
-  "sort_order": "desc"
+    {"fieldname": "event_type", "fieldtype": "Data", "label": "Event Type", "reqd": 1},
+    {"fieldname": "source_env", "fieldtype": "Select", "label": "Source Env", "options": "live\ntest", "reqd": 1},
+    {"fieldname": "idempotency_key", "fieldtype": "Data", "label": "Idempotency Key", "reqd": 1, "unique": 1},
+    {"fieldname": "signature_valid", "fieldtype": "Check", "label": "Signature Valid"},
+    {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "queued\nprocessing\ndone\nfailed\nskipped", "reqd": 1, "default": "queued"},
+    {"fieldname": "payload_hash", "fieldtype": "Data", "label": "Payload Hash"},
+    {"fieldname": "payload_json", "fieldtype": "Long Text", "label": "Payload JSON"},
+    {"fieldname": "error_message", "fieldtype": "Small Text", "label": "Error Message"},
+    {"fieldname": "processed_at", "fieldtype": "Datetime", "label": "Processed At"},
+    {"fieldname": "next_retry_at", "fieldtype": "Datetime", "label": "Next Retry At"},
+    {"fieldname": "attempts", "fieldtype": "Int", "label": "Attempts", "default": "0"}
+  ]
 }
