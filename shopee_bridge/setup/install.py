@@ -61,6 +61,25 @@ def ensure_module_def(mod_name: str):
         })
         sanitize_doc_strings(doc)
         doc.insert(ignore_permissions=True)
+    # Reuse existing path mapping; clear cache supaya registry modul ter-refresh.
+    try:
+        frappe.clear_cache()  # memastikan modules.txt reread
+        frappe.get_module_path(mod_name)  # validasi
+    except Exception:
+        # Fallback manual: cek apakah folder scrubbed sudah ada → kalau ada anggap OK.
+        from frappe.utils import scrub
+        import os
+        try:
+            app_path = frappe.get_app_path("shopee_bridge")
+            candidate = os.path.join(app_path, scrub(mod_name))
+            if os.path.isdir(candidate):
+                return  # path sebenarnya ada; abaikan kegagalan registry sementara
+        except Exception:  # pragma: no cover - fallback minimal
+            pass
+        frappe.log_error(
+            f"Module path lookup gagal untuk '{mod_name}'. Pastikan tercantum di modules.txt dan folder scrub '{scrub(mod_name)}' ada.",
+            "Shopee Bridge ensure_module_def"
+        )
 
 
 def ensure_workspace(mod_name: str, ws_name: str, seq: int | None = None):
@@ -275,6 +294,16 @@ def after_install():
         try:
             ensure_module_def(mod)
             ensure_workspace(mod, mod, seq=998)  # ubah angka kalau perlu posisi lain
+            # 2b) Pastikan shortcut utama Shopee Settings ada
+            try:
+                ensure_workspace_shortcut(
+                    workspace=mod,
+                    shortcut_group_label="Shopee",
+                    item_label="Shopee Settings",
+                    link_doctype="Shopee Settings",
+                )
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "Shopee Bridge ensure workspace shortcut")
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Shopee Bridge ensure workspace")
 

@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"SZvBJq_XQ8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Shopee Settings\",\"col\":3}},{\"id\":\"uWsIUNuTjY\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Webhook Request Log\",\"col\":3}}]",
+ "content": "[{\"type\": \"shortcut\", \"label\": \"Shopee\", \"items\": [{\"label\": \"Shopee Settings\", \"type\": \"DocType\", \"link_to\": \"DocType/Shopee Settings\"}]}]",
  "creation": "2025-09-04 22:16:16.287869",
  "custom_blocks": [],
  "docstatus": 0,
@@ -13,7 +13,7 @@
  "is_hidden": 0,
  "label": "Shopee Bridge",
  "links": [],
- "modified": "2025-09-04 22:29:43.668204",
+ "modified": "2025-09-04 23:04:12.610073",
  "modified_by": "Administrator",
  "module": "Shopee Bridge",
  "name": "Shopee Bridge",
@@ -29,17 +29,16 @@
   {
    "color": "Grey",
    "doc_view": "List",
+   "format": "",
+   "icon": "",
+   "kanban_board": "",
    "label": "Shopee Settings",
    "link_to": "Shopee Settings",
-   "type": "DocType"
-  },
-  {
-   "color": "Grey",
-   "doc_view": "List",
-   "label": "Webhook Request Log",
-   "link_to": "Webhook Request Log",
-   "stats_filter": "[]",
-   "type": "DocType"
+   "report_ref_doctype": "",
+   "restrict_to_domain": "",
+   "stats_filter": "",
+   "type": "DocType",
+   "url": ""
   }
  ],
  "title": "Shopee Bridge"

@@ -1,5 +1,4 @@
-import frappe
-import json
+import frappe, json
 from datetime import datetime
 
 def write_log(
@@ -9,53 +8,56 @@ def write_log(
     message: str = "",
     meta: dict | None = None,
     payload_hash: str | None = None,
-    keep: int = 200,
+    keep_tail: int = 200,
 ) -> str:
-    """Append a line to the Single Shopee Sync Log document.
+    """Create / update a Shopee Sync Log row (standard DocType).
 
-    Since the doctype is now Single, we keep a rolling tail of recent log
-    lines inside the Long Text field ``log_tail`` for quick inspection.
-    Structured / aggregated info can be passed via ``meta`` which will be
-    dumped into ``payload_sample`` (overwritten each call) for debugging.
+    Behavior:
+    - One row per (job, key) combination per run; if existing open row with same status found
+      we append tail, else create new row.
+    - Maintains rolling tail (max keep_tail lines) in `log_tail`.
+    - Stores aggregated counters from meta.
     """
-    # Access single doc
-    doc = frappe.get_doc("Shopee Sync Log")  # single
-
+    if not job:
+        job = "unknown"
+    if not key:
+        key = "n/a"
+    existing_name = frappe.db.get_value(
+        "Shopee Sync Log",
+        {"job": job, "key_ref": key},
+        "name",
+    )
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts} | {job} | {key} | {status} | {message[:300]}".strip()
-
-    tail = (doc.log_tail or "").splitlines() if getattr(doc, "log_tail", None) else []
-    tail.append(line)
-    # trim
-    if len(tail) > keep:
-        tail = tail[-keep:]
-
-    doc.log_tail = "\n".join(tail)
-    if meta:
-        # store latest meta snapshot
+    line = f"{ts} | {status} | {message[:300]}".strip()
+    if existing_name:
+        doc = frappe.get_doc("Shopee Sync Log", existing_name)
+        tail = (doc.log_tail or "").splitlines()
+        tail.append(line)
+        if len(tail) > keep_tail:
+            tail = tail[-keep_tail:]
+        doc.log_tail = "\n".join(tail)
+        doc.status = status
+    else:
+        doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "job": job,
+            "key_ref": key,
+            "sync_type": meta.get("sync_type") if isinstance(meta, dict) else "orders",
+            "status": status,
+            "log_tail": line,
+        })
+    # meta snapshot
+    if isinstance(meta, dict):
         try:
             doc.payload_sample = json.dumps(meta, ensure_ascii=False, indent=2)[:100000]
-        except Exception:  # pragma: no cover
+        except Exception:
             doc.payload_sample = str(meta)[:100000]
-    doc.notes = (doc.notes or "") if hasattr(doc, "notes") else ""
-    doc.last_updated = datetime.utcnow()
-    # update counters if provided in meta
-    if isinstance(meta, dict):
         for fld in ["total", "success", "failed"]:
-            if fld in meta and hasattr(doc, fld):
+            if fld in meta:
                 setattr(doc, fld, int(meta.get(fld) or 0))
-    frappe.db.set_value(
-        "Shopee Sync Log",
-        None,  # single
-        {
-            "log_tail": doc.log_tail,
-            "payload_sample": getattr(doc, "payload_sample", None),
-            "notes": doc.notes,
-            "total": getattr(doc, "total", None),
-            "success": getattr(doc, "success", None),
-            "failed": getattr(doc, "failed", None),
-            "last_updated": doc.last_updated,
-        },
-        update_modified=True,
-    )
-    return "Shopee Sync Log"
+        if meta.get("sync_type"):
+            doc.sync_type = meta.get("sync_type")
+    doc.last_updated = datetime.utcnow()
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name

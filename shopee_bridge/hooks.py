@@ -52,5 +52,7 @@ override_whitelisted_methods = {
 }
 
 # Optional fixtures placeholder (enable only if needed to ship static Custom Fields / Module Def)
-# fixtures = ["Custom Field"]
+fixtures = [
+    {"doctype": "DocType", "filters": {"name": ["in", ["Shopee Sync Log"]]}}
+]
 

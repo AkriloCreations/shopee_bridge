@@ -2,16 +2,18 @@
   "doctype": "DocType",
   "name": "Shopee Sync Log",
   "module": "Shopee Bridge",
-  "issingle": 1,
+  "issingle": 0,
   "custom": 0,
   "istable": 0,
-  "autoname": "",
+  "autoname": "naming_series:",
+  "naming_series": "SHSYNC-.YYYY.MM.-.#####",
   "fields": [
     {
       "fieldname": "sync_type",
       "fieldtype": "Select",
       "label": "Sync Type",
-      "options": "orders\nreturns\nshipping\nfinance\nwebhook"
+      "options": "orders\nreturns\nshipping\nfinance\nwebhook",
+      "reqd": 1
     },
     {
       "fieldname": "status",
@@ -19,6 +21,19 @@
       "label": "Status",
       "options": "success\npartial\nfailed",
       "reqd": 1
+    },
+    {
+      "fieldname": "job",
+      "fieldtype": "Data",
+      "label": "Job",
+      "reqd": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "key_ref",
+      "fieldtype": "Data",
+      "label": "Key Reference",
+      "in_standard_filter": 1
     },
     {
       "fieldname": "from_ts",
