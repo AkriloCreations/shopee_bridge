@@ -125,6 +125,106 @@ def ensure_workspace(mod_name: str, ws_name: str, seq: int | None = None):
     ws.save(ignore_permissions=True)
 
 
+def ensure_workspace_shortcut(
+    workspace: str,
+    shortcut_group_label: str,
+    item_label: str,
+    link_doctype: str | None = None,
+    link_to: str | None = None,
+    item_type: str = "DocType",
+    icon: str | None = None,
+    force_update: bool = False,
+) -> bool:
+    """Tambahkan (idempoten) shortcut baru ke Workspace.
+
+    Struktur konten Workspace (Frappe v14+) yang kita pakai:
+    [
+        {"type": "shortcut", "label": "Shopee", "items": [
+            {"label": "Shopee Settings", "type": "DocType", "link_to": "DocType/Shopee Settings"}
+        ]}
+    ]
+
+    Fungsi ini akan:
+    - Membaca konten JSON yang ada (jika kosong → array baru)
+    - Mencari group (object dengan type=shortcut dan label == shortcut_group_label)
+    - Menambahkan item baru jika belum ada item dengan label sama
+    - Jika sudah ada dan force_update=True maka update field link_to / type / icon
+
+    Args:
+        workspace: Nama doc Workspace.
+        shortcut_group_label: Label group (misal "Shopee").
+        item_label: Label shortcut yang akan ditampilkan.
+        link_doctype: Jika diberikan dan link_to tidak, maka link_to otomatis jadi f"DocType/{link_doctype}".
+        link_to: Link tujuan (prioritas lebih tinggi daripada link_doctype).
+        item_type: Tipe item (DocType, Report, Page, dll).
+        icon: Optional ikon (akan disimpan pada item bila diberikan).
+        force_update: Jika True dan item sudah ada → update propertinya.
+    Returns:
+        bool: True jika ada perubahan dan disimpan, False jika tidak ada perubahan.
+    """
+    dt = "Workspace"
+    if not frappe.db.exists(dt, workspace):
+        raise ValueError(f"Workspace '{workspace}' belum ada. Pastikan sudah dibuat lewat ensure_workspace().")
+
+    ws = frappe.get_doc(dt, workspace)
+    raw = ws.content or "[]"
+    try:
+        content = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        content = []
+
+    if not isinstance(content, list):  # jaga-jaga format lama
+        content = []
+
+    # cari group
+    group = None
+    for blk in content:
+        if isinstance(blk, dict) and blk.get("type") == "shortcut" and blk.get("label") == shortcut_group_label:
+            group = blk
+            break
+
+    if not group:
+        group = {"type": "shortcut", "label": shortcut_group_label, "items": []}
+        content.append(group)
+
+    items = group.setdefault("items", [])
+    if not isinstance(items, list):
+        group["items"] = items = []
+
+    target_link = link_to or (f"DocType/{link_doctype}" if link_doctype else None)
+    if not target_link:
+        raise ValueError("Harus isi link_doctype atau link_to")
+
+    existing = None
+    for it in items:
+        if isinstance(it, dict) and it.get("label") == item_label:
+            existing = it
+            break
+
+    changed = False
+    if existing:
+        if force_update:
+            # update fields jika ada perubahan
+            if existing.get("type") != item_type:
+                existing["type"] = item_type; changed = True
+            if existing.get("link_to") != target_link:
+                existing["link_to"] = target_link; changed = True
+            if icon and existing.get("icon") != icon:
+                existing["icon"] = icon; changed = True
+    else:
+        new_item = {"label": item_label, "type": item_type, "link_to": target_link}
+        if icon:
+            new_item["icon"] = icon
+        items.append(new_item)
+        changed = True
+
+    if changed:
+        ws.content = json.dumps(content)
+        sanitize_doc_strings(ws)
+        ws.save(ignore_permissions=True)
+    return changed
+
+
 def after_install():
     """Idempotent post-install:
     - create custom fields
