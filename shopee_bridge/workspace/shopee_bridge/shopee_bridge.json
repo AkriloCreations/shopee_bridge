@@ -1,6 +1,9 @@
 {
+    "doctype": "Workspace",
+    "name": "Shopee Bridge",
     "label": "Shopee Bridge",
     "module": "Shopee Bridge",
+    "public": 1,
     "category": "Modules",
     "content": [
         {
