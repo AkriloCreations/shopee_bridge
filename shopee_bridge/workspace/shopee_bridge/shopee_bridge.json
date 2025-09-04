@@ -1,7 +1,0 @@
-{
-  "module": "Shopee Bridge",
-  "label": "Shopee Bridge",
-  "public": 1,
-  "sequence_id": 998,
-  "content": "[{\"type\":\"shortcut\",\"label\":\"Shopee\",\"items\":[{\"label\":\"Shopee Settings\",\"type\":\"DocType\",\"link_to\":\"DocType/Shopee Settings\"}]}]"
-}

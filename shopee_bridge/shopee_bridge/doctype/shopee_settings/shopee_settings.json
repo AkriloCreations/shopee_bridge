@@ -1,0 +1,133 @@
+{
+  "doctype": "DocType",
+  "name": "Shopee Settings",
+  "module": "Shopee Bridge",
+  "issingle": 1,
+  "custom": 0,
+  "istable": 0,
+  "fields": [
+    {
+      "fieldname": "partner_id",
+      "fieldtype": "Data",
+      "label": "Partner ID",
+      "reqd": 1
+    },
+    {
+      "fieldname": "partner_key",
+      "fieldtype": "Password",
+      "label": "Partner Key",
+      "reqd": 1
+    },
+    {
+      "fieldname": "region",
+      "fieldtype": "Select",
+      "label": "Region",
+      "options": "ID\nSG\nMY\nTH\nPH\nVN",
+      "reqd": 1
+    },
+    {
+      "fieldname": "redirect_url",
+      "fieldtype": "Data",
+      "label": "Redirect URL",
+      "reqd": 1
+    },
+    {
+      "fieldname": "shop_id",
+      "fieldtype": "Data",
+      "label": "Shop ID"
+    },
+    {
+      "fieldname": "access_token",
+      "fieldtype": "Password",
+      "label": "Access Token"
+    },
+    {
+      "fieldname": "refresh_token",
+      "fieldtype": "Password",
+      "label": "Refresh Token"
+    },
+    {
+      "fieldname": "token_expires_at",
+      "fieldtype": "Datetime",
+      "label": "Token Expires At"
+    },
+    {
+      "fieldname": "scopes",
+      "fieldtype": "Data",
+      "label": "Scopes"
+    },
+    {
+      "fieldname": "oauth_state",
+      "fieldtype": "Data",
+      "label": "OAuth State",
+      "hidden": 1
+    },
+    {
+      "fieldname": "live_partner_push_key",
+      "fieldtype": "Password",
+      "label": "Live Partner Push Key"
+    },
+    {
+      "fieldname": "test_partner_push_key",
+      "fieldtype": "Password",
+      "label": "Test Partner Push Key"
+    },
+    {
+      "fieldname": "webhook_live_enabled",
+      "fieldtype": "Check",
+      "label": "Enable LIVE Webhook",
+      "default": "0"
+    },
+    {
+      "fieldname": "webhook_test_enabled",
+      "fieldtype": "Check",
+      "label": "Enable TEST Webhook",
+      "default": "0"
+    },
+    {
+      "fieldname": "shopee_bank_account",
+      "fieldtype": "Link",
+      "label": "Shopee Bank Account",
+      "options": "Bank Account"
+    },
+    {
+      "fieldname": "fee_account_uuid",
+      "fieldtype": "Data",
+      "label": "Fee Account UUID"
+    },
+    {
+      "fieldname": "voucher_account_uuid",
+      "fieldtype": "Data",
+      "label": "Voucher Account UUID"
+    },
+    {
+      "fieldname": "delivery_protection_account_uuid",
+      "fieldtype": "Data",
+      "label": "Delivery Protection Account UUID"
+    },
+    {
+      "fieldname": "shipping_diff_account_uuid",
+      "fieldtype": "Data",
+      "label": "Shipping Diff Account UUID"
+    },
+    {
+      "fieldname": "last_auth_error",
+      "fieldtype": "Small Text",
+      "label": "Last Auth Error",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    },
+    {
+      "role": "Integration User",
+      "read": 1
+    }
+  ]
+}

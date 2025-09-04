@@ -1,0 +1,2 @@
+shopee_bridge.patches.0001_bootstrap
+shopee_bridge.patches.0002_fix_workspace

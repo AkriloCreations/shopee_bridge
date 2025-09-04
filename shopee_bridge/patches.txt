@@ -1,1 +1,0 @@
-shopee_bridge.patches.0001_bootstrap
