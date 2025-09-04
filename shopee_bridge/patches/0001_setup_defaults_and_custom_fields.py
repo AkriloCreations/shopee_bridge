@@ -19,16 +19,32 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 
 def _ensure_single_settings_record():
-    """Insert the single doctype row if it does not yet exist."""
+    # Pastikan definisi DocType sudah dimuat dari filesystem
     try:
-        frappe.get_doc("Shopee Settings")  # will load (single)
-    except DoesNotExistError:
-        # create empty single
-        try:
-            frappe.get_doc({"doctype": "Shopee Settings"}).insert(ignore_permissions=True)
-        except DuplicateEntryError:
-            # created concurrently elsewhere – ignore
-            pass
+        frappe.reload_doc("shopee_bridge", "doctype", "shopee_settings")
+    except Exception:
+        # kalau reload gagal (mis. saat initial), biarkan after_install yang seed
+        return
+
+    # Hanya lanjut kalau DocType sudah ada di DB
+    if not frappe.db.exists("DocType", "Shopee Settings"):
+        return
+
+    # Seed Singles kalau belum ada
+    try:
+        frappe.get_doc("Shopee Settings")  # akan load single; kalau belum ada, insert baru
+    except Exception:
+        doc = frappe.new_doc("Shopee Settings")
+        doc.update({
+            "partner_id": 0,
+            "partner_key": "",
+            "region": "",
+            "redirect_url": "",
+            "access_token": "",
+            "refresh_token": "",
+            "token_expires_at": None,
+        })
+        doc.insert(ignore_permissions=True)
 
 
 def _apply_default_settings():
@@ -101,8 +117,12 @@ def _create_custom_fields():
     create_custom_fields(custom_field_map, ignore_validate=True)
 
 
-def execute():  # frappe standard patch entrypoint
+def execute():
+    # reload semua artefak yang akan kamu sentuh di patch ini
+    try:
+        frappe.reload_doc("shopee_bridge", "doctype", "shopee_settings")
+    except Exception:
+        pass
+
+    # ... patch lain kamu ...
     _ensure_single_settings_record()
-    _apply_default_settings()
-    _create_custom_fields()
-    print("Shopee Bridge defaults/custom fields ensured")
