@@ -15,7 +15,7 @@ app_name = "shopee_bridge"
 app_title = "Shopee Bridge"
 app_publisher = "Your Team"
 app_description = "Shopee ↔ ERPNext integration"
-app_email = "dev@example.com"
+app_email = "akrilocreations@gmail.com"
 app_version = "0.1.0"
 app_license = "mit"
 

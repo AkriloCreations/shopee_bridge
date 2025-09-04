@@ -1,1 +1,1 @@
-Shopee Bridge
+shopee_bridge
