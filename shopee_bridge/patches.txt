@@ -1,1 +1,2 @@
 shopee_bridge.patches.0001_bootstrap
+shopee_bridge.patches.v2_0.migrate_to_v2

@@ -14,13 +14,13 @@ Future additions:
 app_name = "shopee_bridge"
 app_title = "Shopee Bridge"
 app_publisher = "Your Team"
-app_description = "Shopee ↔ ERPNext integration"
+app_description = "Modern Shopee ↔ ERPNext integration with smart self-healing"
 app_email = "akrilocreations@gmail.com"
-app_version = "0.1.0"
+app_version = "2.0.0"
 app_license = "mit"
 
-# Post-install bootstrap (creates custom fields, module, workspace, seed settings)
-after_install = "shopee_bridge.setup.install.after_install"
+# Modern post-install bootstrap (smart, self-healing system)
+after_install = "shopee_bridge.setup.install_v2.after_install"
 
 # Scheduler (cron based). Jobs are lightweight orchestrators; heavy logic lives in services.
 scheduler_events = {
@@ -51,8 +51,6 @@ override_whitelisted_methods = {
     "shopee_bridge.api.webhook_test": "shopee_bridge.api.webhook_test",
 }
 
-# Optional fixtures placeholder (enable only if needed to ship static Custom Fields / Module Def)
-fixtures = [
-    {"doctype": "DocType", "filters": {"name": ["in", ["Shopee Sync Log"]]}}
-]
+# Optional fixtures placeholder (currently unused in v2.0 - dynamic system doesn't need fixtures)
+# fixtures = []
 
