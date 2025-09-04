@@ -1,17 +1,102 @@
 {
-  "doctype": "Shopee Webhook Inbox",
+  "doctype": "DocType",
+  "name": "Shopee Webhook Inbox",
+  "module": "Shopee Bridge",
+  "standard": "Yes",
   "fields": [
-    {"fieldname": "event_type", "fieldtype": "Data"},
-    {"fieldname": "source_env", "fieldtype": "Data"},
-    {"fieldname": "idempotency_key", "fieldtype": "Data", "unique": 1},
-    {"fieldname": "signature_valid", "fieldtype": "Check"},
-    {"fieldname": "status", "fieldtype": "Select", "options": "queued\nprocessing\ndone\nfailed\nskipped"},
-    {"fieldname": "attempts", "fieldtype": "Int"},
-    {"fieldname": "next_retry_at", "fieldtype": "Datetime"},
-    {"fieldname": "payload_hash", "fieldtype": "Data"},
-    {"fieldname": "payload_json", "fieldtype": "Text"},
-    {"fieldname": "error_message", "fieldtype": "Text"},
-    {"fieldname": "processed_at", "fieldtype": "Datetime"},
-    {"fieldname": "creation", "fieldtype": "Datetime"}
-  ]
+    {
+      "fieldname": "event_type",
+      "label": "Event Type",
+      "fieldtype": "Data",
+      "reqd": 1,
+      "idx": 1
+    },
+    {
+      "fieldname": "source_env",
+      "label": "Source Environment",
+      "fieldtype": "Select",
+      "options": "live\ntest",
+      "reqd": 1,
+      "idx": 2
+    },
+    {
+      "fieldname": "idempotency_key",
+      "label": "Idempotency Key",
+      "fieldtype": "Data",
+      "unique": 1,
+      "reqd": 1,
+      "idx": 3
+    },
+    {
+      "fieldname": "signature_valid",
+      "label": "Signature Valid",
+      "fieldtype": "Check",
+      "default": "0",
+      "idx": 4
+    },
+    {
+      "fieldname": "status",
+      "label": "Status",
+      "fieldtype": "Select",
+      "options": "queued\nprocessing\ndone\nfailed\nskipped",
+      "default": "queued",
+      "reqd": 1,
+      "idx": 5
+    },
+    {
+      "fieldname": "attempts",
+      "label": "Attempts",
+      "fieldtype": "Int",
+      "default": "0",
+      "idx": 6
+    },
+    {
+      "fieldname": "next_retry_at",
+      "label": "Next Retry At",
+      "fieldtype": "Datetime",
+      "idx": 7
+    },
+    {
+      "fieldname": "payload_hash",
+      "label": "Payload Hash",
+      "fieldtype": "Data",
+      "idx": 8
+    },
+    {
+      "fieldname": "payload_json",
+      "label": "Payload JSON",
+      "fieldtype": "Long Text",
+      "idx": 9
+    },
+    {
+      "fieldname": "error_message",
+      "label": "Error Message",
+      "fieldtype": "Small Text",
+      "idx": 10
+    },
+    {
+      "fieldname": "processed_at",
+      "label": "Processed At",
+      "fieldtype": "Datetime",
+      "idx": 11
+    }
+  ],
+  "is_submittable": 0,
+  "track_seen": 0,
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1
+    },
+    {
+      "role": "Integration User",
+      "read": 1,
+      "write": 1
+    }
+  ],
+  "autoname": "",
+  "editable_grid": 0,
+  "sort_field": "creation",
+  "sort_order": "desc"
 }

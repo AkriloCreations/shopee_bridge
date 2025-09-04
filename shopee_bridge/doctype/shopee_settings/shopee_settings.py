@@ -1,86 +1,97 @@
-"""
-Shopee Settings doctype server methods.
-Whitelisted endpoints for OAuth, connection test, and Shopee integration setup.
-"""
-
 import frappe
 from frappe import _
-from frappe.model.document import get_cached_doc
+from frappe.model.document import Document
+from frappe.utils import now
+from shopee_bridge import auth
+
+def _get_settings():
+    """Fetch Shopee Settings Single Doc (cached)."""
+    return frappe.get_cached_doc("Shopee Settings", "Shopee Settings")
+
+def _validate_settings(settings):
+    """Ensure required Shopee credentials are present."""
+    missing = []
+    for field in ["partner_id", "partner_key", "redirect_url"]:
+        if not getattr(settings, field, None):
+            missing.append(field)
+    if missing:
+        raise frappe.ValidationError(_("Missing Shopee Settings fields: {0}").format(", ".join(missing)))
+
+def _set_last_auth_error(msg: str):
+    """Set last_auth_error on Shopee Settings Single."""
+    settings = frappe.get_doc("Shopee Settings", "Shopee Settings")
+    settings.last_auth_error = msg
+    settings.save(ignore_permissions=True)
+    frappe.db.commit()
 
 @frappe.whitelist()
 def connect_to_shopee(scopes=None):
     """
-    Start Shopee OAuth flow and return authorize URL.
+    Generate Shopee OAuth authorize URL for connecting a shop.
+
     Args:
-        scopes (list[str]|None): Shopee OAuth scopes.
+        scopes (list[str] | None): Shopee API scopes to request.
+
     Returns:
-        dict: {"url": "..."}
+        dict: {"url": "..."} Shopee OAuth URL.
+
     Raises:
-        Sets last_auth_error on Shopee Settings if validation fails or error occurs.
+        frappe.ValidationError: If required settings are missing.
     """
     try:
-        doc = frappe.get_cached_doc("Shopee Settings", "Shopee Settings")
-        required = [doc.partner_id, doc.partner_key, doc.redirect_url]
-        if not all(required):
-            msg = _("Shopee Settings missing required fields: partner_id, partner_key, redirect_url.")
-            doc.last_auth_error = msg
-            doc.save()
-            frappe.db.commit()
-            return {"error": msg}
-        # TODO: Import and call shopee_bridge.auth.build_authorize_url
-        # from shopee_bridge import auth
-        # url = auth.build_authorize_url(scopes or [])
-        url = "TODO: build_authorize_url"
+        settings = _get_settings()
+        _validate_settings(settings)
+        scopes = scopes or ["shop.basic.info", "order", "payment", "returns", "logistics"]
+        url = auth.build_authorize_url(scopes)
         return {"url": url}
     except Exception as e:
-        doc = frappe.get_cached_doc("Shopee Settings", "Shopee Settings")
-        doc.last_auth_error = str(e)
-        doc.save()
-        frappe.db.commit()
+        _set_last_auth_error(str(e))
+        frappe.log_error(message=str(e), title="Shopee Connect Error")
         return {"error": str(e)}
 
 @frappe.whitelist()
 def oauth_callback(**kwargs):
     """
     Handle Shopee OAuth callback and store tokens.
+
     Args:
         **kwargs: Callback parameters from Shopee.
+
     Returns:
-        dict: Result from auth.handle_oauth_callback
-    Raises:
-        Sets last_auth_error on Shopee Settings if error occurs.
+        dict: Result of OAuth handling.
+
+    Side Effects:
+        Updates Shopee Settings with tokens or error.
     """
     try:
-        # TODO: Import and call shopee_bridge.auth.handle_oauth_callback
-        # from shopee_bridge import auth
-        # result = auth.handle_oauth_callback(kwargs)
-        result = {"result": "TODO: handle_oauth_callback"}
+        settings = _get_settings()
+        _validate_settings(settings)
+        # TODO: Implement auth.handle_oauth_callback in shopee_bridge.auth
+        result = auth.handle_oauth_callback(kwargs)
         return result
     except Exception as e:
-        doc = frappe.get_cached_doc("Shopee Settings", "Shopee Settings")
-        doc.last_auth_error = str(e)
-        doc.save()
-        frappe.db.commit()
+        _set_last_auth_error(str(e))
+        frappe.log_error(message=str(e), title="Shopee OAuth Callback Error")
         return {"error": str(e)}
 
 @frappe.whitelist()
 def test_shopee_connection():
     """
-    Test Shopee API connection and return shop info.
+    Test Shopee API connection using current tokens.
+
     Returns:
         dict: Shop info or error.
-    Raises:
-        Sets last_auth_error on Shopee Settings if error occurs.
+
+    Side Effects:
+        Updates last_auth_error on failure.
     """
     try:
-        # TODO: Import and call shopee_bridge.auth.get_shop_info
-        # from shopee_bridge import auth
-        # info = auth.get_shop_info()
-        info = {"result": "TODO: get_shop_info"}
-        return info
+        settings = _get_settings()
+        _validate_settings(settings)
+        # TODO: Implement auth.get_shop_info in shopee_bridge.auth
+        result = auth.get_shop_info()
+        return result
     except Exception as e:
-        doc = frappe.get_cached_doc("Shopee Settings", "Shopee Settings")
-        doc.last_auth_error = str(e)
-        doc.save()
-        frappe.db.commit()
+        _set_last_auth_error(str(e))
+        frappe.log_error(message=str(e), title="Shopee Test Connection Error")
         return {"error": str(e)}
