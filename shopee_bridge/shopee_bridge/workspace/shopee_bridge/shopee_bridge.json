@@ -1,0 +1,93 @@
+{
+ "charts": [],
+ "content": "[]",
+ "creation": "2025-09-04 19:57:57.179061",
+ "custom_blocks": [],
+ "docstatus": 0,
+ "doctype": "Workspace",
+ "for_user": "",
+ "hide_custom": 0,
+ "icon": "",
+ "idx": 0,
+ "indicator_color": "green",
+ "is_hidden": 0,
+ "label": "Shopee Bridge",
+ "links": [
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Shopee Settings",
+   "link_count": 0,
+   "link_to": "Shopee Settings",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Webhook Logs",
+   "link_count": 0,
+   "link_to": "Shopee Webhook Inbox",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Customer Issue",
+   "link_count": 0,
+   "link_to": "Customer Issue",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  }
+ ],
+ "modified": "2025-09-04 20:15:56.058837",
+ "modified_by": "Administrator",
+ "module": "Shopee Bridge",
+ "name": "Shopee Bridge",
+ "number_cards": [],
+ "owner": "Administrator",
+ "parent_page": "",
+ "public": 1,
+ "quick_lists": [
+  {
+   "document_type": "Shopee Settings",
+   "label": "Settings"
+  },
+  {
+   "document_type": "Shopee Webhook Inbox",
+   "label": "Webhook"
+  },
+  {
+   "document_type": "Customer Issue",
+   "label": "Issue"
+  }
+ ],
+ "restrict_to_domain": "",
+ "roles": [],
+ "sequence_id": 0.0,
+ "shortcuts": [
+  {
+   "doc_view": "",
+   "label": "Settings",
+   "link_to": "Shopee Settings",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "",
+   "label": "Webhook Log",
+   "link_to": "Shopee Webhook Inbox",
+   "type": "DocType"
+  },
+  {
+   "doc_view": "",
+   "label": "Issue",
+   "link_to": "Customer Issue",
+   "type": "DocType"
+  }
+ ],
+ "title": "Shopee Bridge"
+}
