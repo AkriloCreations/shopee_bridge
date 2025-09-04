@@ -288,7 +288,8 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         # Extract tokens and identifiers
         access_token = data.get("access_token")
         refresh_token = data.get("refresh_token")
-        expires_in = data.get("expires_in", 14400)  # 4 hours default
+        # Ensure expires_in is an integer for datetime calculations
+        expires_in = int(data.get("expires_in", 14400))  # 4 hours default
         
         # API may return shop_id, merchant_id, or both
         returned_shop_id = data.get("shop_id")
@@ -302,12 +303,13 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         settings.access_token = access_token
         settings.refresh_token = refresh_token
         
-        # Convert expires_in to datetime for the Datetime field 
-        # Use Frappe's utility to properly handle timezone conversion
+        # Compute timezone-aware UTC expiry; storing aware avoids accidental timezone shifts on save
         from datetime import datetime, timedelta, timezone
         expires_datetime = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-        # Convert to Frappe's expected format (automatically handles timezone)
-        settings.token_expires_at = frappe.utils.get_datetime(expires_datetime)
+        settings.token_expires_at = expires_datetime  # aware UTC
+        frappe.logger().debug(
+            f"[Shopee] Setting token_expires_at (aware UTC) to {expires_datetime} (type: {type(expires_datetime)}), ts: {int(expires_datetime.timestamp())}"
+        )
         
         settings.last_auth_code = code  # for audit
         
@@ -326,6 +328,30 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         
         # Clear cache
         frappe.cache().delete_value("Shopee Settings")
+        
+        # Verify saved token_expires_at is a datetime (not a string) and normalize to AWARE UTC
+        settings_reloaded = _settings()
+        token_expires_check = getattr(settings_reloaded, "token_expires_at", None)
+        if token_expires_check:
+            need_save = False
+            if isinstance(token_expires_check, str):
+                frappe.logger().warning("[Shopee] token_expires_at saved as string, converting back to datetime (assumed UTC)")
+                token_expires_check = frappe.utils.get_datetime(token_expires_check)
+                need_save = True
+            # If naive, add UTC tzinfo
+            from datetime import timezone
+            if getattr(token_expires_check, 'tzinfo', None) is None:
+                token_expires_check = token_expires_check.replace(tzinfo=timezone.utc)
+                need_save = True
+                
+            if need_save:
+                settings_reloaded.token_expires_at = token_expires_check
+                settings_reloaded.save(ignore_permissions=True)
+                frappe.db.commit()
+                
+            frappe.logger().debug(
+                f"[Shopee] Final normalized token_expires_at (aware UTC): {settings_reloaded.token_expires_at}, ts: {int(token_expires_check.timestamp())}"
+            )
         
         frappe.logger().info(f"[Shopee] OAuth completed - shop_id: {settings.shop_id}, merchant_id: {getattr(settings, 'merchant_id', 'N/A')}")
         
@@ -405,33 +431,62 @@ def refresh_if_needed(buffer_seconds: int = 600) -> bool:
         True if a refresh SHOULD happen now, else False.
     """
     settings = _settings()
-    token_expires_at = getattr(settings, "token_expires_at", None)
-    if not token_expires_at:
+    raw = getattr(settings, "token_expires_at", None)
+    if not raw:
+        frappe.logger().debug("[Shopee] No token_expires_at found, refresh not needed")
         return False
     
-    # Convert datetime to timestamp
+    # Normalize token_expires_at to a timestamp for safe comparison
     try:
         from datetime import datetime, timezone
-        if isinstance(token_expires_at, str):
-            # Parse as UTC datetime string
-            expiry_dt = datetime.strptime(token_expires_at, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-        elif hasattr(token_expires_at, 'timestamp'):
-            # Already a datetime object
-            expiry_dt = token_expires_at
+        
+        # Log the raw value for debugging
+        frappe.logger().debug(f"[Shopee] Raw token_expires_at: {raw} (type: {type(raw)})")
+        
+        # Convert to datetime based on type
+        if isinstance(raw, str):
+            # Parse string to datetime
+            try:
+                expiry_dt = frappe.utils.get_datetime(raw)
+                frappe.logger().debug(f"[Shopee] Parsed string to datetime: {expiry_dt}")
+            except Exception as e:
+                frappe.logger().error(f"[Shopee] Failed to parse token_expires_at string: {e}")
+                return False
+        elif isinstance(raw, datetime):
+            # Already a datetime
+            expiry_dt = raw
+            frappe.logger().debug(f"[Shopee] Using existing datetime: {expiry_dt}")
         else:
-            # Use Frappe's get_datetime to convert properly
-            expiry_dt = frappe.utils.get_datetime(token_expires_at)
+            # Unknown type
+            frappe.logger().error(f"[Shopee] Unexpected token_expires_at type: {type(raw)}")
+            return False
+
+        # Treat stored value as naive UTC; attach UTC tz only for calculations
+        if expiry_dt.tzinfo is None:
+            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
         
-        expiry = int(expiry_dt.timestamp())
-    except (ValueError, AttributeError):
+        # Convert to timestamp for integer comparison - always use integer comparison
+        expiry_timestamp = int(expiry_dt.timestamp())
+        now_timestamp = int(time.time())
+        time_remaining = expiry_timestamp - now_timestamp
+        
+        # Make sure time_remaining is an integer to avoid type comparison issues
+        time_remaining = int(time_remaining)
+        
+        frappe.logger().debug(f"[Shopee] Token expires in {time_remaining} seconds (buffer: {buffer_seconds})")
+        
+        # Check if refresh needed - ensure both are integers
+        if int(time_remaining) < int(buffer_seconds):
+            frappe.logger().info(f"[Shopee] Token refresh needed (expires in {time_remaining}s)")
+            refresh_token_via_api()
+            return True
+        else:
+            frappe.logger().debug(f"[Shopee] Token refresh not needed yet (expires in {time_remaining}s)")
+            return False
+            
+    except Exception as e:
+        frappe.logger().error(f"[Shopee] Failed in refresh_if_needed: {e}")
         return False
-        
-    now = int(time.time())
-    if expiry - now < buffer_seconds:
-        # Prepare payload (not used here, but side effects minimal)
-        refresh_token_via_api()
-        return True
-    return False
 
 def refresh_token_via_api() -> Dict[str, Any]:
     """Produce payload for token refresh.
@@ -671,7 +726,8 @@ def refresh_access_token() -> Dict[str, Any]:
         # Extract new tokens
         new_access_token = data.get("access_token")
         new_refresh_token = data.get("refresh_token") 
-        expires_in = data.get("expires_in", 14400)  # 4 hours default
+        # Ensure expires_in is an integer for datetime calculations
+        expires_in = int(data.get("expires_in", 14400))  # 4 hours default
         
         if not new_access_token:
             raise Exception("No access_token in refresh response")
@@ -682,18 +738,42 @@ def refresh_access_token() -> Dict[str, Any]:
         if new_refresh_token:
             settings.refresh_token = new_refresh_token
             
-        # Convert expires_in to datetime for the Datetime field
-        # Use Frappe's utility to properly handle timezone conversion  
+        # Compute timezone-aware UTC expiry
         from datetime import datetime, timedelta, timezone
         expires_datetime = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-        # Convert to Frappe's expected format (automatically handles timezone)
-        settings.token_expires_at = frappe.utils.get_datetime(expires_datetime)
+        settings.token_expires_at = expires_datetime  # aware UTC
+        frappe.logger().debug(
+            f"[Shopee] Refresh: Setting token_expires_at (aware UTC) to {expires_datetime} (type: {type(expires_datetime)}), ts: {int(expires_datetime.timestamp())}"
+        )
         
         settings.save(ignore_permissions=True)
         frappe.db.commit()
         
         # Clear cache
         frappe.cache().delete_value("Shopee Settings")
+        
+        # Verify saved token_expires_at is a datetime (not a string) and normalize to AWARE UTC
+        settings_reloaded = _settings()
+        token_expires_check = getattr(settings_reloaded, "token_expires_at", None)
+        if token_expires_check:
+            need_save = False
+            if isinstance(token_expires_check, str):
+                frappe.logger().warning("[Shopee] token_expires_at saved as string, converting back to datetime (assumed UTC)")
+                token_expires_check = frappe.utils.get_datetime(token_expires_check)
+                need_save = True
+            from datetime import timezone
+            if getattr(token_expires_check, 'tzinfo', None) is None:
+                token_expires_check = token_expires_check.replace(tzinfo=timezone.utc)
+                need_save = True
+                
+            if need_save:
+                settings_reloaded.token_expires_at = token_expires_check
+                settings_reloaded.save(ignore_permissions=True)
+                frappe.db.commit()
+                
+            frappe.logger().debug(
+                f"[Shopee] Final normalized token_expires_at (aware UTC): {settings_reloaded.token_expires_at}, ts: {int(token_expires_check.timestamp())}"
+            )
         
         frappe.logger().info("[Shopee] Access token refreshed successfully")
         
@@ -706,6 +786,85 @@ def refresh_access_token() -> Dict[str, Any]:
     except Exception as e:
         frappe.log_error(f"Token refresh failed: {str(e)}", "Shopee Token Refresh")
         return {"success": False, "error": str(e)}
+
+
+def get_token_status() -> Dict[str, Any]:
+    """Get current token status information for debugging.
+    
+    Returns:
+        Dict with token expiry details and time remaining.
+    """
+    from datetime import datetime, timezone
+    import pytz
+    
+    settings = _settings()
+    access_token = getattr(settings, "access_token", None)
+    refresh_token = getattr(settings, "refresh_token", None)
+    raw_expires_at = getattr(settings, "token_expires_at", None)
+    
+    result = {
+        "has_access_token": bool(access_token),
+        "has_refresh_token": bool(refresh_token),
+        "raw_expires_at": str(raw_expires_at),
+        "raw_expires_at_type": str(type(raw_expires_at))
+    }
+    
+    # Calculate time remaining if possible
+    if raw_expires_at:
+        try:
+            # Normalize to datetime
+            if isinstance(raw_expires_at, str):
+                expiry_dt = frappe.utils.get_datetime(raw_expires_at)
+                result["parsed_from_string"] = True
+            elif isinstance(raw_expires_at, datetime):
+                expiry_dt = raw_expires_at
+                result["parsed_from_string"] = False
+            else:
+                result["error"] = f"Unexpected token_expires_at type: {type(raw_expires_at)}"
+                return result
+                
+            # Timezone information
+            result["has_timezone"] = expiry_dt.tzinfo is not None
+            result["original_timezone"] = str(expiry_dt.tzinfo)
+            
+            # If naive, assume UTC and make it aware
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                result["assumed_utc_added_tzinfo"] = True
+            
+            # Format in multiple timezones for verification
+            utc_time = expiry_dt.astimezone(timezone.utc)
+            try:
+                jakarta_tz = pytz.timezone("Asia/Jakarta")
+                jakarta_time = expiry_dt.astimezone(jakarta_tz)
+                result["jakarta_format"] = jakarta_time.strftime("%d-%m-%Y %H:%M:%S")
+                result["jakarta_format_with_tz"] = jakarta_time.strftime("%d-%m-%Y %H:%M:%S %Z%z")
+            except Exception as tz_error:
+                result["jakarta_tz_error"] = str(tz_error)
+                
+            # Get expiry timestamp and current time
+            expiry_timestamp = int(expiry_dt.timestamp())
+            now_timestamp = int(time.time())
+            # Ensure time_remaining is always an integer
+            time_remaining = int(expiry_timestamp - now_timestamp)
+            
+            result.update({
+                "normalized_expires_at": str(expiry_dt),
+                "utc_format": utc_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "iso_format": expiry_dt.isoformat(),
+                "expiry_timestamp": expiry_timestamp,
+                "current_timestamp": now_timestamp,
+                "seconds_remaining": time_remaining,
+                "minutes_remaining": round(time_remaining / 60, 1),
+                "hours_remaining": round(time_remaining / 3600, 2),
+                "is_expired": int(time_remaining) <= 0,
+                "needs_refresh": int(time_remaining) < 600  # 10 minutes buffer
+            })
+            
+        except Exception as e:
+            result["error"] = f"Failed to calculate expiry: {str(e)}"
+    
+    return result
 
 
 def cron_refresh_job():  # pragma: no cover - scheduled job wrapper
@@ -778,6 +937,7 @@ __all__ = [
     "verify_webhook_signature",
     "schedule_token_renewal_cron",
     "get_shop_info",
+    "get_token_status",
     # Exceptions
     "AuthRequired",
     "InvalidState",

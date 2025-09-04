@@ -5,8 +5,18 @@ class ShopeeSettings(Document):
     def validate(self):
         if not self.partner_id or not self.partner_key or not self.redirect_url:
             frappe.throw("Partner ID, Partner Key, dan Redirect URL wajib diisi.")
-        if self.token_expires_at and self.token_expires_at < frappe.utils.now():
-            frappe.msgprint("Access Token sudah expired, silakan refresh.")
+        
+        # Properly handle token expiration comparison
+        if self.token_expires_at:
+            from datetime import datetime
+            if isinstance(self.token_expires_at, str):
+                token_expires = frappe.utils.get_datetime(self.token_expires_at)
+            else:
+                token_expires = self.token_expires_at
+                
+            current_time = frappe.utils.now_datetime()
+            if token_expires < current_time:
+                frappe.msgprint("Access Token sudah expired, silakan refresh.")
 
 @frappe.whitelist()
 def connect_to_shopee(scopes: list[str] | None = None) -> dict:
