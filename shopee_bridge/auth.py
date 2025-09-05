@@ -51,7 +51,7 @@ TEST_BASE_URL = "https://partner.test-stable.shopeemobile.com"
 
 OAUTH_AUTHORIZE_PATH = "/api/v2/shop/auth_partner"
 OAUTH_TOKEN_PATH = "/api/v2/auth/token/get"
-OAUTH_REFRESH_PATH = "/api/v2/auth/token/refresh"
+OAUTH_REFRESH_PATH = "/api/v2/auth/access_token/get"  # This is the correct endpoint for refresh
 
 WEBHOOK_SIGNATURE_HEADER = "X-Shopee-Signature"
 WEBHOOK_TIMESTAMP_HEADER = "X-Shopee-Timestamp"
@@ -592,36 +592,39 @@ def _verify_legacy_signature(raw_body: bytes, push_key: str, signature_header: s
 
 def refresh_access_token() -> Dict[str, Any]:
     """Complete token refresh flow with HTTP call and persistence.
-    
+
     Returns:
         Dict with refresh result and new token info.
     """
     from . import clients
     try:
         payload = refresh_token_via_api()
+
         response = clients._do_request(
             payload["method"],
             payload["url"],
             {"Content-Type": "application/json"},
             None,
-            payload["json"],
-            None
+            payload.get("json"),
+            None,
         )
         status, text, headers = response
-        if status == 403 and "invalid_access_token" in text:
-            # Do not retry refresh to avoid infinite loop
-            raise ShopeeAuthError("invalid_access_token during refresh")
+
         if status != 200:
             raise Exception(f"Refresh failed: HTTP {status} - {text}")
+
         import json
         data = json.loads(text)
         if data.get("error"):
             raise Exception(f"Shopee API error: {data}")
+
         access_token = data.get("access_token")
         refresh_token = data.get("refresh_token")
         expires_in = int(data.get("expires_in", 14400))
+
         if not access_token:
             raise Exception("No access_token in refresh response")
+
         settings = _settings()
         settings.access_token = access_token
         if refresh_token:
@@ -630,15 +633,10 @@ def refresh_access_token() -> Dict[str, Any]:
         settings.save(ignore_permissions=True)
         frappe.db.commit()
         frappe.cache().delete_value("Shopee Settings")
+
         frappe.logger().info("[Shopee] Access token refreshed successfully")
-        return {
-            "success": True,
-            "expires_in": expires_in,
-            "expires_at": settings.token_expires_at
-        }
-    except ShopeeAuthError as e:
-        frappe.log_error(f"Token refresh failed: {str(e)}", "Shopee Token Refresh")
-        return {"success": False, "error": str(e)}
+        return {"success": True, "expires_in": expires_in, "expires_at": settings.token_expires_at}
+
     except Exception as e:
         frappe.log_error(f"Token refresh failed: {str(e)}", "Shopee Token Refresh")
         return {"success": False, "error": str(e)}

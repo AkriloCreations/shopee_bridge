@@ -2,6 +2,46 @@
 
 Shopee → ERPNext (OAuth + Orders)
 
+## Quick Start
+
+### Smoke Tests
+
+Run basic functionality tests:
+
+```bash
+# From the bench directory
+cd apps/shopee_bridge
+python tests/test_basic.py
+```
+
+### CLI Operations
+
+Use the CLI tool for quick operations:
+
+```bash
+# Audit recent orders
+python scripts/cli.py audit --days 7
+
+# Sync recent orders
+python scripts/cli.py sync --minutes 30
+
+# Check system health
+python scripts/cli.py health
+
+# Debug webhook payload
+python scripts/cli.py debug-webhook WEBHOOK_INBOX_NAME
+```
+
+### API Endpoints
+
+Key whitelisted endpoints for quick operations:
+
+- `audit_orders` - Audit recent orders
+- `sync_recent_orders` - Quick order sync
+- `check_token_health` - Token status check
+- `debug_webhook_payload` - Debug webhook issues
+- `get_sync_logs` - View recent sync logs
+
 
 ### Contributing
 

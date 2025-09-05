@@ -442,6 +442,136 @@ def refresh_token() -> Dict[str, Any]:
 		return _error(e)
 
 
+@frappe.whitelist()
+def audit_orders(days_back: int = 7) -> Dict[str, Any]:
+	"""Audit recent orders for data consistency.
+	
+	Args:
+		days_back: Number of days to look back
+		
+	Returns:
+		Audit results
+	"""
+	try:
+		from .. import helpers
+		
+		end_time = helpers.epoch_now()
+		start_time = end_time - (days_back * 24 * 60 * 60)
+		
+		from .services import orders
+		order_sns = orders.get_order_list(start_time, end_time)
+		
+		results = {
+			"total_orders": len(order_sns),
+			"period_days": days_back,
+			"start_time": start_time,
+			"end_time": end_time,
+			"sample_orders": order_sns[:5] if order_sns else []
+		}
+		
+		return _result({"audit": results})
+	except Exception as e:
+		return _error(e)
+
+
+@frappe.whitelist()
+def debug_webhook_payload(inbox_name: str) -> Dict[str, Any]:
+	"""Debug a webhook payload for troubleshooting.
+	
+	Args:
+		inbox_name: Name of webhook inbox record
+		
+	Returns:
+		Payload details
+	"""
+	try:
+		inbox = frappe.get_doc("Shopee Webhook Inbox", inbox_name)
+		payload = json.loads(inbox.payload_json)
+		
+		debug_info = {
+			"inbox_name": inbox_name,
+			"event_type": inbox.event_type,
+			"source_env": inbox.source_env,
+			"signature_valid": inbox.signature_valid,
+			"status": inbox.status,
+			"attempts": inbox.attempts,
+			"payload_keys": list(payload.keys()),
+			"payload_size": len(inbox.payload_json),
+			"created": inbox.creation,
+			"processed_at": inbox.processed_at
+		}
+		
+		return _result({"debug": debug_info, "payload": payload})
+	except Exception as e:
+		return _error(e)
+
+
+@frappe.whitelist()
+def sync_recent_orders(minutes: int = 30) -> Dict[str, Any]:
+	"""Quick sync for recent orders.
+	
+	Args:
+		minutes: Minutes to look back
+		
+	Returns:
+		Sync results
+	"""
+	try:
+		from .services import orders
+		result = orders.sync_incremental_orders(updated_since_minutes=minutes)
+		return _result({"sync": result})
+	except Exception as e:
+		return _error(e)
+
+
+@frappe.whitelist()
+def check_token_health() -> Dict[str, Any]:
+	"""Check token health and expiry status.
+	
+	Returns:
+		Token health information
+	"""
+	try:
+		from . import auth
+		token_status = auth.get_token_status()
+		
+		health = {
+			"has_access_token": token_status.get("has_access_token", False),
+			"has_refresh_token": token_status.get("has_refresh_token", False),
+			"expires_at": token_status.get("normalized_expires_at"),
+			"seconds_remaining": token_status.get("seconds_remaining"),
+			"is_expired": token_status.get("is_expired", True),
+			"needs_refresh": token_status.get("needs_refresh", True)
+		}
+		
+		return _result({"health": health})
+	except Exception as e:
+		return _error(e)
+
+
+@frappe.whitelist()
+def get_sync_logs(limit: int = 20) -> Dict[str, Any]:
+	"""Get recent sync logs for monitoring.
+	
+	Args:
+		limit: Maximum number of logs to return
+		
+	Returns:
+		Recent sync logs
+	"""
+	try:
+		logs = frappe.get_list(
+			"Shopee Sync Log",
+			fields=["name", "job", "status", "message", "started_at", "ended_at", "creation"],
+			order_by="creation desc",
+			limit=limit
+		)
+		
+		return _result({"logs": logs})
+	except Exception as e:
+		return _error(e)
+
+
 __all__ = [
 	# Auth & Connection
 	"connect_to_shopee",
@@ -479,5 +609,10 @@ __all__ = [
 	
 	# Utilities
 	"get_health_status",
+	"audit_orders",
+	"debug_webhook_payload",
+	"sync_recent_orders",
+	"check_token_health",
+	"get_sync_logs",
 ]
 

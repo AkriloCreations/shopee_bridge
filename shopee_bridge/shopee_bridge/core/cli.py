@@ -383,6 +383,26 @@ def list_commands():
             "name": "list_commands",
             "description": "Show this command list",
             "usage": "shopee_bridge.core.cli.list_commands"
+        },
+        {
+            "name": "quick_sync_orders",
+            "description": "Quick sync for recent orders",
+            "usage": "shopee_bridge.core.cli.quick_sync_orders"
+        },
+        {
+            "name": "audit_recent_orders",
+            "description": "Audit recent orders for consistency",
+            "usage": "shopee_bridge.core.cli.audit_recent_orders"
+        },
+        {
+            "name": "check_system_health",
+            "description": "Check overall system health",
+            "usage": "shopee_bridge.core.cli.check_system_health"
+        },
+        {
+            "name": "debug_token_status",
+            "description": "Debug OAuth token status",
+            "usage": "shopee_bridge.core.cli.debug_token_status"
         }
     ]
     
@@ -395,6 +415,155 @@ def list_commands():
     print("💡 Replace [site] with your actual site name")
 
 
+def quick_sync_orders(minutes: int = 15):
+	"""Quick sync for recent orders.
+	
+	Usage:
+		bench --site [site] execute shopee_bridge.core.cli.quick_sync_orders
+	"""
+	print("🔄 Shopee Bridge Quick Order Sync")
+	print("=" * 40)
+	
+	try:
+		from shopee_bridge.services import orders
+		
+		print(f"📅 Syncing orders from last {minutes} minutes...")
+		result = orders.sync_incremental_orders(updated_since_minutes=minutes)
+		
+		if result.get("orders_found", 0) > 0:
+			print("✅ Sync completed successfully")
+			print(f"   Orders found: {result.get('orders_found', 0)}")
+			print(f"   Orders processed: {result.get('orders_processed', 0)}")
+			print(f"   Duration: {result.get('duration_s', 0):.2f}s")
+			
+			if result.get("errors"):
+				print(f"   Errors: {len(result['errors'])}")
+				for error in result["errors"][:3]:  # Show first 3 errors
+					print(f"     - {error}")
+		else:
+			print("ℹ️  No orders found in the specified time range")
+		
+	except Exception as e:
+		print(f"❌ Sync failed: {str(e)}")
+		import frappe
+		frappe.log_error(frappe.get_traceback(), "Shopee CLI Quick Sync")
+
+
+def audit_recent_orders(days: int = 7):
+	"""Audit recent orders for consistency.
+	
+	Usage:
+		bench --site [site] execute shopee_bridge.core.cli.audit_recent_orders
+	"""
+	print("🔍 Shopee Bridge Order Audit")
+	print("=" * 35)
+	
+	try:
+		from shopee_bridge.services import orders
+		from shopee_bridge import helpers
+		
+		end_time = helpers.epoch_now()
+		start_time = end_time - (days * 24 * 60 * 60)
+		
+		print(f"📊 Auditing orders from last {days} days...")
+		order_sns = orders.get_order_list(start_time, end_time)
+		
+		print("✅ Audit completed")
+		print(f"   Total orders: {len(order_sns)}")
+		print(f"   Time range: {days} days")
+		
+		if order_sns:
+			print(f"   Sample orders: {', '.join(order_sns[:5])}")
+			if len(order_sns) > 5:
+				print(f"   ... and {len(order_sns) - 5} more")
+		
+	except Exception as e:
+		print(f"❌ Audit failed: {str(e)}")
+		import frappe
+		frappe.log_error(frappe.get_traceback(), "Shopee CLI Audit")
+
+
+def check_system_health():
+	"""Check overall system health.
+	
+	Usage:
+		bench --site [site] execute shopee_bridge.core.cli.check_system_health
+	"""
+	print("🏥 Shopee Bridge Health Check")
+	print("=" * 35)
+	
+	try:
+		from shopee_bridge.core.health import run_quick_health_check
+		
+		result = run_quick_health_check()
+		
+		overall_status = result.get("overall_status", "unknown")
+		duration = result.get("duration", 0)
+		
+		status_emojis = {
+			"healthy": "🟢",
+			"needs_attention": "🟡", 
+			"error": "🔴",
+			"unknown": "⚪"
+		}
+		
+		emoji = status_emojis.get(overall_status, "⚪")
+		print(f"{emoji} Overall Status: {overall_status.upper()}")
+		print(f"⏱️  Check Duration: {duration:.2f}s")
+		
+		checks = result.get("checks", {})
+		if checks:
+			print(f"\n🔬 Component Status:")
+			for check_name, check_result in checks.items():
+				status = check_result.get("status", "unknown")
+				check_emoji = status_emojis.get(status, "⚪")
+				name = check_name.replace("_", " ").title()
+				print(f"   {check_emoji} {name}: {status}")
+		
+		if overall_status != "healthy":
+			print(f"\n💡 Run 'repair_setup' to fix issues")
+		
+	except Exception as e:
+		print(f"❌ Health check failed: {str(e)}")
+		import frappe
+		frappe.log_error(frappe.get_traceback(), "Shopee CLI Health Check")
+
+
+def debug_token_status():
+	"""Debug OAuth token status.
+	
+	Usage:
+		bench --site [site] execute shopee_bridge.core.cli.debug_token_status
+	"""
+	print("🔑 Shopee Bridge Token Debug")
+	print("=" * 35)
+	
+	try:
+		from shopee_bridge import auth
+		
+		token_status = auth.get_token_status()
+		
+		print("📋 Token Status:")
+		print(f"   Has Access Token: {token_status.get('has_access_token', False)}")
+		print(f"   Has Refresh Token: {token_status.get('has_refresh_token', False)}")
+		
+		if token_status.get("normalized_expires_at"):
+			print(f"   Expires At: {token_status.get('normalized_expires_at')}")
+			print(f"   Seconds Remaining: {token_status.get('seconds_remaining', 0)}")
+			print(f"   Is Expired: {token_status.get('is_expired', True)}")
+			print(f"   Needs Refresh: {token_status.get('needs_refresh', True)}")
+		else:
+			print("   No expiry information available")
+		
+		if token_status.get("error"):
+			print(f"   Error: {token_status.get('error')}")
+		
+	except Exception as e:
+		print(f"❌ Token debug failed: {str(e)}")
+		import frappe
+		frappe.log_error(frappe.get_traceback(), "Shopee CLI Token Debug")
+
+
 # Export CLI functions for easy access
 __all__ = [
     "check_health",
@@ -402,5 +571,9 @@ __all__ = [
     "reset_workspace",
     "full_bootstrap",
     "show_status",
-    "list_commands"
+    "list_commands",
+    "quick_sync_orders",
+    "audit_recent_orders", 
+    "check_system_health",
+    "debug_token_status"
 ]

@@ -54,7 +54,7 @@ def _get_last_pushed_update_time(doctype: str, name: str) -> int:
 		return 0
 
 
-def get_order_list(time_from: int, time_to: int, status: str | None, page_size: int = 100) -> List[str]:
+def get_order_list(time_from: int, time_to: int, status: str | None = None, page_size: int = 100) -> List[str]:
 	"""Fetch list of order_sn within time window.
 
 	Args:
@@ -62,33 +62,48 @@ def get_order_list(time_from: int, time_to: int, status: str | None, page_size: 
 		time_to: Unix epoch (seconds) inclusive upper bound.
 		status: Optional Shopee order status filter.
 		page_size: Page size (Shopee max typically 100).
+		
 	Returns:
 		List of order_sn strings.
+		
+	Raises:
+		ShopeeAPIError: On API errors
 	"""
+	from .. import helpers
+	
+	if not helpers.is_valid_epoch(time_from) or not helpers.is_valid_epoch(time_to):
+		frappe.log_error("Invalid time range for order list", "Shopee Order Sync")
+		return []
+	
+	if time_from >= time_to:
+		frappe.log_error("Invalid time range: time_from >= time_to", "Shopee Order Sync")
+		return []
+	
 	params: Dict[str, Any] = {
 		"time_range_field": "update_time",
 		"time_from": int(time_from),
 		"time_to": int(time_to),
 		"page_size": min(max(int(page_size), 1), 100),
-		"order_status": status or "",  # Shopee may treat empty as all
 	}
+	
+	if status:
+		params["order_status"] = status
+	
 	order_sns: List[str] = []
-	more = True
-	cursor = None
-	while more:
-		if cursor:
-			params["cursor"] = cursor
-		resp = clients.http_get(ORDER_LIST_PATH, params)
-		data = resp.get("response") or resp  # adapt to actual API structure once known
-		# Expect data like { 'order_list': [ { 'order_sn': '...' }, ... ], 'more': True, 'next_cursor': '...' }
-		for row in (data.get("order_list") or []):
-			sn = row.get("order_sn")
-			if sn:
+	
+	try:
+		for item in clients.paginate_get(ORDER_LIST_PATH, params, page_size=page_size):
+			if sn := item.get("order_sn"):
 				order_sns.append(sn)
-		more = bool(data.get("more")) and bool(data.get("next_cursor"))
-		cursor = data.get("next_cursor")
-		if not more:
-			break
+	except clients.ShopeeAPIError as e:
+		_log_sync("order_list_api_error", {"error": str(e), "status": e.status_code})
+		frappe.log_error(f"Order list fetch failed: {e}", "Shopee Order Sync")
+		return []
+	except Exception as e:
+		_log_sync("order_list_error", {"error": str(e)})
+		frappe.log_error(f"Order list fetch failed: {e}", "Shopee Order Sync")
+		return []
+	
 	return order_sns
 
 
@@ -100,14 +115,14 @@ def get_order_detail(order_sn_list: List[str]) -> List[Dict[str, Any]]:
 	results: List[Dict[str, Any]] = []
 	if not order_sn_list:
 		return results
-	chunk_size = 50
-	for i in range(0, len(order_sn_list), chunk_size):
-		chunk = order_sn_list[i : i + chunk_size]
-		params = {"order_sn_list": ",".join(chunk)}
-		resp = clients.http_get(ORDER_DETAIL_PATH, params)
-		data = resp.get("response") or resp
-		for od in (data.get("order_list") or data.get("orders") or []):
-			results.append(od)
+	
+	try:
+		for result in clients.batch_request(ORDER_DETAIL_PATH, order_sn_list, batch_size=50):
+			results.append(result)
+	except Exception as e:
+		_log_sync("order_detail_error", {"error": str(e)})
+		frappe.log_error(f"Order detail fetch failed: {e}", "Shopee Order Sync")
+	
 	return results
 
 
@@ -386,14 +401,94 @@ def sync_incremental_orders(updated_since_minutes: int = 15) -> Dict[str, Any]:
 	return summary
 
 
-__all__ = [
-	"get_order_list",
-	"get_order_detail",
-	"ensure_customer_and_addresses",
-	"upsert_sales_order",
-	"ensure_sales_invoice_for_paid",
-	"ensure_delivery_note_for_ready",
-	"on_completed",
-	"sync_incremental_orders",
-]
+def get_order_details(order_sn: str) -> Dict[str, Any]:
+	"""Get detailed order information from Shopee.
+	
+	Args:
+		order_sn: Order serial number
+		
+	Returns:
+		Order details dictionary
+		
+	Raises:
+		ShopeeAPIError: On API errors
+	"""
+	try:
+		details = get_order_detail([order_sn])
+		return details[0] if details else {}
+	except Exception as e:
+		frappe.log_error(f"Failed to get order details for {order_sn}: {e}", "Shopee Order Details")
+		return {}
+
+
+def get_escrow_details(order_sn: str) -> Dict[str, Any]:
+	"""Get escrow details for an order.
+	
+	Args:
+		order_sn: Order serial number
+		
+	Returns:
+		Escrow details dictionary
+	"""
+	from . import finance
+	return finance.get_escrow_detail(order_sn)
+
+
+def sync_single_order(order_sn: str) -> Dict[str, Any]:
+	"""Sync a single order from Shopee to ERPNext.
+	
+	Args:
+		order_sn: Order serial number
+		
+	Returns:
+		Sync result summary
+	"""
+	started = int(time.time())
+	
+	try:
+		# Get order details
+		order_data = get_order_details(order_sn)
+		if not order_data:
+			return {"success": False, "error": "Order not found", "order_sn": order_sn}
+		
+		# Create/update ERPNext documents
+		so_name = upsert_sales_order(order_data)
+		
+		# Check order status for additional documents
+		status = (order_data.get("order_status") or "").lower()
+		result = {
+			"success": True,
+			"order_sn": order_sn,
+			"sales_order": so_name,
+			"status": status,
+			"duration_s": round(time.time() - started, 2)
+		}
+		
+		if status in {"paid", "ready_to_ship", "completed"}:
+			try:
+				from . import finance
+				escrow = finance.get_escrow_detail(order_sn)
+				if escrow and not escrow.get("error"):
+					invoice = finance.patch_invoice_with_fees(escrow)
+					result["sales_invoice"] = invoice
+			except Exception as e:
+				result["invoice_error"] = str(e)
+		
+		if status in {"ready_to_ship", "completed"}:
+			try:
+				dn = ensure_delivery_note_for_ready(so_name, order_data)
+				result["delivery_note"] = dn
+			except Exception as e:
+				result["delivery_note_error"] = str(e)
+		
+		return result
+		
+	except Exception as e:
+		frappe.log_error(f"Order sync failed for {order_sn}: {e}", "Shopee Order Sync")
+		return {
+			"success": False,
+			"error": str(e),
+			"order_sn": order_sn,
+			"duration_s": round(time.time() - started, 2)
+		}
 

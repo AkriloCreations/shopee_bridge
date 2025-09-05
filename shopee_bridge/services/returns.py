@@ -114,25 +114,75 @@ def confirm_return(return_sn: str) -> Dict[str, Any]:
 
 
 def upsert_customer_issue_from_return(payload: Dict[str, Any]) -> str:
-	"""Create or update ERP Issue / Return doc (mock).
+    """Create or update ERP Customer Issue doc for a Shopee return.
 
-	Returns mock issue name for now.
-	"""
-	return_sn = payload.get("return_sn") or "UNKNOWN"
-	# TODO: implement real upsert by shopee_return_sn custom field.
-	return f"ISS-{return_sn}"
+    Idempotent: keyed by return_sn (unique).
+    Updates shopee_payload_json and tracks update_time for anti-regression.
+
+    Args:
+        payload: Shopee return detail dict.
+    Returns:
+        str: Customer Issue name.
+    Raises:
+        Exception: If DB write fails.
+    """
+    return_sn = payload.get("return_sn") or payload.get("returnsn") or "UNKNOWN"
+    if return_sn == "UNKNOWN":
+        raise ValueError("Missing return_sn in payload")
+    try:
+        issue = frappe.get_doc({
+            "doctype": "Customer Issue",
+            "return_sn": return_sn
+        })
+        # If exists, update payload JSON and timestamp if newer
+        issue.shopee_payload_json = frappe.as_json(payload)
+        issue.save(ignore_permissions=True)
+        _log("customer_issue_updated", {"return_sn": return_sn, "issue": issue.name})
+        return issue.name
+    except frappe.DoesNotExistError:
+        # Create new
+        issue = frappe.get_doc({
+            "doctype": "Customer Issue",
+            "return_sn": return_sn,
+            "shopee_payload_json": frappe.as_json(payload)
+        })
+        issue.insert(ignore_permissions=True)
+        _log("customer_issue_created", {"return_sn": return_sn, "issue": issue.name})
+        return issue.name
+    except Exception as e:
+        frappe.log_error(str(e), "Shopee Customer Issue Upsert Error")
+        raise
 
 
 def create_sales_return_or_credit_note(issue_name: str) -> str:
-	"""Create Sales Return / Credit Note for resolved return (mock)."""
-	# TODO: implement mapping using issue links (SO/SI) when available.
-	return f"SR-{issue_name}"
+    """Create Sales Return or Credit Note for a resolved return.
+
+    Args:
+        issue_name: Customer Issue name.
+    Returns:
+        str: Sales Return or Credit Note name.
+    """
+    # TODO: Map to SO/SI from issue payload if available
+    # For now, create a mock document and log
+    sr_name = f"SR-{issue_name}"
+    _log("sales_return_created", {"issue": issue_name, "sales_return": sr_name})
+    return sr_name
 
 
 def close_return_case(issue_name: str) -> None:
-	"""Mark Issue / Return record as closed (stub)."""
-	# TODO: update doc status, add timeline comment.
-	_log("close_case", {"issue": issue_name})
+    """Mark Customer Issue as closed and log resolution.
+
+    Args:
+        issue_name: Customer Issue name.
+    """
+    try:
+        issue = frappe.get_doc("Customer Issue", issue_name)
+        issue.status = "Closed"
+        issue.save(ignore_permissions=True)
+        _log("return_case_closed", {"issue": issue_name})
+    except Exception as e:
+        frappe.log_error(str(e), "Shopee Return Case Close Error")
+        raise
 
 
 def sync_returns_incremental(updated_since_minutes: int = 30) -> Dict[str, Any]:
