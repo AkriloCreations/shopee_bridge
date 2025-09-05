@@ -24,7 +24,7 @@
       "label": "Environment",
       "options": "Test\nProduction",
       "reqd": 1,
-      "default": "test"
+      "default": "Test"
     },
     {
       "fieldname": "region",
