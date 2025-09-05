@@ -28,6 +28,7 @@ import traceback
 import hashlib
 
 import frappe
+from shopee_bridge import auth
 
 try:  # Prefer requests
 	import requests  # type: ignore
@@ -38,8 +39,6 @@ except Exception:  # pragma: no cover - fallback path
 		make_post_request as _frappe_post,
 	)
 	_HAS_REQUESTS = False
-
-from . import auth
 
 DEFAULT_TIMEOUT = 20  # seconds
 RETRY_STATUSES = {429, 500, 502, 503, 504}

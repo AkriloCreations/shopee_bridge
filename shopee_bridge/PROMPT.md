@@ -263,6 +263,19 @@ Make this production-ready:
    - Log analysis tools
 ```
 
+## TASKS.md
+
+### Run Sequence
+Execute these commands in the container terminal to validate the implementation:
+
+1. `pytest -q` - Run all tests
+2. `python smoke_test.py` - Import test for key modules
+3. `bench execute shopee_bridge.api.debug_sign --kwargs '{"path":"/api/v2/shop/get_shop_info"}'` - Test debug_sign API
+4. `bench execute shopee_bridge.api.sync_recent_orders --kwargs '{"hours":1}'` - Test sync_recent_orders API
+5. `bench execute shopee_bridge.api.audit_shopee_orders_for_month --kwargs '{"year":2025,"month":8}'` - Test audit API
+
+All commands should complete without import errors or runtime exceptions.
+
 ## 🚀 Execution Strategy
 
 ### Start with Claude Code:

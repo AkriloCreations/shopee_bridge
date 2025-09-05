@@ -16,7 +16,7 @@ import hashlib
 import time
 import frappe
 
-from .. import clients
+from shopee_bridge import clients
 
 # Shopee API paths
 CHANNEL_LIST_PATH = "/api/v2/logistics/get_channel_list"

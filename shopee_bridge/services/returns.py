@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 import time
 import frappe
 
-from .. import clients
+from shopee_bridge import clients
 
 RETURN_LIST_PATH = "/api/v2/returns/get_return_list"
 RETURN_DETAIL_PATH = "/api/v2/returns/get_return_detail"

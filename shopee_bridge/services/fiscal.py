@@ -18,7 +18,7 @@ import datetime as _dt
 import math
 import frappe
 
-from . import orders, returns, logistics, finance
+from shopee_bridge.services import orders, returns, logistics, finance
 
 
 def _iter_chunks(start: str, end: str, chunk_days: int) -> Iterable[Tuple[_dt.date, _dt.date]]:

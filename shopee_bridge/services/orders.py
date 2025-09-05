@@ -24,7 +24,7 @@ import math
 import frappe
 from frappe.utils import nowdate, now, get_datetime
 
-from .. import clients
+from shopee_bridge import clients, helpers
 
 ORDER_LIST_PATH = "/api/v2/order/get_order_list"
 ORDER_DETAIL_PATH = "/api/v2/order/get_order_detail"
@@ -69,7 +69,6 @@ def get_order_list(time_from: int, time_to: int, status: str | None = None, page
 	Raises:
 		ShopeeAPIError: On API errors
 	"""
-	from .. import helpers
 	
 	if not helpers.is_valid_epoch(time_from) or not helpers.is_valid_epoch(time_to):
 		frappe.log_error("Invalid time range for order list", "Shopee Order Sync")
@@ -430,8 +429,16 @@ def get_escrow_details(order_sn: str) -> Dict[str, Any]:
 	Returns:
 		Escrow details dictionary
 	"""
-	from . import finance
-	return finance.get_escrow_detail(order_sn)
+	from shopee_bridge.services import finance
+	return finance.get_escrow_detail("", "", 0, order_sn)
+
+
+def fetch_and_log_escrow(site: str, host: str, access_token: str, shop_id: int, order_sn: str) -> dict:
+	"""Fetch escrow detail and log it."""
+	from shopee_bridge.services import finance
+	escrow = finance.get_escrow_detail(host, access_token, shop_id, order_sn)
+	finance.log_escrow(site, order_sn, escrow)
+	return escrow
 
 
 def sync_single_order(order_sn: str) -> Dict[str, Any]:
@@ -466,8 +473,8 @@ def sync_single_order(order_sn: str) -> Dict[str, Any]:
 		
 		if status in {"paid", "ready_to_ship", "completed"}:
 			try:
-				from . import finance
-				escrow = finance.get_escrow_detail(order_sn)
+				from shopee_bridge.services import finance
+				escrow = finance.get_escrow_detail("", "", 0, order_sn)
 				if escrow and not escrow.get("error"):
 					invoice = finance.patch_invoice_with_fees(escrow)
 					result["sales_invoice"] = invoice

@@ -141,7 +141,7 @@ def get_shop_info() -> Dict[str, Any]:
     
     # Make API call to get shop info
     try:
-        from . import clients
+        from shopee_bridge import clients
         
         # Use the shop/get_shop_info endpoint
         result = clients.http_get("/api/v2/shop/get_shop_info", {})
@@ -257,7 +257,7 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
     Returns:
         Dict with exchange result and token info
     """
-    from . import clients
+    from shopee_bridge import clients
     try:
         payload = exchange_code_for_token(code, shop_id, main_account_id)
         response = clients._do_request(
@@ -596,7 +596,7 @@ def refresh_access_token() -> Dict[str, Any]:
     Returns:
         Dict with refresh result and new token info.
     """
-    from . import clients
+    from shopee_bridge import clients
     try:
         payload = refresh_token_via_api()
 

@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 import json, hashlib
 import frappe
 
-from . import auth
+from shopee_bridge import auth, helpers
 
 
 def _result(data: Dict[str, Any], ok: bool = True) -> Dict[str, Any]:
@@ -137,6 +137,7 @@ def _process_webhook(source_env: str) -> Dict[str, Any]:
 	try:
 		payload_json = raw_body.decode("utf-8") if raw_body else "{}"
 		payload = json.loads(payload_json or "{}")
+		print("payload", payload)
 	except Exception:
 		payload = {}
 		payload_json = "{}"
@@ -221,7 +222,7 @@ def sync_finance_api() -> Dict[str, Any]:
 def get_order(order_sn: str) -> Dict[str, Any]:
 	"""Get single order details from Shopee."""
 	try:
-		from .services import orders
+		from shopee_bridge.services import orders
 		order_data = orders.get_order_details(order_sn)
 		return _result({"order": order_data})
 	except Exception as e:
@@ -232,7 +233,7 @@ def get_order(order_sn: str) -> Dict[str, Any]:
 def sync_order(order_sn: str) -> Dict[str, Any]:
 	"""Sync specific order from Shopee to ERPNext."""
 	try:
-		from .services import orders
+		from shopee_bridge.services import orders
 		result = orders.sync_single_order(order_sn)
 		return _result({"sync_result": result})
 	except Exception as e:
@@ -243,7 +244,7 @@ def sync_order(order_sn: str) -> Dict[str, Any]:
 def update_order_status(order_sn: str, status: str) -> Dict[str, Any]:
 	"""Update order status in Shopee."""
 	try:
-		from .services import orders
+		from shopee_bridge.services import orders
 		result = orders.update_order_status(order_sn, status)
 		return _result({"updated": result})
 	except Exception as e:
@@ -453,8 +454,6 @@ def audit_orders(days_back: int = 7) -> Dict[str, Any]:
 		Audit results
 	"""
 	try:
-		from .. import helpers
-		
 		end_time = helpers.epoch_now()
 		start_time = end_time - (days_back * 24 * 60 * 60)
 		
@@ -572,6 +571,63 @@ def get_sync_logs(limit: int = 20) -> Dict[str, Any]:
 		return _error(e)
 
 
+@frappe.whitelist()
+def debug_sign(path: str) -> dict:
+	"""Debug sign a path."""
+	from shopee_bridge import helpers
+	from shopee_bridge import auth
+	signed = auth.sign_request(path, {}, None)
+	signature = signed["url"].split("sign=")[1].split("&")[0]
+	return {"path": path, "ts": helpers.now_epoch(), "signature": signature}
+
+
+@frappe.whitelist()
+def audit_shopee_orders_for_month(year: int, month: int) -> dict:
+	"""Audit orders for a month."""
+	from shopee_bridge import helpers
+	from shopee_bridge.services import orders
+	start = helpers.ymd_to_epoch(year, month, 1)
+	end = helpers.ymd_to_epoch(year + (1 if month == 12 else 0), (1 if month == 12 else month + 1), 1)
+	order_sns = orders.get_order_list(start, end)
+	# Filter <= end
+	order_sns = [sn for sn in order_sns if sn]  # assume all are within
+	if not order_sns:
+		return {"count": 0, "first_order_sn": None, "last_order_sn": None, "min_created": None, "max_created": None}
+	first_order_sn = order_sns[0]
+	last_order_sn = order_sns[-1]
+	# Get details for min max created
+	created_times = []
+	for sn in order_sns:
+		detail = orders.get_order_details(sn)
+		if detail and "create_time" in detail:
+			created_times.append(detail["create_time"])
+	min_created = min(created_times) if created_times else None
+	max_created = max(created_times) if created_times else None
+	return {"count": len(order_sns), "first_order_sn": first_order_sn, "last_order_sn": last_order_sn, "min_created": min_created, "max_created": max_created}
+
+
+@frappe.whitelist()
+def sync_recent_orders(hours: int = 24) -> dict:
+	"""Sync recent orders."""
+	from shopee_bridge import helpers
+	from shopee_bridge.services import orders
+	since_epoch = helpers.now_epoch() - hours * 3600
+	order_sns = orders.get_order_list(since_epoch, helpers.now_epoch())
+	orders_total = len(order_sns)
+	escrow_logged = 0
+	for sn in order_sns:
+		try:
+			# Fetch detail
+			detail = orders.get_order_details(sn)
+			# Fetch and log escrow
+			escrow = orders.fetch_and_log_escrow("", "", "", 0, sn)  # dummy params
+			if not escrow.get("error"):
+				escrow_logged += 1
+		except Exception:
+			pass  # ignore errors for count
+	return {"orders_total": orders_total, "escrow_logged": escrow_logged}
+
+
 __all__ = [
 	# Auth & Connection
 	"connect_to_shopee",
@@ -614,5 +670,7 @@ __all__ = [
 	"sync_recent_orders",
 	"check_token_health",
 	"get_sync_logs",
+	"debug_sign",
+	"audit_shopee_orders_for_month",
 ]
 

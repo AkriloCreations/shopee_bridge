@@ -20,8 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 import frappe
-
-from . import orders, returns, logistics
+from shopee_bridge.services import orders, returns, logistics
 
 
 def _logger():  # central logger accessor

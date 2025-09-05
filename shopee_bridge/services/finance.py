@@ -40,7 +40,7 @@ from typing import Any, Dict, List
 import time
 import frappe
 
-from .. import clients
+from shopee_bridge import clients
 
 ESCROW_DETAIL_PATH = "/api/v2/payment/get_escrow_detail"
 
@@ -52,14 +52,14 @@ def _log(event: str, data: Dict[str, Any]):  # light logging
 		pass
 
 
-def get_escrow_detail(order_sn: str) -> Dict[str, Any]:
+def get_escrow_detail(host: str, access_token: str, shop_id: int, order_sn: str) -> dict:
 	"""Fetch escrow detail for a single order.
 
-	Performs signed GET on Shopee endpoint `/payment/get_escrow_detail`.
-	Returns raw Shopee payload (normalized through potential 'response' key).
+	Performs signed POST on Shopee endpoint `/api/v2/payment/get_escrow_detail`.
+	Returns raw Shopee payload.
 	"""
 	try:
-		resp = clients.http_get(ESCROW_DETAIL_PATH, {"order_sn": order_sn})
+		resp = clients.http_post(ESCROW_DETAIL_PATH, json={"order_sn": order_sn, "shop_id": shop_id})
 		return resp.get("response") or resp
 	except clients.ShopeeAPIError as e:
 		_log("escrow_detail_api_error", {"order_sn": order_sn, "error": str(e), "status": e.status_code})
@@ -243,6 +243,19 @@ def finance_backfill_range(start: str, end: str) -> Dict[str, Any]:
 		"duration_s": round(time.time() - started, 2),
 	}
 	return summary
+
+
+def log_escrow(site: str, order_sn: str, payload: dict) -> str:
+	"""Log escrow detail to shopee_sync_log."""
+	import frappe
+	doc = frappe.get_doc({
+		"doctype": "shopee_sync_log",
+		"category": "escrow",
+		"ref": order_sn,
+		"payload": frappe.as_json(payload)
+	})
+	doc.insert(ignore_permissions=True)
+	return doc.name
 
 
 __all__ = [

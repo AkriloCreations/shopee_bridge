@@ -14,7 +14,8 @@ import time
 
 import frappe
 
-from . import auth
+from shopee_bridge import auth, helpers
+from shopee_bridge.services import webhook_handlers
 
 
 class WebhookVerificationError(Exception):
@@ -82,7 +83,6 @@ def create_webhook_inbox(payload: Dict[str, Any], source_env: str, signature_val
 	Raises:
 		frappe.ValidationError: On validation errors
 	"""
-	from .. import helpers
 	
 	# Derive idempotency key
 	idempotency_key = derive_idempotency_key(payload)
@@ -212,8 +212,6 @@ def process_webhook_inbox(inbox_name: str) -> Dict[str, Any]:
 		payload = json.loads(inbox.payload_json)
 		
 		# Route to appropriate handler
-		from .services import webhook_handlers
-		
 		event_type = (payload.get("event_type") or "").lower()
 		
 		if event_type.startswith("order."):

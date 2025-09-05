@@ -17,6 +17,36 @@ def epoch_now() -> int:
 	return int(time.time())
 
 
+def now_epoch() -> int:
+	"""Get current timestamp as epoch seconds (int)."""
+	return int(time.time())
+
+
+def safe(obj, maxlen: int = 256) -> str:
+	"""Safely convert object to JSON-compact string, truncate to maxlen, never throw."""
+	try:
+		json_str = json.dumps(obj, separators=(",", ":"), sort_keys=True)
+		return json_str[:maxlen]
+	except Exception:
+		return str(obj)[:maxlen]
+
+
+def chunks(seq, size: int):
+	"""Simple chunker for batching orders/escrow calls."""
+	if not seq:
+		return []
+	result = []
+	for i in range(0, len(seq), size):
+		result.append(seq[i:i + size])
+	return result
+
+
+def ymd_to_epoch(y: int, m: int, d: int) -> int:
+	"""Convert year/month/day to epoch seconds using calendar.timegm."""
+	import calendar
+	return calendar.timegm(time.struct_time((y, m, d, 0, 0, 0, -1, -1, 0)))
+
+
 def safe_int(value: Any, default: int = 0) -> int:
 	"""Safely convert value to int with fallback."""
 	try:
@@ -143,9 +173,11 @@ def merge_dicts(*dicts: Dict[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
 	"epoch_now",
+	"now_epoch",
 	"safe_int", 
 	"safe_float",
 	"safe_str",
+	"safe",
 	"truncate_text",
 	"generate_idempotency_key",
 	"deep_get",
@@ -156,5 +188,7 @@ __all__ = [
 	"validate_required_fields",
 	"create_payload_hash",
 	"batch_items",
-	"merge_dicts"
+	"chunks",
+	"merge_dicts",
+	"ymd_to_epoch"
 ]
