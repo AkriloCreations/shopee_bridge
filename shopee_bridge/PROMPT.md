@@ -54,6 +54,8 @@ Requirements:
 - Add comprehensive logging
 - Make all operations idempotent
 - Follow the exact function signatures from the spec
+- semua pake time epoch utc gausah pake datetime,
+- cron job saat abis refresh if needed aja gausah pake fungsi lain
 
 Test the OAuth flow and basic API connectivity.
 ```
@@ -70,7 +72,7 @@ Create the complete database layer:
    - customer_issue/ (Optional extended returns)
 
 2. **Custom Fields** for core ERPNext doctypes:
-   - Sales Order: shopee_order_sn, buyer_user_id, etc.
+   - Sales Order: custom_order_sn, so.po_no, buyer_user_id, etc.
    - Sales Invoice: escrow fields, sync tracking
    - Delivery Note: logistics tracking fields
 
@@ -97,7 +99,7 @@ Key functions:
 - sync_incremental_orders() for scheduled syncing
 
 Critical requirements:
-- All operations must be idempotent using shopee_order_sn as key
+- All operations must be idempotent using custom_shopee_order_sn, so.po_no as key
 - Never downgrade order status (check last_pushed_update_time)
 - Comprehensive error handling with Shopee Sync Log entries
 - Proper mapping from Shopee data to ERPNext fields
@@ -122,6 +124,7 @@ Requirements:
 - Handle multiple shipping providers
 - Update delivery status in real-time
 - Proper error handling for shipping failures
+- selalu update doctype terkait untuk implementasi fungsinya
 ```
 
 **Prompt 6: Returns & Finance Services**

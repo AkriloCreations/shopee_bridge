@@ -10,11 +10,11 @@ def _utc_naive(expires_in_seconds: int):
 
 from typing import List, Dict, Any, Union, Optional
 import time
+import json
 import hmac
 import hashlib
-import urllib.parse
 import secrets
-import frappe
+import urllib.parse
 
 """Shopee Bridge authentication utilities.
 
@@ -199,24 +199,16 @@ def build_authorize_url(scopes: List[str] = None) -> str:
     redirect_url = settings.redirect_url
     base_url = _base_url(settings.environment)
     timestamp = int(time.time())
-    
-    # Create signature base string: partner_id + api_path + timestamp
-    # For Public APIs (like auth_partner): partner_id, api path, timestamp
     base_string = f"{partner_id}{OAUTH_AUTHORIZE_PATH}{timestamp}"
     sign = hmac_sha256(base_string, partner_key)
-    
-    # Build query parameters
     params = {
         "partner_id": partner_id,
         "timestamp": timestamp,
         "sign": sign,
         "redirect": redirect_url,
     }
-    
-    # Add scopes if provided
     if scopes:
-        params["scope"] = ",".join(scopes)
-    
+        params["scopes"] = ",".join(scopes)
     qs = urllib.parse.urlencode(params)
     return f"{base_url}{OAUTH_AUTHORIZE_PATH}?{qs}"
 
@@ -250,7 +242,7 @@ def handle_oauth_callback(params: Dict[str, Any]) -> Dict[str, Any]:
         result = complete_token_exchange(code, shop_id, main_account_id)
         return result
     except Exception as e:
-        frappe.log_error(f"OAuth callback failed: {str(e)}", "Shopee OAuth Error")
+        frappe.log_error(f"OAuth callback error: {str(e)}", "Shopee OAuth Callback")
         raise
 
 
@@ -379,7 +371,7 @@ def exchange_code_for_token(code: str, shop_id: Union[str, int], main_account_id
     }
 
 def refresh_if_needed(buffer_seconds: int = 600) -> bool:
-    """Heuristically decide whether to refresh the token soon.
+    """Heuristically decide whether to refresh the token soon (epoch only).
 
     Does NOT perform network I/O; only returns whether a refresh payload was produced.
     The caller (scheduler / client) should then execute the HTTP request using the
@@ -393,42 +385,19 @@ def refresh_if_needed(buffer_seconds: int = 600) -> bool:
     settings = _settings()
     raw = getattr(settings, "token_expires_at", None)
     if not raw:
-        frappe.logger().debug("[Shopee] No token_expires_at found, refresh not needed")
-        return False
-    
+        frappe.logger().warning("[Shopee] No token_expires_at found, will refresh.")
+        return True
     try:
-        # Parse to datetime if string
-        from datetime import datetime, timezone
-        # Convert to aware UTC
-        if isinstance(raw, str):
-            expires_at = frappe.utils.get_datetime(raw)
-        else:
-            expires_at = raw
-        if expires_at.tzinfo is None:
-            expires_at_aware = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at_aware = expires_at.astimezone(timezone.utc)
-        now_aware = datetime.now(timezone.utc)
-        seconds_left = (expires_at_aware - now_aware).total_seconds()
-        return seconds_left < buffer_seconds
-        # Attach UTC tzinfo for comparison only
-        if expiry_dt.tzinfo is None:
-            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-        expiry_timestamp = int(expiry_dt.timestamp())
-        now_timestamp = int(time.time())
-        time_remaining = int(expiry_timestamp - now_timestamp)
-        frappe.logger().debug(f"[Shopee] Token expires in {time_remaining} seconds (buffer: {buffer_seconds})")
-        if time_remaining < int(buffer_seconds):
-            frappe.logger().info(f"[Shopee] Token refresh needed (expires in {time_remaining}s)")
-            refresh_token_via_api()
+        expiry = int(raw)
+        now = int(time.time())
+        time_remaining = expiry - now
+        if time_remaining < buffer_seconds:
+            frappe.logger().info(f"[Shopee] Token needs refresh, seconds_remaining={time_remaining}")
             return True
-        else:
-            frappe.logger().debug(f"[Shopee] Token refresh not needed yet (expires in {time_remaining}s)")
-            return False
-            
-    except Exception as e:
-        frappe.logger().error(f"[Shopee] Failed in refresh_if_needed: {e}")
         return False
+    except Exception as e:
+        frappe.logger().warning(f"[Shopee] Failed to check token expiry: {str(e)}")
+        return True
 
 def refresh_token_via_api() -> Dict[str, Any]:
     """Produce payload for token refresh.
@@ -496,12 +465,11 @@ def sign_request(
     access_token = getattr(settings, "access_token", None)
     shop_id = getattr(settings, "shop_id", None)
     if not all([partner_id, access_token, shop_id]):
-        raise AuthRequired("Missing partner_id / access_token / shop_id")
+        raise AuthRequired("Missing partner_id, access_token, or shop_id")
     partner_key = settings.get_password("partner_key")
     timestamp = int(time.time())
     base_string = f"{partner_id}{path}{timestamp}{access_token}{shop_id}"
     signature = hmac_sha256(base_string, partner_key)
-    # Base query pieces required by Shopee
     base_qs = {
         "partner_id": partner_id,
         "timestamp": timestamp,
@@ -509,7 +477,6 @@ def sign_request(
         "shop_id": shop_id,
         "sign": signature,
     }
-    # Merge user params (user params should not override required ones)
     merged = {**params, **base_qs}
     qs = urllib.parse.urlencode(merged, doseq=True)
     url = f"{_base_url(settings.environment)}{path}?{qs}"
@@ -542,17 +509,12 @@ def verify_webhook_signature(
     Raises:
         SignatureMismatch: on any mismatch or malformed header.
     """
-    # Check for Authorization header (Push Authorization method)
     auth_header = headers.get("Authorization")
-    if auth_header:
-        return _verify_push_authorization(full_url or f"https://erp.managerio.ddns.net{path}", 
-                                        raw_body, push_key, auth_header)
-    
-    # Fallback to legacy signature verification method
+    if auth_header and full_url:
+        return _verify_push_authorization(full_url, raw_body, push_key, auth_header)
     signature_header = headers.get(WEBHOOK_SIGNATURE_HEADER)
     if signature_header:
         return _verify_legacy_signature(raw_body, push_key, signature_header, headers)
-    
     raise SignatureMismatch("Missing both Authorization and X-Shopee-Signature headers")
 
 
@@ -615,8 +577,6 @@ def _verify_legacy_signature(raw_body: bytes, push_key: str, signature_header: s
     computed = hmac_sha256(raw_body, push_key, raw=True)
     if not constant_time_compare(signature_header, computed):
         raise SignatureMismatch("Legacy webhook signature mismatch")
-    
-    # Validate timestamp drift if present
     ts_header = headers.get(WEBHOOK_TIMESTAMP_HEADER)
     if ts_header:
         try:
@@ -628,7 +588,6 @@ def _verify_legacy_signature(raw_body: bytes, push_key: str, signature_header: s
             raise
         except Exception:
             raise SignatureMismatch("Invalid webhook timestamp header")
-    
     return True
 
 def refresh_access_token() -> Dict[str, Any]:

@@ -40,7 +40,7 @@ scheduler_events = {
             "shopee_bridge.jobs.process_webhook.retry_due",
         ],
         "*/30 * * * *": [
-            "shopee_bridge.auth.schedule_token_renewal_cron",
+            "shopee_bridge.auth.refresh_if_needed",
         ],
         "15 1 * * *": [
             "shopee_bridge.jobs.reconcile_bank.run",
