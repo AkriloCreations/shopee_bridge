@@ -168,7 +168,7 @@ def execute():
         print(f"Error: {e}")
         
     print("\n💡 Callback URL expected format:")
-    print("https://erp.managerio.ddns.net?code=XXXXXX&shop_id=XXXXXX&state=XXXXXX")
+    print("https://erpdev.managerio.ddns.net?code=XXXXXX&shop_id=XXXXXX&state=XXXXXX")
     
     print("\n🔧 Test callback simulation (when you have real code):")
     print("frappe.get_attr('shopee_bridge.api.oauth_callback')({")

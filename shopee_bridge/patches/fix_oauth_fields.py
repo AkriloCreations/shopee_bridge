@@ -55,8 +55,8 @@ def execute():
         # Update redirect_url default if it's empty or wrong
         if frappe.db.exists("Shopee Settings", "Shopee Settings"):
             doc = frappe.get_doc("Shopee Settings", "Shopee Settings")
-            if not doc.redirect_url or doc.redirect_url == "https://erp.managerio.ddns.net/":
-                doc.redirect_url = "https://erp.managerio.ddns.net/app/shopee-settings"
+            if not doc.redirect_url or doc.redirect_url == "https://erpdev.managerio.ddns.net/":
+                doc.redirect_url = "https://erpdev.managerio.ddns.net/app/shopee-settings"
                 doc.save(ignore_permissions=True)
                 frappe.db.commit()
                 frappe.log_error("Updated redirect_url to settings page")

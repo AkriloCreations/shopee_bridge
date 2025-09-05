@@ -545,7 +545,7 @@ def verify_webhook_signature(
     # Check for Authorization header (Push Authorization method)
     auth_header = headers.get("Authorization")
     if auth_header:
-        return _verify_push_authorization(full_url or f"https://erp.managerio.ddns.net{path}", 
+        return _verify_push_authorization(full_url or f"https://erpdev.managerio.ddns.net{path}", 
                                         raw_body, push_key, auth_header)
     
     # Fallback to legacy signature verification method

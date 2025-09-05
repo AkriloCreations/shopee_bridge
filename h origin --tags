@@ -1,0 +1,208 @@
+* [33meb4d91e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;33mtag: [m[1;33mv5.0-stable[m[33m, [m[1;31morigin/main[m[33m)[m inside git
+* [33m6a2937d[m[33m ([m[1;31morigin/develop[m[33m)[m set file
+[31m|[m * [33m0cf9bb6[m[33m ([m[1;31morigin/developer[m[33m)[m editing file
+[31m|[m[31m/[m  
+* [33m0c2f79b[m custom
+* [33me8e1d83[m fixing connection issue
+* [33md4bffd1[m refactor: Remove unused persistence function and update token expiration logic
+* [33mbc8a1a4[m masih belom bisa token
+* [33m693933d[m fixutc
+* [33m9787b30[m refactor: Update OAuth callback documentation and streamline token handling logic
+* [33m8915b5b[m fix fungsi callback oauth
+* [33mcbe958e[m auth.py
+* [33md0d8a12[m updating structures
+* [33m1ad8595[m feat: Implement comprehensive CLI commands for Shopee Bridge management
+* [33m9176b9b[m added after install
+* [33m5358b7e[m feat: add unique index for Shopee Sync Log to ensure one active row per job and key_ref combination
+* [33m5eb09ba[m refactor: consolidate Shopee Sync Log and workspace shortcuts, ensuring proper DocType creation and path validation
+* [33meca219c[m added after install
+* [33mcf6b691[m setup
+* [33mab60673[m perbaikan struktur doctype
+* [33ma7c63f9[m perbaiki struktur folder
+* [33m0bb1657[m editing structures
+* [33mbecbba5[m fixing patches
+* [33m1f1e124[m chore: register bootstrap patch in patches.txt
+* [33m1d0fb15[m fix: normalize workspace content for Shopee Bridge
+* [33m6fad3a7[m fix: set modules.txt to 'Shopee Bridge'
+* [33m7378cfd[m Refactor Shopee Bridge patches: consolidate and rename files, update module definitions, and enhance workspace configuration.
+* [33md492ee0[m testing
+* [33me2870c7[m disable fixture and workspace
+* [33m21c3a04[m fixing structures
+* [33mcccd9c9[m fix module mapping
+* [33m0cd3104[m updating doctype
+* [33mb6632e2[m updating doctype
+* [33m42de67a[m Add Shopee Settings doctype, patches, and migration script
+* [33m1d064b1[m feat: Implement Shopee logistics, orders, returns, and webhook handling services
+* [33m1c6204f[m fix: use 'Issue' instead of legacy 'Customer Issue' in after_install
+* [33mcdd9aed[m added
+* [33m794f278[m add module
+* [33m0f24314[m feat: Implement initial setup for Shopee Bridge app with core functionalities and custom fields
+* [33m7985e59[m implement doctype
+*   [33mf953ddd[m Resolve merge: prefer <ours|theirs> for api.py; <keep|remove> reconcile_bank.py
+[33m|[m[34m\[m  
+[33m|[m * [33m5a5787e[m refactor: improve receivable account resolution in payment processing
+* [34m|[m [33md321264[m initial commit
+[34m|[m [34m|[m * [33m11cd381[m[33m ([m[1;31morigin/fix/circular-imports[m[33m)[m wip: break circular imports (dispatcher, lazy imports, api resolver)
+[34m|[m [34m|[m[34m/[m  
+[34m|[m[34m/[m[34m|[m   
+* [34m|[m [33m31b2345[m[33m ([m[1;31morigin/enhanced-oauth-v3[m[33m)[m feat: Implement Shopee return API integration for handling refunds and returns
+* [34m|[m [33m6a961c4[m[33m ([m[1;33mtag: [m[1;33mv4.91-stable[m[33m)[m implementing audit
+* [34m|[m [33mb72f4c9[m menyatukan sync_order_range
+* [34m|[m [33m9fc42c1[m feat: Add Shopee API integration for retrieving return lists and details
+* [34m|[m [33m5d44b2d[m adding features fallback return
+* [34m|[m [33m9829732[m fix: Enhance error handling for API responses and implement rate limiting in sync_orders_range
+* [34m|[m [33md16f470[m fix: Improve error handling and parameter coercion in migrate_orders_from function
+* [34m|[m [33mc2c7e2e[m feat: Add migration function for backfilling Shopee orders with deduplication
+* [34m|[m [33m98fa239[m Enhance Payment Entry creation for Shopee orders
+* [34m|[m [33me47c4fb[m chore: Remove obsolete files related to Payment Entry and Chart of Accounts checks
+* [34m|[m [33mb0ec264[m Local webhook.py modifications
+* [34m|[m [33m83b1d08[m Add debug script for analyzing missing Payment Entries during order synchronization
+* [34m|[m [33m3f6c0b1[m feat: Implement expense account creation and enhance payment entry processing for Shopee
+* [34m|[m [33m4874096[m feat: Refactor Payment Entry handling for Shopee fees
+* [34m|[m [33mb0439e4[m Add logging for payment entry processing to track net amounts and escrow normalization
+* [34m|[m [33madd1ead[m Add error handling and logging for expense account creation and payment entry processing
+* [34m|[m [33md142ed9[m Add expense account creation and update logic for Shopee fees in credit note processing
+* [34m|[m [33m5f774b3[m Enhance payment entry creation to accurately break down and account for all Shopee fee components
+* [34m|[m [33mbb6bb23[m Add handling for extra fees in credit note creation for Shopee orders
+* [34m|[m [33mf508fbd[m Refactor order and invoice retrieval functions to include purchase_order_number checks
+* [34m|[m [33m7cc507e[m[33m ([m[1;33mtag: [m[1;33mv4.8-stable[m[33m)[m Implement accurate reference-only reconciliation for Shopee bank transactions
+* [34m|[m [33mf4b4b1a[m Refactor payment entry deduction logic to ensure accurate calculations and prevent overshooting gross amounts
+* [34m|[m [33mf725545[m Enhance sync_orders_range function to include filtering by create_time and track filtered out orders in stats
+* [34m|[m [33m1689ad1[m Enhance payment entry creation to handle race conditions and ensure idempotency by locking Sales Invoices and checking for existing entries.
+* [34m|[m [33m0e68c15[m Refactor _process_order_to_si function to skip existing Sales Invoices and log the action
+* [34m|[m [33m232beef[m Enhance _process_order_to_si function to handle existing Sales Invoices by attempting Credit Note and Payment Entry creation for refunds
+* [34m|[m [33m95b9306[m Refactor sync_orders_range function to simplify order status handling by removing TO_RETURN status and treating RETURNED as CANCELLED
+* [34m|[m [33mf1f9ed7[m Enhance sync_orders_range function with improved order status handling and pagination logic
+* [34m|[m [33m5a7208b[m Enhance Shopee Bridge API and Settings
+* [34m|[m [33mb3a7a93[m Enhance Shopee webhook logging with improved provisional log updates and error handling
+* [34m|[m [33m300ffd5[m Improve webhook logging with early provisional entries and enhanced error handling
+* [34m|[m [33m5585ab2[m Refactor Shopee webhook signature verification to support dynamic URL construction and improve logging
+* [34m|[m [33mba9ebf6[m Enhance Shopee webhook handling with improved logging and error management
+* [34m|[m [33m92fe72a[m Refactor sync_orders_range and verify_webhook_signature functions for improved logic and error handling
+* [34m|[m [33m5aa1273[m process order to si remake
+* [34m|[m [33m79880a0[m new
+* [34m|[m [33mb93b169[m add
+* [34m|[m [33mf0d1d79[m New
+* [34m|[m [33mc3d914a[m Enhance sync_orders_range and complete_order_to_si functions with detailed docstrings and validation checks for time range and order SN
+* [34m|[m [33m6df45ca[m Enhance webhook signature verification with detailed logging for incoming requests and signature comparisons
+* [34m|[m [33m333252c[m Enhance Sales Order and Invoice processing with mandatory field validation and improved deduplication logic
+* [34m|[m [33m0b90490[m Implement feature X to enhance user experience and fix bug Y in module Z
+* [34m|[m [33m8997365[m Add duplicate prevention and detailed checks for Sales Orders and Invoices in webhook handling
+* [34m|[m [33m8e101ed[m enhanced webhook signature
+* [34m|[m [33m1f9cf40[m enhanced webhook signature
+* [34m|[m [33m033f527[m editing expense
+* [34m|[m [33m806a8f5[m editing expense
+* [34m|[m [33m4b4a8c9[m editing expense
+* [34m|[m [33m11d6c77[m editing expense
+* [34m|[m [33md610970[m[33m ([m[1;33mtag: [m[1;33mv4.76-stable[m[33m)[m add api.py cancel & complete to si
+* [34m|[m [33m29442c7[m[33m ([m[1;33mtag: [m[1;33mv4.75-stable[m[33m)[m add api.py cancel & complete to si
+* [34m|[m [33mb08d5b3[m[33m ([m[1;33mtag: [m[1;33mv4.74-stable[m[33m)[m add api.py cancel & complete to si
+* [34m|[m [33m256989c[m[33m ([m[1;33mtag: [m[1;33mv4.73-stable[m[33m)[m add api.py cancel & complete to si
+* [34m|[m [33m7f7ca6b[m[33m ([m[1;33mtag: [m[1;33mv4.72-stable[m[33m)[m add api.py cancel & complete to si
+* [34m|[m [33mb0c12ae[m[33m ([m[1;33mtag: [m[1;33mv4.71-stable[m[33m)[m update api.py
+* [34m|[m [33mf2b8133[m update api.py
+* [34m|[m [33m6649a8b[m update api.py
+* [34m|[m [33m1922850[m shopee add so
+[35m|[m [34m|[m * [33m6cacf2e[m[33m ([m[1;33mtag: [m[1;33mv4.70-stable[m[33m, [m[1;31morigin/v4.59-stable[m[33m)[m edit api.py
+[35m|[m [34m|[m[35m/[m  
+[35m|[m[35m/[m[34m|[m   
+* [34m|[m [33mf64c568[m[33m ([m[1;33mtag: [m[1;33mv4.60-stable[m[33m)[m shopee add so
+* [34m|[m [33m08ed6de[m fixing shopee webhook()
+* [34m|[m [33m3172e3a[m fixing shopee webhook()
+* [34m|[m [33m38a125f[m[33m ([m[1;33mtag: [m[1;33mv4.63-stable[m[33m)[m enhance.api.py
+* [34m|[m [33ma81d868[m[33m ([m[1;33mtag: [m[1;33mv4.65-stable[m[33m)[m edit webhook.py function
+* [34m|[m [33m4efa2be[m perbaiki struktur api.py dan webhook.py
+* [34m|[m [33mec04dc1[m add init.py webhook module
+* [34m|[m [33mcedfbe2[m adding webhook.py
+* [34m|[m [33ma968f9a[m adding webhook.py
+* [34m|[m [33md7f6052[m edit shopee.webhook
+* [34m|[m [33m7fa476c[m edit shopee.webhook
+* [34m|[m [33m0989747[m adding test webhook
+* [34m|[m [33m2e316b4[m adding test webhook
+* [34m|[m [33m8d33805[m adding test webhook
+* [34m|[m [33m52ae276[m adding test webhook
+* [34m|[m [33m39adb9a[m adding test webhook
+* [34m|[m [33m8c5afc4[m adding test_webhook
+* [34m|[m [33m18ccbc9[m adding test_webhook
+* [34m|[m [33m55092e3[m adding test_webhook
+* [34m|[m [33m0b84852[m adding test_webhook
+* [34m|[m [33m26aaebc[m adding test_webhook
+* [34m|[m [33mc91013a[m[33m ([m[1;33mtag: [m[1;33m4.63-stable[m[33m)[m adding test_webhook
+* [34m|[m [33m189dfba[m[33m ([m[1;33mtag: [m[1;33m4.62-stable[m[33m)[m adding test_webhook
+* [34m|[m [33m1e14fbe[m[33m ([m[1;33mtag: [m[1;33m4.61-stable[m[33m)[m adding test_webhook
+* [34m|[m [33m3bb1f78[m[33m ([m[1;33mtag: [m[1;33m4.60-stable[m[33m)[m adding test_webhook
+* [34m|[m [33m1ecdbf9[m[33m ([m[1;33mtag: [m[1;33m4.59-stable[m[33m)[m adding test_webhook
+* [34m|[m [33m36e9115[m adding test_webhook
+* [34m|[m [33m9f5518a[m[33m ([m[1;33mtag: [m[1;33m4.58-stable[m[33m)[m enhanced api.py webbhook_key
+* [34m|[m [33mbeb63c0[m[33m ([m[1;33mtag: [m[1;33mv4.57-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m8e93171[m[33m ([m[1;33mtag: [m[1;33mv4.56-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m93a541b[m[33m ([m[1;33mtag: [m[1;33mv4.55-stable[m[33m)[m enhanced api.py
+* [34m|[m [33md9259cc[m enhanced api.py
+* [34m|[m [33m540fff6[m[33m ([m[1;33mtag: [m[1;33mv4.54-stable[m[33m, [m[1;33mtag: [m[1;33mv4.53-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m35aad42[m[33m ([m[1;33mtag: [m[1;33mv4.52-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mac8ddf7[m[33m ([m[1;33mtag: [m[1;33mv4.51-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m37b263d[m[33m ([m[1;33mtag: [m[1;33mv4.50-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mda4b3dc[m[33m ([m[1;33mtag: [m[1;33mv4.49-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m6b70a5a[m[33m ([m[1;33mtag: [m[1;33mv4.48-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m91d5382[m[33m ([m[1;33mtag: [m[1;33mv4.47-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m65f7b87[m[33m ([m[1;33mtag: [m[1;33mv4.46-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mc90f292[m[33m ([m[1;33mtag: [m[1;33mv4.45-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m005a7ff[m enhanced api.py
+* [34m|[m [33m1dcdb49[m[33m ([m[1;33mtag: [m[1;33mv4.44-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m33757fe[m[33m ([m[1;33mtag: [m[1;33mv4.43-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mac8bef6[m[33m ([m[1;33mtag: [m[1;33mv4.42-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m04bdfc0[m[33m ([m[1;33mtag: [m[1;33mv4.41-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m2aff0c1[m[33m ([m[1;33mtag: [m[1;33mv4.40-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mdcfd700[m[33m ([m[1;33mtag: [m[1;33mv4.39-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m1ed80af[m[33m ([m[1;33mtag: [m[1;33mv4.38-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mfe763f9[m[33m ([m[1;33mtag: [m[1;33mv4.37-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mc2c1449[m enhanced api.py
+* [34m|[m [33m2a9a2a4[m[33m ([m[1;33mtag: [m[1;33mv4.36-stable[m[33m, [m[1;33mtag: [m[1;33mv4.34-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mba63c89[m[33m ([m[1;33mtag: [m[1;33mv4.33-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m0f5f87f[m[33m ([m[1;33mtag: [m[1;33mv4.32-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m69bc2fc[m[33m ([m[1;33mtag: [m[1;33mv4.31-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m6d78b2c[m[33m ([m[1;33mtag: [m[1;33mv4.30-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m88a0359[m enhanced api.py
+* [34m|[m [33m78296f8[m enhanced api.py
+* [34m|[m [33m07967e2[m[33m ([m[1;33mtag: [m[1;33mv4.24-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m8daadd2[m[33m ([m[1;33mtag: [m[1;33mv4.23-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m27cf825[m[33m ([m[1;33mtag: [m[1;33mv4.22-stable[m[33m)[m enhanced api.py
+* [34m|[m [33mb12bb54[m[33m ([m[1;33mtag: [m[1;33mv4.21-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m982db6a[m[33m ([m[1;33mtag: [m[1;33mv4.20-stable[m[33m)[m enhanced api.py
+* [34m|[m [33m2456b0d[m[33m ([m[1;33mtag: [m[1;33mv4.19-stable[m[33m)[m edit api.py
+* [34m|[m [33m8e40db4[m[33m ([m[1;33mtag: [m[1;33mv4.18-stable[m[33m)[m edit api.py
+* [34m|[m [33m5e53e5b[m[33m ([m[1;33mtag: [m[1;33mv4.17-stable[m[33m)[m edit api.py
+* [34m|[m [33m45eda5b[m[33m ([m[1;33mtag: [m[1;33mv4.16-stable[m[33m)[m edit api.py
+* [34m|[m [33m278a08a[m[33m ([m[1;33mtag: [m[1;33mv4.15-stable[m[33m)[m edit api.py
+* [34m|[m [33m2e85149[m[33m ([m[1;33mtag: [m[1;33mv4.14-stable[m[33m)[m edit api.py
+* [34m|[m [33ma228d37[m[33m ([m[1;33mtag: [m[1;33mv4.13-stable[m[33m)[m edit api.py
+* [34m|[m [33m40f4f58[m[33m ([m[1;33mtag: [m[1;33mv4.12-stable[m[33m)[m edit api.py
+* [34m|[m [33m7f91a1a[m[33m ([m[1;33mtag: [m[1;33mv4.11-stable[m[33m)[m edit api.py
+* [34m|[m [33me82c399[m[33m ([m[1;33mtag: [m[1;33mv4.10-stable[m[33m)[m edit api.py
+* [34m|[m [33m231eb0d[m[33m ([m[1;33mtag: [m[1;33mv4.09-stable[m[33m)[m edit api.py
+* [34m|[m [33mb568056[m[33m ([m[1;33mtag: [m[1;33mv4.08-stable[m[33m)[m edit api.py
+* [34m|[m [33m41d8d4b[m[33m ([m[1;33mtag: [m[1;33mv4.07-stable[m[33m)[m edit api.py
+* [34m|[m [33mcc4b798[m[33m ([m[1;33mtag: [m[1;33mv4.06-stable[m[33m)[m edit api.py
+* [34m|[m [33m288ba52[m[33m ([m[1;33mtag: [m[1;33mv4.05-stable[m[33m)[m edit api.py
+* [34m|[m [33m673ad68[m[33m ([m[1;33mtag: [m[1;33mv4.04-stable[m[33m)[m edit api.py
+* [34m|[m [33mc523992[m[33m ([m[1;33mtag: [m[1;33mv4.03-stable[m[33m)[m edit api.py
+* [34m|[m [33me3448fd[m[33m ([m[1;33mtag: [m[1;33mv4.02-stable[m[33m)[m edit api.py
+* [34m|[m [33m3debe8c[m[33m ([m[1;33mtag: [m[1;33mv4.01-stable[m[33m)[m edit api.py
+* [34m|[m [33m1070084[m[33m ([m[1;33mtag: [m[1;33mv4.0-stable[m[33m)[m edit api.py
+* [34m|[m [33mcb768c2[m[33m ([m[1;33mtag: [m[1;33mv3.4-stable[m[33m)[m edit api.py
+* [34m|[m [33m2a44fae[m[33m ([m[1;33mtag: [m[1;33mv3.3-stable[m[33m)[m edit api.py
+* [34m|[m [33m7e0e3bb[m[33m ([m[1;33mtag: [m[1;33mv3.2-stable[m[33m)[m edit api.py
+* [34m|[m [33m5af1681[m[33m ([m[1;33mtag: [m[1;33mv3.1-stable[m[33m)[m edit hooks.py
+* [34m|[m [33m8a7802d[m[33m ([m[1;33mtag: [m[1;33mv3.0-stable[m[33m)[m edit hooks.py
+* [34m|[m [33m2209ef5[m[33m ([m[1;33mtag: [m[1;33mv2.9-stable[m[33m)[m tambah process order SO & SI
+* [34m|[m [33meb7bb98[m[33m ([m[1;33mtag: [m[1;33mv2.7-stable[m[33m)[m tambah baru
+* [34m|[m [33m4fa479f[m[33m ([m[1;33mtag: [m[1;33mv2.6-stable[m[33m)[m feat: add diagnose_order + fixes
+* [34m|[m [33mb5d6c3f[m[33m ([m[1;33mtag: [m[1;33mv2.5-stable[m[33m, [m[1;33mtag: [m[1;33mv2.4-stable[m[33m, [m[1;33mtag: [m[1;33mv2.3-stable[m[33m)[m feat: add diagnose_order + fixes
+* [34m|[m [33md096fd1[m[33m ([m[1;33mtag: [m[1;33mv2.2-stable[m[33m)[m feat: add diagnose_order + fixes
+* [34m|[m [33ma7fa2a0[m[33m ([m[1;33mtag: [m[1;33mv2.1-stable[m[33m, [m[1;33mtag: [m[1;33mv2.0-stable[m[33m, [m[1;33mtag: [m[1;33mv1.6-stable[m[33m, [m[1;33mtag: [m[1;33mv1.5-stable[m[33m, [m[1;33mtag: [m[1;33mv1.4-stable[m[33m)[m feat: oauth v3 flow
+* [34m|[m [33m492a1df[m[33m ([m[1;33mtag: [m[1;33mv1.3-stable[m[33m, [m[1;33mtag: [m[1;33mv1.2-stable[m[33m)[m feat: oauth v3 flow
+* [34m|[m [33m88fd22a[m feat: enhanced OAuth handling with error handling and better UX
+* [34m|[m [33mbf378cd[m[33m ([m[1;33mtag: [m[1;33mv1.1-stable[m[33m, [m[1;33mtag: [m[1;33mv1.0-stable[m[33m, [m[1;31morigin/enhanced-oauth-v2[m[33m)[m feat: enhanced OAuth handling with error handling and better UX
+[34m|[m[34m/[m  
+* [33m8cdbbfc[m[33m ([m[1;33mtag: [m[1;33mv4.64-stable[m[33m)[m update struktur
+* [33m8739a2d[m Initial commit

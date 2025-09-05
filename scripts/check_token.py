@@ -3,7 +3,7 @@ import frappe
 from shopee_bridge.auth import get_token_status, refresh_access_token
 
 # Initialize Frappe (required when running standalone scripts)
-frappe.init(site="erp.managerio.ddns.net")
+frappe.init(site="erpdev.managerio.ddns.net")
 frappe.connect()
 
 try:

@@ -38,7 +38,7 @@
       "fieldtype": "Data",
       "label": "Redirect URL",
       "reqd": 1,
-      "default": "https://erp.managerio.ddns.net/app/shopee-settings"
+      "default": "https://erpdev.managerio.ddns.net/app/shopee-settings"
     },
     {
       "fieldname": "shop_id",
