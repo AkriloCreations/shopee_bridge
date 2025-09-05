@@ -1,0 +1,31 @@
+{
+    "doctype": "Workspace",
+    "name": "Shopee Bridge",
+    "label": "Shopee Bridge",
+    "module": "Shopee Bridge",
+    "public": 1,
+    "category": "Modules",
+    "content": [
+        {
+            "type": "shortcut",
+            "label": "Shopee Settings",
+            "link_to": "Shopee Settings",
+            "doctype": "Shopee Settings"
+        },
+        {
+            "type": "shortcut",
+            "label": "Shopee Webhook Inbox",
+            "link_to": "List/Shopee Webhook Inbox",
+            "doctype": "Shopee Webhook Inbox"
+        },
+        {
+            "type": "shortcut",
+            "label": "Shopee Sync Log",
+            "link_to": "List/Shopee Sync Log",
+            "doctype": "Shopee Sync Log"
+        }
+    ],
+    "for_user": "",
+    "hide_custom": 0,
+    "is_hidden": 0
+}

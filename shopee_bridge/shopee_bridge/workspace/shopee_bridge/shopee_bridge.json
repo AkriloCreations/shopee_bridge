@@ -1,0 +1,52 @@
+{
+ "charts": [],
+ "content": "[{\"id\": \"dc317903-e\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\"><b>Shopee Bridge</b></span>\", \"col\": 12}}, {\"id\": \"7f46df28-9\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Shopee Settings\", \"label\": \"Shopee Settings\", \"link_to\": \"Shopee Settings\", \"type\": \"DocType\", \"doc_view\": \"Settings\", \"col\": 4}}, {\"id\": \"71bb25b1-7\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Webhook Inbox\", \"label\": \"Webhook Inbox\", \"link_to\": \"Shopee Webhook Inbox\", \"type\": \"DocType\", \"doc_view\": \"List\", \"col\": 4}}, {\"id\": \"a8d00711-1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Customer Issues\", \"label\": \"Customer Issues\", \"link_to\": \"Customer Issue\", \"type\": \"DocType\", \"doc_view\": \"List\", \"col\": 4}}]",
+ "creation": "2025-09-05 00:41:12.188637",
+ "custom_blocks": [],
+ "docstatus": 0,
+ "doctype": "Workspace",
+ "hide_custom": 0,
+ "icon": "",
+ "idx": 0,
+ "indicator_color": "blue",
+ "is_hidden": 0,
+ "label": "Shopee Bridge",
+ "links": [],
+ "modified": "2025-09-05 00:44:12.984946",
+ "modified_by": "Administrator",
+ "module": "Shopee Bridge",
+ "name": "Shopee Bridge",
+ "number_cards": [],
+ "owner": "Administrator",
+ "public": 1,
+ "quick_lists": [],
+ "roles": [],
+ "sequence_id": 998.0,
+ "shortcuts": [
+  {
+   "color": "blue",
+   "doc_view": "List",
+   "format": "",
+   "label": "Shopee Settings",
+   "link_to": "Shopee Settings",
+   "type": "DocType"
+  },
+  {
+   "color": "blue",
+   "doc_view": "List",
+   "format": "",
+   "label": "Webhook Inbox",
+   "link_to": "Shopee Webhook Inbox",
+   "type": "DocType"
+  },
+  {
+   "color": "blue",
+   "doc_view": "List",
+   "format": "",
+   "label": "Customer Issues",
+   "link_to": "Customer Issue",
+   "type": "DocType"
+  }
+ ],
+ "title": "Shopee Bridge"
+}
