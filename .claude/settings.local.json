@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Read(//home/**)",
+      "Bash(docker-compose:*)",
+      "Bash(docker exec:*)",
+      "Bash(bench list-apps:*)",
+      "Bash(bench --site all migrate)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
