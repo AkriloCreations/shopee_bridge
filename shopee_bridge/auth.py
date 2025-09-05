@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 import frappe
 
 def _utc_naive(expires_in_seconds: int):
-    """Hitung expiry dalam UTC aware lalu simpan sebagai naive UTC."""
-    return (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).replace(tzinfo=None)
+    """Return expiry as integer epoch UTC (seconds since 1970-01-01 UTC)."""
+    return int((datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).timestamp())
 
 from typing import List, Dict, Any, Union, Optional
 import time
@@ -304,7 +304,7 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         settings = _settings()
         settings.access_token = access_token
         settings.refresh_token = refresh_token
-        settings.token_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in))
+        settings.token_expires_at = _utc_naive(expires_in)
         settings.last_auth_code = code
         if returned_shop_id:
             settings.shop_id = str(returned_shop_id)
@@ -398,13 +398,19 @@ def refresh_if_needed(buffer_seconds: int = 600) -> bool:
     
     try:
         # Parse to datetime if string
+        from datetime import datetime, timezone
+        # Convert to aware UTC
         if isinstance(raw, str):
-            expiry_dt = frappe.utils.get_datetime(raw)
-        elif isinstance(raw, datetime):
-            expiry_dt = raw
+            expires_at = frappe.utils.get_datetime(raw)
         else:
-            frappe.logger().error(f"[Shopee] Unexpected token_expires_at type: {type(raw)}")
-            return False
+            expires_at = raw
+        if expires_at.tzinfo is None:
+            expires_at_aware = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at_aware = expires_at.astimezone(timezone.utc)
+        now_aware = datetime.now(timezone.utc)
+        seconds_left = (expires_at_aware - now_aware).total_seconds()
+        return seconds_left < buffer_seconds
         # Attach UTC tzinfo for comparison only
         if expiry_dt.tzinfo is None:
             expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
@@ -661,7 +667,7 @@ def refresh_access_token() -> Dict[str, Any]:
         settings.access_token = access_token
         if refresh_token:
             settings.refresh_token = refresh_token
-        settings.token_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in))
+        settings.token_expires_at = _utc_naive(expires_in)
         settings.save(ignore_permissions=True)
         frappe.db.commit()
         frappe.cache().delete_value("Shopee Settings")

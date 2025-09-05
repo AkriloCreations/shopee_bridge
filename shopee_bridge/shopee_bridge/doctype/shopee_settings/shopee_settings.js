@@ -1,5 +1,21 @@
 frappe.ui.form.on("Shopee Settings", {
     refresh(frm) {
+        // === TOKEN EXPIRY INFO ===
+        if (frm.doc.token_expires_at) {
+            try {
+                const expiryEpoch = parseInt(frm.doc.token_expires_at);
+                if (!isNaN(expiryEpoch)) {
+                    // Convert to WIB
+                    const dt = new Date(expiryEpoch * 1000);
+                    const wibStr = dt.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+                    const nowEpoch = Math.floor(Date.now() / 1000);
+                    let status = expiryEpoch < nowEpoch ? '❌ Expired' : '✅ Valid';
+                    frm.dashboard.set_headline(`<span style="font-size:1.1em">Access Token <b>${status}</b> sampai <b>${wibStr} WIB</b></span>`);
+                }
+            } catch (e) {
+                frm.dashboard.set_headline(`<span style="color:red">Gagal membaca expiry token: ${e}</span>`);
+            }
+        }
         // Add button groups for better organization
         frm.clear_custom_buttons();
         
@@ -15,6 +31,22 @@ frappe.ui.form.on("Shopee Settings", {
                         window.open(r.message.url, "_blank");
                     } else {
                         frappe.msgprint(__("Error: {0}", [r.message?.error || "Failed to generate OAuth URL"]));
+                            // Connection indicator logic
+                            let indicator = 'green';
+                            if (expiryEpoch < nowEpoch) {
+                                indicator = 'red';
+                                status = '❌ Disconnected';
+                            } else if (expiryEpoch - nowEpoch < 86400) { // less than 24h
+                                indicator = 'orange';
+                                status = '⚠️ Expiring Soon';
+                            } else if (!frm.doc.access_token) {
+                                indicator = 'red';
+                                status = '❌ Disconnected';
+                            } else {
+                                indicator = 'green';
+                                status = '✅ Connected';
+                            }
+                            frm.dashboard.set_headline(`<span style="font-size:1.1em;color:${indicator}">Access Token <b>${status}</b> sampai <b>${wibStr} WIB</b></span>`);
                     }
                 } catch (e) { 
                     frappe.msgprint(__("Error: {0}", [String(e)])); 
@@ -27,16 +59,38 @@ frappe.ui.form.on("Shopee Settings", {
                     const r = await frappe.call({ method: "shopee_bridge.api.test_shopee_connection" });
                     if (r.message?.ok) {
                         const shop = r.message.shop;
-                        let msg = `<b>Connection Status:</b><br>
-                            Environment: ${shop.environment}<br>
-                            Shop ID: ${shop.shop_id || 'Not connected'}<br>
-                            Has Token: ${shop.has_token ? 'Yes' : 'No'}`;
-                        
-                        if (shop.api_error) {
-                            msg += `<br><b>API Error:</b> ${shop.api_error}<br>
-                                    <b>Message:</b> ${shop.message}`;
+                        let msg = `<b>Connection Status:</b><br><br>`;
+                        msg += `<b>Environment:</b> ${shop.environment}<br>`;
+                        msg += `<b>Shop ID:</b> ${shop.shop_id || 'Not connected'}<br>`;
+                        msg += `<b>Has Token:</b> ${shop.has_token ? '✅ Yes' : '❌ No'}<br>`;
+                        if (shop.token_expires_at) {
+                            const dt = new Date(shop.token_expires_at * 1000);
+                            const wibStr = dt.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+                            msg += `<b>Token Expiry:</b> ${wibStr} WIB<br>`;
                         }
-                        
+                        if (shop.scopes) {
+                            msg += `<b>Scopes:</b> ${Array.isArray(shop.scopes) ? shop.scopes.join(', ') : shop.scopes}<br>`;
+                        }
+                        if (shop.last_auth_error) {
+                            msg += `<b>Last Auth Error:</b> <span style="color:red">${shop.last_auth_error}</span><br>`;
+                        }
+                        if (shop.api_error) {
+                            msg += `<b>API Error:</b> <span style="color:red">${shop.api_error}</span><br>`;
+                        }
+                        if (shop.message) {
+                            msg += `<b>Message:</b> ${shop.message}<br>`;
+                        }
+                        if (shop.api_response) {
+                            let displayValue = shop.api_response;
+                            if (typeof displayValue === 'object') {
+                                try {
+                                    displayValue = `<pre style="background:#f8f8f8;padding:4px;border-radius:3px">${JSON.stringify(displayValue, null, 2)}</pre>`;
+                                } catch (e) {
+                                    displayValue = '[object Object]';
+                                }
+                            }
+                            msg += `<b>API Response:</b> ${displayValue}<br>`;
+                        }
                         frappe.msgprint(msg, __("Connection Test Result"));
                     } else {
                         frappe.msgprint(__("Error: {0}", [r.message?.error]));
@@ -219,11 +273,20 @@ frappe.ui.form.on("Shopee Settings", {
                         const info = r.message.shop;
                         let msg = `<b>Shop Information:</b><br><br>`;
                         
-                        Object.entries(info).forEach(([key, value]) => {
-                            if (value !== null && value !== undefined) {
-                                msg += `<b>${key.replace(/_/g, ' ').toUpperCase()}:</b> ${value}<br>`;
-                            }
-                        });
+
+                            Object.entries(info).forEach(([key, value]) => {
+                                if (value !== null && value !== undefined) {
+                                    let displayValue = value;
+                                    if (typeof value === 'object') {
+                                        try {
+                                            displayValue = `<pre style="background:#f8f8f8;padding:4px;border-radius:3px">${JSON.stringify(value, null, 2)}</pre>`;
+                                        } catch (e) {
+                                            displayValue = '[object Object]';
+                                        }
+                                    }
+                                    msg += `<b>${key.replace(/_/g, ' ').toUpperCase()}:</b> ${displayValue}<br>`;
+                                }
+                            });
                         
                         frappe.msgprint(msg, __("Shop Information"));
                     }

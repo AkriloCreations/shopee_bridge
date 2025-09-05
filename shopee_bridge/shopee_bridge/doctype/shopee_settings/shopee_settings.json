@@ -59,18 +59,19 @@
     },
     {
       "fieldname": "access_token",
-      "fieldtype": "Password",
+      "fieldtype": "Data",
       "label": "Access Token"
     },
     {
       "fieldname": "refresh_token",
-      "fieldtype": "Password",
+      "fieldtype": "Data",
       "label": "Refresh Token"
     },
     {
       "fieldname": "token_expires_at",
-      "fieldtype": "Datetime",
-      "label": "Token Expires At"
+      "fieldtype": "Data",
+      "label": "Token Expires At (Epoch UTC)",
+      "hidden": 1
     },
     {
       "fieldname": "scopes",
