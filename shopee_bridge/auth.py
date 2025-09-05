@@ -2,7 +2,6 @@
 # Datetime helpers
 # ---------------------------------------------------------------------------
 from datetime import datetime, timedelta, timezone
-import frappe
 
 def _utc_naive(expires_in_seconds: int):
     """Return expiry as integer epoch UTC (seconds since 1970-01-01 UTC)."""
@@ -80,8 +79,9 @@ class ShopeeAuthError(Exception):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _settings() -> frappe.model.document.Document:
+def _settings():
     ## ambil data direct langsung dari DB ##
+    import frappe
     try:
         return frappe.get_doc("Shopee Settings")
     except Exception as exc:  # pragma: no cover - defensive guard
@@ -101,10 +101,12 @@ def _mask_secret(value: Optional[str], show: int = 4) -> str:
 
 
 def _cache_set(key: str, val: str, ttl: int):
+    import frappe
     frappe.cache().set_value(key, val, expires_in_sec=ttl)
 
 
 def _cache_get(key: str) -> Optional[str]:
+    import frappe
     return frappe.cache().get_value(key)
 
 
@@ -121,6 +123,7 @@ def _validate_state(state: str):
     if not cached:
         raise InvalidState("Invalid or expired state parameter")
     # One‑time use: remove
+    import frappe
     frappe.cache().delete_value(STATE_CACHE_PREFIX + state)
 
 def get_shop_info() -> Dict[str, Any]:
@@ -242,6 +245,7 @@ def handle_oauth_callback(params: Dict[str, Any]) -> Dict[str, Any]:
         result = complete_token_exchange(code, shop_id, main_account_id)
         return result
     except Exception as e:
+        import frappe
         frappe.log_error(f"OAuth callback error: {str(e)}", "Shopee OAuth Callback")
         raise
 
@@ -305,6 +309,7 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         if returned_merchant_id:
             settings.merchant_id = str(returned_merchant_id)
         settings.save(ignore_permissions=True)
+        import frappe
         frappe.db.commit()
         frappe.cache().delete_value("Shopee Settings")
         frappe.logger().info(f"[Shopee] OAuth completed - shop_id: {settings.shop_id}, merchant_id: {getattr(settings, 'merchant_id', 'N/A')}")
@@ -318,6 +323,7 @@ def complete_token_exchange(code: str, shop_id: Union[str, int] = None, main_acc
         }
     except Exception as e:
         error_msg = str(e)
+        import frappe
         frappe.log_error(f"Token exchange failed: {error_msg}", "Shopee Token Exchange")
         return {
             "success": False,

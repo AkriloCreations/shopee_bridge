@@ -27,7 +27,7 @@ import time
 import traceback
 import hashlib
 
-import frappe
+# import frappe  # Moved inside functions to avoid import errors in tests
 from shopee_bridge import auth
 
 try:  # Prefer requests
@@ -80,6 +80,7 @@ def _do_request(method: str, url: str, headers: Dict[str, str], params: Dict[str
 			)
 			return resp.status_code, resp.text, dict(resp.headers)
 		except Exception as exc:
+			import frappe
 			frappe.log_error(f"Shopee HTTP {method} error: {exc}")
 			raise
 	else:
@@ -91,6 +92,7 @@ def _do_request(method: str, url: str, headers: Dict[str, str], params: Dict[str
 				data = _frappe_post(url, headers=headers, data=json or {})
 				return 200, _json.dumps(data), {}
 		except Exception as exc:
+			import frappe
 			frappe.log_error(f"Shopee HTTP fallback error: {exc}")
 			raise
 
@@ -107,6 +109,7 @@ def _retryable(status: int) -> bool:
 
 
 def _log_short(msg: str):
+	import frappe
 	frappe.logger().info(msg)
 
 
@@ -166,6 +169,7 @@ def _execute_with_retry(method: str, path: str, params: Dict[str, Any], json: Di
 			last_error = ShopeeAPIError(f"HTTP error: {exc}")
 			break
 	
+	import frappe
 	frappe.log_error(message=str(last_error), title="Shopee HTTP error")
 	raise last_error
 
@@ -191,11 +195,15 @@ def rotate_on_401(send_callable: Callable[[], Dict[str, Any]]) -> Dict[str, Any]
 		if auth.refresh_if_needed():
 			result = auth.refresh_access_token()
 			if not result.get("success"):
+				import frappe
 				frappe.logger().warning(f"[Shopee] Token refresh failed: {result.get('error')}")
 			else:
+				import frappe
 				frappe.logger().info("[Shopee] Token refresh successful via rotate_on_401")
+		import frappe
 		frappe.cache().delete_value("Shopee Settings")
 	except Exception as exc:
+		import frappe
 		frappe.log_error(f"Shopee refresh error: {exc}")
 		return first
 	second = send_callable()
@@ -260,6 +268,7 @@ def paginate_get(path: str, params: Dict[str, Any], page_size: int = 100, max_pa
 			time.sleep(5)
 			continue
 		except ShopeeAPIError as e:
+			import frappe
 			frappe.log_error(f"Pagination error at page {page_count}: {e}", "Shopee Pagination")
 			break
 
@@ -307,6 +316,7 @@ def batch_request(path: str, items: List[str], batch_size: int = 50, method: str
 					yield result
 					
 		except ShopeeAPIError as e:
+			import frappe
 			frappe.log_error(f"Batch request error for items {batch[:3]}...: {e}", "Shopee Batch Request")
 			# Continue with next batch instead of failing completely
 			continue
@@ -320,6 +330,7 @@ def log_request(path: str, params: Dict[str, Any], response: Dict[str, Any], dur
 			f"{path}:{_json.dumps(params, sort_keys=True)}".encode()
 		).hexdigest()
 		
+		import frappe
 		frappe.get_doc({
 			"doctype": "Shopee Sync Log",
 			"job": "api_request",
@@ -338,8 +349,19 @@ def log_request(path: str, params: Dict[str, Any], response: Dict[str, Any], dur
 		}).insert(ignore_permissions=True)
 		
 	except Exception as e:
+		import frappe
 		frappe.logger().warning(f"Failed to log API request: {e}")
 
 
-__all__ = ["http_get", "http_post", "rotate_on_401", "paginate_get", "batch_request", "log_request", 
+def request_json(method: str, host: str, path: str, query: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, access_token: str | None = None, shop_id: int | None = None) -> Dict[str, Any]:
+	"""Generic request method for Shopee API."""
+	if method.upper() == "GET":
+		return http_get(path, query or {})
+	elif method.upper() == "POST":
+		return http_post(path, json=body)
+	else:
+		raise ValueError(f"Unsupported method: {method}")
+
+
+__all__ = ["http_get", "http_post", "request_json", "rotate_on_401", "paginate_get", "batch_request", "log_request", 
 		   "ShopeeAPIError", "ShopeeRateLimitError", "ShopeeAuthError"]

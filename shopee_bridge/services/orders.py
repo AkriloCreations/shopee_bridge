@@ -436,9 +436,9 @@ def get_escrow_details(order_sn: str) -> Dict[str, Any]:
 def fetch_and_log_escrow(site: str, host: str, access_token: str, shop_id: int, order_sn: str) -> dict:
 	"""Fetch escrow detail and log it."""
 	from shopee_bridge.services import finance
-	escrow = finance.get_escrow_detail(host, access_token, shop_id, order_sn)
-	finance.log_escrow(site, order_sn, escrow)
-	return escrow
+	data = finance.get_escrow_detail(host, access_token, shop_id, order_sn)
+	finance.log_escrow(site, order_sn, data)
+	return data
 
 
 def sync_single_order(order_sn: str) -> Dict[str, Any]:

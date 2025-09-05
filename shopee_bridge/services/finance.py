@@ -38,7 +38,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 import time
-import frappe
 
 from shopee_bridge import clients
 
@@ -47,39 +46,32 @@ ESCROW_DETAIL_PATH = "/api/v2/payment/get_escrow_detail"
 
 def _log(event: str, data: Dict[str, Any]):  # light logging
 	try:
+		import frappe
 		frappe.logger().info(f"[Shopee][finance] {event} {data}")
 	except Exception:  # pragma: no cover
 		pass
 
 
+# Shopee endpoint: /api/v2/payment/get_escrow_detail
+# Method: GET
+# Query params: order_sn, shop_id (+ partner_id, timestamp, sign, access_token)
+# Body params: none
 def get_escrow_detail(host: str, access_token: str, shop_id: int, order_sn: str) -> dict:
-	"""Fetch escrow detail for a single order.
-
-	Performs signed POST on Shopee endpoint `/api/v2/payment/get_escrow_detail`.
-	Returns raw Shopee payload.
-	"""
-	try:
-		resp = clients.http_post(ESCROW_DETAIL_PATH, json={"order_sn": order_sn, "shop_id": shop_id})
-		return resp.get("response") or resp
-	except clients.ShopeeAPIError as e:
-		_log("escrow_detail_api_error", {"order_sn": order_sn, "error": str(e), "status": e.status_code})
-		return {"error": str(e), "status_code": e.status_code}
-	except Exception as e:
-		_log("escrow_detail_error", {"order_sn": order_sn, "error": str(e)})
-		return {"error": str(e)}
+	"""Fetch escrow detail for a single order."""
+	return clients.request_json(
+		method="GET",
+		host=host,
+		path="/api/v2/payment/get_escrow_detail",
+		query={"order_sn": order_sn, "shop_id": shop_id},
+		body=None,
+		access_token=access_token,
+		shop_id=shop_id,
+	)
 
 
 def patch_invoice_with_fees(escrow: Dict[str, Any]) -> str:
-	"""Idempotently patch Sales Invoice with Shopee fee / net values.
-
-	Locates Sales Invoice by shopee_order_sn, updates fee/net fields and line item.
-	Idempotency: keyed by (order_sn, payout_batch_id).
-	Logs all actions.
-	Args:
-		escrow: Shopee escrow detail dict.
-	Returns:
-		str: Sales Invoice name.
-	"""
+	"""Idempotently patch Sales Invoice with Shopee fee / net values."""
+	import frappe
 	order_sn = escrow.get("order_sn") or "UNKNOWN"
 	payout_batch_id = escrow.get("payout_batch_id") or "BATCH-MOCK"
 	try:
@@ -110,13 +102,8 @@ def patch_invoice_with_fees(escrow: Dict[str, Any]) -> str:
 
 
 def ensure_bank_transaction_from_escrow(escrow: Dict[str, Any]) -> str:
-	"""Idempotently create Bank Transaction for Shopee payout.
-
-	Args:
-		escrow: Shopee escrow detail dict.
-	Returns:
-		str: Bank Transaction name.
-	"""
+	"""Idempotently create Bank Transaction for Shopee payout."""
+	import frappe
 	order_sn = escrow.get("order_sn") or "UNKNOWN"
 	payout_batch_id = escrow.get("payout_batch_id") or "BATCH-MOCK"
 	net = float(escrow.get("net", 0))
@@ -246,7 +233,6 @@ def finance_backfill_range(start: str, end: str) -> Dict[str, Any]:
 
 
 def log_escrow(site: str, order_sn: str, payload: dict) -> str:
-	"""Log escrow detail to shopee_sync_log."""
 	import frappe
 	doc = frappe.get_doc({
 		"doctype": "shopee_sync_log",
