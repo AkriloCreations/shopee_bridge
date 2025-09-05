@@ -17,7 +17,7 @@ def run(minutes: int = 30) -> Dict[str, Any]:
         "errors": [],
     }
     from ..services import logistics
-    from ..doctype.shopee_sync_log.shopee_sync_log import write_log
+    from ..shopee_bridge.doctype.shopee_sync_log.shopee_sync_log import ShopeeSyncLog
     try:
         svc = logistics.sync_shipping_status(updated_since_minutes=minutes)
         summary.update({
@@ -26,10 +26,10 @@ def run(minutes: int = 30) -> Dict[str, Any]:
             "errors": svc.get("errors", []),
         })
         status = "ok" if not summary["errors"] else "partial"
-        write_log("sync_shipping", f"window:{from_ts}-{now_ts}", status, meta=summary)
+        ShopeeSyncLog.write_log("sync_shipping", f"window:{from_ts}-{now_ts}", status, meta=summary)
     except Exception as exc:  # pragma: no cover
         msg = str(exc)
         summary["errors"].append(msg)
-        write_log("sync_shipping", f"window:{from_ts}-{now_ts}", "fail", message=msg)
+        ShopeeSyncLog.write_log("sync_shipping", f"window:{from_ts}-{now_ts}", "fail", message=msg)
     return summary
 

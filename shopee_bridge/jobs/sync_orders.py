@@ -27,7 +27,7 @@ def run(minutes: int = 10) -> Dict[str, Any]:
         "errors": [],
     }
     from ..services import orders  # local import
-    from ..doctype.shopee_sync_log.shopee_sync_log import write_log
+    from ..shopee_bridge.doctype.shopee_sync_log.shopee_sync_log import ShopeeSyncLog
 
     try:
         sns: List[str] = orders.get_order_list(window_from, now_ts, status=None)
@@ -50,12 +50,11 @@ def run(minutes: int = 10) -> Dict[str, Any]:
             except Exception as per_exc:  # pragma: no cover
                 msg = f"{order_sn}: {per_exc}"[:400]
                 summary["errors"].append(msg)
-                write_log("sync_orders", order_sn, "fail", message=msg)
+                ShopeeSyncLog.write_log("sync_orders", order_sn, "fail", message=msg)
         status = "ok" if not summary["errors"] else "partial"
-        write_log("sync_orders", f"window:{window_from}-{now_ts}", status, meta=summary)
+        ShopeeSyncLog.write_log("sync_orders", f"window:{window_from}-{now_ts}", status, meta=summary)
     except Exception as exc:  # fatal
         summary["errors"].append(str(exc))
-        from ..doctype.shopee_sync_log.shopee_sync_log import write_log
-        write_log("sync_orders", f"window:{window_from}-{now_ts}", "fail", message=str(exc))
+        ShopeeSyncLog.write_log("sync_orders", f"window:{window_from}-{now_ts}", "fail", message=str(exc))
     return summary
 
