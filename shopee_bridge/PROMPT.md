@@ -165,6 +165,50 @@ Implement the complete webhook and job processing system:
 Ensure webhook signature verification and proper error handling.
 ```
 
+### Phase 5b: Jobs Implementation
+**Prompt 7b: Implement All Jobs in jobs/***
+```
+Implement all job modules in the jobs/ folder:
+
+1. **process_webhook.py**
+   - Dispatcher for Shopee Webhook Inbox
+   - Async event processing, retry_due logic, idempotency key derivation
+   - Error logging and status updates
+
+2. **sync_finance.py**
+   - Hourly batch sync of Shopee escrow and finance data
+   - Patch invoices, reconcile bank transactions, log results
+
+3. **sync_orders.py**
+   - Incremental order pull (every 10 minutes)
+   - Upsert Sales Orders, Sales Invoices, Delivery Notes
+   - Idempotent writes, anti-regression status logic
+
+4. **sync_returns.py**
+   - Scheduled returns sync (every 30 minutes)
+   - Upsert Customer Issues, Sales Returns, Credit Notes
+   - Error handling and logging
+
+5. **sync_shipping.py**
+   - Scheduled shipping status refresh (every 30 minutes)
+   - Update Delivery Notes, attach shipping labels, track logistics
+
+6. **backfill_fy.py**
+   - Fiscal year backfill orchestrator
+   - Chunked historical sync for orders, returns, shipping, finance
+
+7. **reconcile_bank.py**
+   - Strict bank reconciliation job
+   - Match Shopee payouts to ERP bank transactions
+
+Requirements:
+- Each job must be idempotent and log results to Shopee Sync Log
+- Use deterministic keys for all writes
+- Catch and log all errors
+- Add rich docstrings and type hints
+- Follow the architecture and naming conventions
+```
+
 ### Phase 6: API Layer & Integration
 **Prompt 8: API Endpoints**
 ```
