@@ -1,8 +1,8 @@
 """Incremental shipping (logistics) sync job (stub)."""
-
+import frappe
 from typing import Dict, Any
 import time
-import frappe
+
 
 
 def run(minutes: int = 30) -> Dict[str, Any]:

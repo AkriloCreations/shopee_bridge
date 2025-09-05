@@ -1,7 +1,7 @@
 """Full fiscal year backfill orchestrator job."""
 
 from typing import Dict, Any
-import frappe
+import frappe # type: ignore
 
 
 def run(company: str, fiscal_year_name: str) -> Dict[str, Any]:

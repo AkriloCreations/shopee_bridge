@@ -28,7 +28,7 @@ def run(minutes: int = 10) -> Dict[str, Any]:
     }
     from ..services import orders  # local import
     from ..shopee_bridge.doctype.shopee_sync_log.shopee_sync_log import ShopeeSyncLog
-
+    
     try:
         sns: List[str] = orders.get_order_list(window_from, now_ts, status=None)
         summary["orders_found"] = len(sns)
