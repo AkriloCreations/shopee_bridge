@@ -63,7 +63,7 @@ Test the OAuth flow and basic API connectivity.
 ### Phase 3: DocTypes & Database Layer
 **Prompt 3: DocTypes and Custom Fields**
 ```
-Create the complete database layer:
+Create or modify the complete database layer:
 
 1. **DocTypes** (in shopee_bridge/doctype/):
    - shopee_settings/ (Single doctype)
@@ -75,6 +75,8 @@ Create the complete database layer:
    - Sales Order: custom_order_sn, so.po_no, buyer_user_id, etc.
    - Sales Invoice: escrow fields, sync tracking
    - Delivery Note: logistics tracking fields
+
+tadi ada error saat call sync order, harusnya ke shopee_bridge.jobs malah ke shopee_bridge.doctypes, call dipanggil dari shopee_settings.js, silahkan langsung fix problemnya, dan works flawlesly
 
 3. **Bootstrap Patch** (patches/0001_bootstrap.py):
    - Create all custom fields idempotently
@@ -99,7 +101,7 @@ Key functions:
 - sync_incremental_orders() for scheduled syncing
 
 Critical requirements:
-- All operations must be idempotent using custom_shopee_order_sn, so.po_no as key
+- All operations must be idempotent using custom_order_sn, so.po_no as key
 - Never downgrade order status (check last_pushed_update_time)
 - Comprehensive error handling with Shopee Sync Log entries
 - Proper mapping from Shopee data to ERPNext fields

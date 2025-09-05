@@ -1,0 +1,54 @@
+{
+  "doctype": "DocType",
+  "name": "Shopee Sync Log",
+  "module": "Shopee Bridge",
+  "istable": 0,
+  "custom": 0,
+  "fields": [
+    {
+      "fieldname": "sync_type",
+      "fieldtype": "Data",
+      "label": "Sync Type",
+      "reqd": 1
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "success\nfailed",
+      "reqd": 1
+    },
+    {
+      "fieldname": "error_message",
+      "fieldtype": "Text",
+      "label": "Error Message"
+    },
+    {
+      "fieldname": "details",
+      "fieldtype": "Long Text",
+      "label": "Details"
+    },
+    {
+      "fieldname": "timestamp",
+      "fieldtype": "Datetime",
+      "label": "Timestamp",
+      "reqd": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    },
+    {
+      "role": "Administrator",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ]
+}

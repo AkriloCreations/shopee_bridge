@@ -46,6 +46,14 @@
    "label": "Customer Issues",
    "link_to": "Customer Issue",
    "type": "DocType"
+  },
+  {
+   "color": "blue",
+   "doc_view": "List",
+   "format": "",
+   "label": "Shopee Sync Log",
+   "link_to": "Shopee Sync Log",
+   "type": "DocType"
   }
  ],
  "title": "Shopee Bridge"
