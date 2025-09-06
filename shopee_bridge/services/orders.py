@@ -33,7 +33,17 @@ ORDER_DETAIL_PATH = "/api/v2/order/get_order_detail"
 # --- Shopee Sync Log fallback ---
 def _log_sync(event: str, data: Dict[str, Any]):
 	try:
-		frappe.logger().info(f"[Shopee][orders] {event} {data}")
+		import frappe
+		from shopee_bridge import helpers
+		doc = frappe.get_doc({
+			"doctype": "Shopee Sync Log",
+			"category": "orders",
+			"ref": event,
+			"payload_json": frappe.as_json(data),
+			"status": "DONE",
+			"created_epoch": helpers.now_epoch(),
+		})
+		doc.insert(ignore_permissions=True)
 	except Exception:
 		pass
 
