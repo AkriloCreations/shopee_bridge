@@ -6,33 +6,38 @@
   "custom": 0,
   "fields": [
     {
-      "fieldname": "sync_type",
+      "fieldname": "category",
       "fieldtype": "Data",
-      "label": "Sync Type",
+      "label": "Category",
+      "reqd": 1
+    },
+    {
+      "fieldname": "ref",
+      "fieldtype": "Data",
+      "label": "Reference",
       "reqd": 1
     },
     {
       "fieldname": "status",
       "fieldtype": "Select",
       "label": "Status",
-      "options": "success\nfailed",
+      "options": "PENDING\nDONE\nFAILED",
       "reqd": 1
+    },
+    {
+      "fieldname": "payload_json",
+      "fieldtype": "Long Text",
+      "label": "Payload JSON"
+    },
+    {
+      "fieldname": "created_epoch",
+      "fieldtype": "Int",
+      "label": "Created Epoch"
     },
     {
       "fieldname": "error_message",
       "fieldtype": "Text",
       "label": "Error Message"
-    },
-    {
-      "fieldname": "details",
-      "fieldtype": "Long Text",
-      "label": "Details"
-    },
-    {
-      "fieldname": "timestamp",
-      "fieldtype": "Datetime",
-      "label": "Timestamp",
-      "reqd": 1
     }
   ],
   "permissions": [

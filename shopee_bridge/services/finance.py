@@ -234,12 +234,29 @@ def finance_backfill_range(start: str, end: str) -> Dict[str, Any]:
 
 def log_escrow(site: str, order_sn: str, payload: dict) -> str:
 	import frappe
+	from shopee_bridge import helpers
+	# idempotent upsert on (category, ref)
+	existing = frappe.get_all(
+		"Shopee Sync Log",
+		filters={"category": "escrow", "ref": order_sn},
+		pluck="name",
+		limit=1,
+	)
+	if existing:
+		name = existing[0]
+		doc = frappe.get_doc("Shopee Sync Log", name)
+		doc.payload_json = frappe.as_json(payload)
+		doc.status = "DONE"
+		doc.created_epoch = helpers.now_epoch()
+		doc.save(ignore_permissions=True)
+		return doc.name
 	doc = frappe.get_doc({
-		"doctype": "shopee_sync_log",
+		"doctype": "Shopee Sync Log",
 		"category": "escrow",
 		"ref": order_sn,
 		"payload_json": frappe.as_json(payload),
-		"created_epoch": helpers.now_epoch()
+		"status": "DONE",
+		"created_epoch": helpers.now_epoch(),
 	})
 	doc.insert(ignore_permissions=True)
 	return doc.name

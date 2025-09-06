@@ -27,7 +27,6 @@ def run(minutes: int = 10) -> Dict[str, Any]:
         "errors": [],
     }
     from ..services import orders  # local import
-    from ..shopee_bridge.doctype.shopee_sync_log.shopee_sync_log import ShopeeSyncLog
     
     try:
         sns: List[str] = orders.get_order_list(window_from, now_ts, status=None)
@@ -50,11 +49,38 @@ def run(minutes: int = 10) -> Dict[str, Any]:
             except Exception as per_exc:  # pragma: no cover
                 msg = f"{order_sn}: {per_exc}"[:400]
                 summary["errors"].append(msg)
-                ShopeeSyncLog.write_log("sync_orders", order_sn, "fail", message=msg)
+                # Write per-order error log
+                log_doc = frappe.get_doc({
+                    "doctype": "Shopee Sync Log",
+                    "sync_type": "sync_orders",
+                    "status": "fail",
+                    "error_message": msg,
+                    "timestamp": frappe.utils.now()
+                })
+                log_doc.insert(ignore_permissions=True)
+                frappe.db.commit()
         status = "ok" if not summary["errors"] else "partial"
-        ShopeeSyncLog.write_log("sync_orders", f"window:{window_from}-{now_ts}", status, meta=summary)
+        # Write summary log
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "sync_type": "sync_orders",
+            "status": status,
+            "details": frappe.as_json(summary),
+            "timestamp": frappe.utils.now()
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
     except Exception as exc:  # fatal
         summary["errors"].append(str(exc))
-        ShopeeSyncLog.write_log("sync_orders", f"window:{window_from}-{now_ts}", "fail", message=str(exc))
+        # Write fatal error log
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "sync_type": "sync_orders",
+            "status": "fail",
+            "error_message": str(exc),
+            "timestamp": frappe.utils.now()
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
     return summary
 

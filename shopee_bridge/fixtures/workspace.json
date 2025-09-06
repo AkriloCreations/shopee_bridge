@@ -4,17 +4,18 @@
 		"name": "Shopee Bridge",
 		"label": "Shopee Bridge",
 		"title": "Shopee Bridge",
-		"public": 1,
-		"content": "[{\"type\": \"shortcut\", \"label\": \"Shopee Settings\", \"link_type\": \"DocType\", \"link_to\": \"Shopee Settings\"}, {\"type\": \"shortcut\", \"label\": \"Shopee Sync Log\", \"link_type\": \"DocType\", \"link_to\": \"Shopee Sync Log\"}, {\"type\": \"shortcut\", \"label\": \"Shopee Webhook Inbox\", \"link_type\": \"DocType\", \"link_to\": \"Shopee Webhook Inbox\"}]",
-		"for_user": "",
-		"parent_page": "",
-		"icon": "octicon octicon-globe",
 		"module": "Shopee Bridge",
+		"public": 1,
+		"is_hidden": 0,
 		"route": "shopee-bridge",
+		"icon": "octicon octicon-globe",
+		"parent_page": "",
+		"for_user": "",
 		"restrict_to_domain": "",
 		"roles": [
 			{"role": "All"},
 			{"role": "System Manager"}
-		]
+		],
+		"content": "[{\"id\":\"dc317903-e\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\"><b>Shopee Bridge</b></span>\",\"col\":12}},{\"id\":\"7f46df28-9\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Shopee Settings\",\"label\":\"Shopee Settings\",\"link_to\":\"Shopee Settings\",\"type\":\"DocType\",\"doc_view\":\"Settings\",\"col\":4}},{\"id\":\"71bb25b1-7\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Webhook Inbox\",\"label\":\"Webhook Inbox\",\"link_to\":\"Shopee Webhook Inbox\",\"type\":\"DocType\",\"doc_view\":\"List\",\"col\":4}},{\"id\":\"a8d00711-1\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Shopee Sync Log\",\"label\":\"Shopee Sync Log\",\"link_to\":\"Shopee Sync Log\",\"type\":\"DocType\",\"doc_view\":\"List\",\"col\":4}}]"
 	}
 ]

@@ -6,7 +6,6 @@ import frappe
 
 def run(hours: int = 1) -> Dict[str, Any]:
     from ..services import finance
-    from ..shopee_bridge.doctype.shopee_sync_log.shopee_sync_log import ShopeeSyncLog
     summary: Dict[str, Any] = {"hours": hours, "count": 0, "errors": []}
     try:
         svc = finance.sync_escrow_for_completed_orders(min_age_hours=hours)
@@ -15,10 +14,30 @@ def run(hours: int = 1) -> Dict[str, Any]:
             "errors": svc.get("errors", []),
         })
         status = "ok" if not summary["errors"] else "partial"
-        ShopeeSyncLog.write_log("sync_finance", f"hours:{hours}", status, meta=summary)
+        # Write log entry using frappe.get_doc instead of DocType import
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "sync_type": "sync_finance",
+            "status": status,
+            "error_message": None,
+            "details": frappe.as_json(summary),
+            "timestamp": frappe.utils.now()
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
     except Exception as exc:  # pragma: no cover
         summary["errors"].append(str(exc))
-        ShopeeSyncLog.write_log("sync_finance", f"hours:{hours}", "fail", message=str(exc))
+        # Write error log entry
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "sync_type": "sync_finance",
+            "status": "fail",
+            "error_message": str(exc),
+            "details": frappe.as_json(summary),
+            "timestamp": frappe.utils.now()
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
     return summary
 
 

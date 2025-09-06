@@ -6,15 +6,32 @@ import frappe
 
 def run(days_back: int = 2) -> Dict[str, Any]:
     from ..services import finance
-    from ..shopee_bridge.doctype.shopee_sync_log.shopee_sync_log import ShopeeSyncLog
     summary: Dict[str, Any] = {"days_back": days_back}
     try:
         res = finance.reconcile_bank_strict(days_back=days_back)
         summary.update(res)
         status = "ok"
-        ShopeeSyncLog.write_log("reconcile_bank", f"days_back:{days_back}", status, meta=summary)
+        # Write summary log
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "sync_type": "reconcile_bank",
+            "status": status,
+            "details": frappe.as_json(summary),
+            "timestamp": frappe.utils.now()
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
     except Exception as exc:  # pragma: no cover
         summary["error"] = str(exc)
-        ShopeeSyncLog.write_log("reconcile_bank", f"days_back:{days_back}", "fail", message=str(exc))
+        # Write error log
+        log_doc = frappe.get_doc({
+            "doctype": "Shopee Sync Log",
+            "sync_type": "reconcile_bank",
+            "status": "fail",
+            "error_message": str(exc),
+            "timestamp": frappe.utils.now()
+        })
+        log_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
     return summary
 
