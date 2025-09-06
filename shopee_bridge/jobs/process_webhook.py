@@ -137,5 +137,89 @@ def retry_due() -> Dict[str, Any]:
 	return {"enqueued": enqueued, "remaining_failed": remaining}
 
 
+def process_inbox(name: str) -> dict:
+	"""Process a single webhook inbox entry.
+	
+	Args:
+		name: Name of the inbox record
+		
+	Returns:
+		Processing result
+	"""
+	try:
+		doc = frappe.get_doc("Shopee Webhook Inbox", name)
+		if doc.status != "queued":
+			return {"status": "skipped", "message": f"Status is {doc.status}"}
+		
+		doc.status = "processing"
+		doc.attempts = (doc.attempts or 0) + 1
+		doc.save(ignore_permissions=True)
+		
+		payload = json.loads(doc.payload_json or "{}")
+		event_type = (payload.get("event_type") or "").lower()
+		
+		if event_type.startswith("order."):
+			webhook_handlers.handle_order_push(payload, doc.source_env)
+		elif event_type.startswith("returns."):
+			webhook_handlers.handle_return_push(payload, doc.source_env)
+		elif event_type.startswith("logistics."):
+			webhook_handlers.handle_logistics_push(payload, doc.source_env)
+		else:
+			doc.status = "skipped"
+			doc.error_message = f"Unknown event type: {event_type}"
+		
+		doc.status = "done"
+		doc.processed_at = frappe.utils.now_datetime()
+		doc.save(ignore_permissions=True)
+		
+		return {"status": "success", "event_type": event_type}
+		
+	except Exception as e:
+		try:
+			doc.status = "failed"
+			doc.error_message = str(e)[:500]
+			doc.save(ignore_permissions=True)
+		except:
+			pass
+		return {"status": "failed", "error": str(e)}
+
+
+def process_pending(limit: int = 50) -> dict:
+	"""Process pending webhook inbox entries.
+	
+	Args:
+		limit: Maximum number of entries to process
+		
+	Returns:
+		Processing summary
+	"""
+	pending = frappe.get_all(
+		"Shopee Webhook Inbox",
+		filters={"status": "queued"},
+		fields=["name"],
+		limit=limit,
+		order_by="creation asc"
+	)
+	
+	processed = 0
+	success = 0
+	failed = 0
+	
+	for row in pending:
+		result = process_inbox(row["name"])
+		processed += 1
+		if result["status"] == "success":
+			success += 1
+		else:
+			failed += 1
+	
+	return {
+		"processed": processed,
+		"success": success,
+		"failed": failed,
+		"remaining": len(pending) - processed
+	}
+
+
 __all__ = ["derive_idempotency_key", "run", "retry_due"]
 

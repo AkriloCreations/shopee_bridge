@@ -35,6 +35,8 @@ scheduler_events = {
         ],
         "0 * * * *": [
             "shopee_bridge.jobs.sync_finance.run",
+            "shopee_bridge.jobs.sync_finance.sync_recent_escrow",
+            "shopee_bridge.jobs.process_webhook.process_pending"
         ],
         "*/5 * * * *": [
             "shopee_bridge.jobs.process_webhook.retry_due",
@@ -89,5 +91,5 @@ override_whitelisted_methods = {
 }
 
 # Optional fixtures placeholder (currently unused in v2.0 - dynamic system doesn't need fixtures)
-# fixtures = []
+fixtures = ["Workspace", "Module Def", "Number Card"]
 

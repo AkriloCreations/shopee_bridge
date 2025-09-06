@@ -1,0 +1,38 @@
+[
+ {
+  "doctype": "Property Setter",
+  "docstatus": 0,
+  "modified": "2025-09-06 12:00:00.000000",
+  "name": "Shopee Sync Log-category-ref-unique",
+  "property": "unique",
+  "property_type": "Check",
+  "value": "1",
+  "doctype_or_field": "DocField",
+  "doc_type": "Shopee Sync Log",
+  "field_name": "category"
+ },
+ {
+  "doctype": "Property Setter",
+  "docstatus": 0,
+  "modified": "2025-09-06 12:00:00.000000",
+  "name": "Shopee Sync Log-ref-unique",
+  "property": "unique",
+  "property_type": "Check",
+  "value": "1",
+  "doctype_or_field": "DocField",
+  "doc_type": "Shopee Sync Log",
+  "field_name": "ref"
+ },
+ {
+  "doctype": "Property Setter",
+  "docstatus": 0,
+  "modified": "2025-09-06 12:00:00.000000",
+  "name": "Shopee Sync Log-unique",
+  "property": "unique",
+  "property_type": "JSON",
+  "value": "[\"category\", \"ref\"]",
+  "doctype_or_field": "DocType",
+  "doc_type": "Shopee Sync Log",
+  "field_name": null
+ }
+]

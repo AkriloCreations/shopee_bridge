@@ -1,0 +1,20 @@
+[
+	{
+		"doctype": "Workspace",
+		"name": "Shopee Bridge",
+		"label": "Shopee Bridge",
+		"title": "Shopee Bridge",
+		"public": 1,
+		"content": "[{\"type\": \"shortcut\", \"label\": \"Shopee Settings\", \"link_type\": \"DocType\", \"link_to\": \"Shopee Settings\"}, {\"type\": \"shortcut\", \"label\": \"Shopee Sync Log\", \"link_type\": \"DocType\", \"link_to\": \"Shopee Sync Log\"}, {\"type\": \"shortcut\", \"label\": \"Shopee Webhook Inbox\", \"link_type\": \"DocType\", \"link_to\": \"Shopee Webhook Inbox\"}]",
+		"for_user": "",
+		"parent_page": "",
+		"icon": "octicon octicon-globe",
+		"module": "Shopee Bridge",
+		"route": "shopee-bridge",
+		"restrict_to_domain": "",
+		"roles": [
+			{"role": "All"},
+			{"role": "System Manager"}
+		]
+	}
+]

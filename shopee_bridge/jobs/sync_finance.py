@@ -21,3 +21,32 @@ def run(hours: int = 1) -> Dict[str, Any]:
         ShopeeSyncLog.write_log("sync_finance", f"hours:{hours}", "fail", message=str(exc))
     return summary
 
+
+def sync_recent_escrow(hours: int = 24) -> dict:
+    """Sync escrow for orders from the last N hours.
+
+    Args:
+        hours: Number of hours to look back
+
+    Returns:
+        Dict with orders_scanned and escrow_logged counts
+    """
+    from ..services import orders, finance
+    from .. import helpers
+
+    since_epoch = helpers.now_epoch() - hours * 3600
+    order_sns = orders.get_order_list(since_epoch, helpers.now_epoch())
+    orders_scanned = len(order_sns)
+    escrow_logged = 0
+
+    for sn in order_sns:
+        try:
+            escrow = finance.get_escrow_detail("", "", 0, sn)
+            if escrow and not escrow.get("error"):
+                finance.log_escrow("", sn, escrow)
+                escrow_logged += 1
+        except Exception as e:
+            frappe.log_error(f"Escrow sync failed for {sn}: {e}", "Shopee Escrow Sync")
+
+    return {"orders_scanned": orders_scanned, "escrow_logged": escrow_logged}
+

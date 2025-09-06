@@ -8,68 +8,43 @@
   "autoname": "hash",
   "fields": [
     {
-      "fieldname": "event_type",
+      "fieldname": "topic",
       "fieldtype": "Data",
-      "label": "Event Type",
-      "reqd": 1
+      "label": "Topic",
+      "reqd": 1,
+      "idx": 1
     },
     {
-      "fieldname": "source_env",
-      "fieldtype": "Select",
-      "label": "Source Env",
-      "options": "live\ntest",
-      "reqd": 1
+      "fieldname": "body_json",
+      "fieldtype": "Long Text",
+      "label": "Body JSON"
     },
     {
       "fieldname": "idempotency_key",
       "fieldtype": "Data",
       "label": "Idempotency Key",
       "reqd": 1,
-      "unique": 1
-    },
-    {
-      "fieldname": "signature_valid",
-      "fieldtype": "Check",
-      "label": "Signature Valid"
+      "idx": 1
     },
     {
       "fieldname": "status",
       "fieldtype": "Select",
       "label": "Status",
-      "options": "queued\nprocessing\ndone\nfailed\nskipped",
+      "options": "NEW\nDONE\nERROR",
       "reqd": 1,
-      "default": "queued"
+      "idx": 1
     },
     {
-      "fieldname": "payload_hash",
-      "fieldtype": "Data",
-      "label": "Payload Hash"
-    },
-    {
-      "fieldname": "payload_json",
-      "fieldtype": "Long Text",
-      "label": "Payload JSON"
+      "fieldname": "received_epoch",
+      "fieldtype": "Int",
+      "label": "Received Epoch",
+      "reqd": 1,
+      "idx": 1
     },
     {
       "fieldname": "error_message",
       "fieldtype": "Small Text",
       "label": "Error Message"
-    },
-    {
-      "fieldname": "processed_at",
-      "fieldtype": "Datetime",
-      "label": "Processed At"
-    },
-    {
-      "fieldname": "next_retry_at",
-      "fieldtype": "Datetime",
-      "label": "Next Retry At"
-    },
-    {
-      "fieldname": "attempts",
-      "fieldtype": "Int",
-      "label": "Attempts",
-      "default": "0"
     }
   ],
   "permissions": [
