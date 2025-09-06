@@ -3,14 +3,28 @@ frappe.ui.form.on("Shopee Settings", {
         // === TOKEN EXPIRY INFO ===
         if (frm.doc.token_expires_at) {
             try {
+                // Parse as epoch timestamp (Shopee v2 standard)
                 const expiryEpoch = parseInt(frm.doc.token_expires_at);
                 if (!isNaN(expiryEpoch)) {
-                    // Convert to WIB
+                    // Convert to WIB timezone
                     const dt = new Date(expiryEpoch * 1000);
                     const wibStr = dt.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
                     const nowEpoch = Math.floor(Date.now() / 1000);
-                    let status = expiryEpoch < nowEpoch ? '❌ Expired' : '✅ Valid';
-                    frm.dashboard.set_headline(`<span style="font-size:1.1em">Access Token <b>${status}</b> sampai <b>${wibStr} WIB</b></span>`);
+                    const timeRemaining = expiryEpoch - nowEpoch;
+                    
+                    let status, indicator;
+                    if (timeRemaining <= 0) {
+                        status = '❌ Expired';
+                        indicator = 'red';
+                    } else if (timeRemaining < 600) { // 10 minutes
+                        status = '⚠️ Expiring Soon';
+                        indicator = 'orange';
+                    } else {
+                        status = '✅ Valid';
+                        indicator = 'green';
+                    }
+                    
+                    frm.dashboard.set_headline(`<span style="font-size:1.1em;color:${indicator}">Access Token <b>${status}</b> sampai <b>${wibStr} WIB</b></span>`);
                 }
             } catch (e) {
                 frm.dashboard.set_headline(`<span style="color:red">Gagal membaca expiry token: ${e}</span>`);
@@ -66,7 +80,12 @@ frappe.ui.form.on("Shopee Settings", {
                         if (shop.token_expires_at) {
                             const dt = new Date(shop.token_expires_at * 1000);
                             const wibStr = dt.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-                            msg += `<b>Token Expiry:</b> ${wibStr} WIB<br>`;
+                            const nowEpoch = Math.floor(Date.now() / 1000);
+                            const timeRemaining = shop.token_expires_at - nowEpoch;
+                            const hoursRemaining = Math.floor(timeRemaining / 3600);
+                            const minutesRemaining = Math.floor((timeRemaining % 3600) / 60);
+                            
+                            msg += `<b>Token Expiry:</b> ${wibStr} WIB (${hoursRemaining}h ${minutesRemaining}m remaining)<br>`;
                         }
                         if (shop.scopes) {
                             msg += `<b>Scopes:</b> ${Array.isArray(shop.scopes) ? shop.scopes.join(', ') : shop.scopes}<br>`;
@@ -101,19 +120,15 @@ frappe.ui.form.on("Shopee Settings", {
             }, __("Connection"));
 
             frm.add_custom_button(__("Refresh Token"), async () => {
-                if (!frm.doc.refresh_token) {
-                    frappe.msgprint(__("No refresh token available. Please reconnect to Shopee first."));
-                    return;
-                }
-                
-                frappe.show_alert(__("Refreshing access token..."), 3);
+                frappe.show_alert(__("Checking token status and refreshing if needed..."), 3);
                 try {
-                    const r = await frappe.call({ method: "shopee_bridge.api.refresh_token" });
-                    if (r.message?.ok && r.message.token_refreshed) {
-                        frappe.show_alert(__("Token refreshed successfully!"), 5);
+                    // Use new centralized refresh function
+                    const r = await frappe.call({ method: "shopee_bridge.auth.refresh_access_token_if_needed" });
+                    if (r.message) {
+                        frappe.show_alert(__("Token was refreshed successfully!"), 5);
                         frm.reload_doc();
                     } else {
-                        frappe.msgprint(__("Token refresh failed: {0}", [r.message?.error]));
+                        frappe.show_alert(__("Token is still valid, no refresh needed."), 3);
                     }
                 } catch (e) {
                     frappe.msgprint(__("Token refresh error: {0}", [String(e)]));

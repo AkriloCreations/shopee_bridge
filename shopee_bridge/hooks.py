@@ -42,7 +42,7 @@ scheduler_events = {
             "shopee_bridge.jobs.process_webhook.retry_due",
         ],
         "*/30 * * * *": [
-            "shopee_bridge.auth.refresh_if_needed",
+            "shopee_bridge.auth.refresh_access_token_if_needed",
         ],
         "15 1 * * *": [
             "shopee_bridge.jobs.reconcile_bank.run",
@@ -91,5 +91,5 @@ override_whitelisted_methods = {
 }
 
 # Optional fixtures placeholder (currently unused in v2.0 - dynamic system doesn't need fixtures)
-fixtures = ["Workspace", "Module Def", "Number Card"]
+fixtures = ["Module Def", "Workspace", "Number Card"]
 

@@ -21,7 +21,7 @@
       "fieldname": "status",
       "fieldtype": "Select",
       "label": "Status",
-      "options": "PENDING\nDONE\nFAILED",
+      "options": "NEW\nDONE\nERROR",
       "reqd": 1
     },
     {

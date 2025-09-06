@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import frappe
-from shopee_bridge.auth import get_token_status, refresh_access_token
+from shopee_bridge.auth import get_token_status, refresh_access_token_if_needed
 
 # Initialize Frappe (required when running standalone scripts)
 frappe.init(site="erp.managerio.ddns.net")
@@ -16,7 +16,7 @@ try:
     # If token needs refresh, refresh it
     if status.get("needs_refresh", False):
         print("\nToken needs refresh, refreshing...")
-        refresh_result = refresh_access_token()
+        refresh_result = refresh_access_token_if_needed()
         print(f"Refresh result: {refresh_result}")
         
         # Check status after refresh

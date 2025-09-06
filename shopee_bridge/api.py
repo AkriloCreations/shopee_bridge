@@ -437,8 +437,8 @@ def refresh_token() -> Dict[str, Any]:
 	"""Manually refresh OAuth token."""
 	try:
 		from . import auth
-		result = auth.refresh_access_token()
-		return _result({"token_refreshed": result})
+		refreshed = auth.refresh_access_token_if_needed()
+		return _result({"token_refreshed": refreshed})
 	except Exception as e:
 		return _error(e)
 

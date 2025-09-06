@@ -185,29 +185,35 @@ def http_post(path: str, json: Dict[str, Any] | None = None, files: Dict[str, An
 
 
 def rotate_on_401(send_callable: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
-	"""Execute a send callable; on 401 attempt one refresh cycle then retry."""
+	"""Execute a send callable; on 401/403 attempt one refresh cycle then retry.
+	
+	Official Shopee v2 OAuth docs: https://open.shopee.com/documents?module=2&type=1&id=53
+	- 401/403 indicate expired/invalid tokens
+	- Auto-refresh prevents manual intervention
+	- Single retry prevents infinite loops
+	"""
 	first = send_callable()
-	if first.get("_status") != 401:
+	if first.get("_status") not in (401, 403):
 		return first
-	_log_short("[Shopee] 401 encountered; attempting token refresh heuristic")
+		
+	_log_short("[Shopee] 401/403 encountered; attempting token refresh")
+	
 	try:
-		# Only refresh if needed, and persist new tokens if refreshed
-		if auth.refresh_if_needed():
-			result = auth.refresh_access_token()
-			if not result.get("success"):
-				import frappe
-				frappe.logger().warning(f"[Shopee] Token refresh failed: {result.get('error')}")
-			else:
-				import frappe
-				frappe.logger().info("[Shopee] Token refresh successful via rotate_on_401")
+		# Use new centralized refresh function
+		if auth.refresh_access_token_if_needed():
+			_log_short("[Shopee] Token refresh successful via rotate_on_401")
+		else:
+			_log_short("[Shopee] Token refresh not needed")
+			
+		# Clear cache and retry once
 		import frappe
 		frappe.cache().delete_value("Shopee Settings")
+		second = send_callable()
+		return second
+		
 	except Exception as exc:
-		import frappe
-		frappe.log_error(f"Shopee refresh error: {exc}")
+		_log_short(f"[Shopee] Token refresh failed: {exc}")
 		return first
-	second = send_callable()
-	return second
 
 
 def paginate_get(path: str, params: Dict[str, Any], page_size: int = 100, max_pages: int = 50) -> Iterator[Dict[str, Any]]:

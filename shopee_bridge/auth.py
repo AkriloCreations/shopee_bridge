@@ -7,14 +7,6 @@ def _utc_naive(expires_in_seconds: int):
     """Return expiry as integer epoch UTC (seconds since 1970-01-01 UTC)."""
     return int((datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).timestamp())
 
-from typing import List, Dict, Any, Union, Optional
-import time
-import json
-import hmac
-import hashlib
-import secrets
-import urllib.parse
-
 """Shopee Bridge authentication utilities.
 
 This module ONLY prepares data structures (URLs, signed parameters, payloads) and manipulates
@@ -25,7 +17,7 @@ Implemented capabilities:
 - OAuth v2 helper flows (build authorize URL, exchange code, refresh flow heuristic)
 - HMAC-SHA256 request signing per Shopee v2 rule:
         signature_base = partner_id + path + timestamp + access_token + shop_id
-        signature = hex(HMAC_SHA256(signature_base, partner_key))
+        signature = hex(HMAC-SHA256(signature_base, partner_key))
 - Webhook signature verification (raw body HMAC with push key) + timestamp drift enforcement
 - Pro‑active token refresh scheduling helper (`schedule_token_renewal_cron`)
 
@@ -43,6 +35,26 @@ TODOs (left for business logic implementers):
 3. Add CSRF/state correlation storage (e.g. redis / cache) with expiry if multi-user auth flows used.
 4. Extend scheduling (e.g. handle multi‑shop tokens if expanding beyond single shop).
 """
+
+# DOC-GUARD: Shopee OAuth Refresh v2 Implementation
+# ================================================
+# Refresh endpoint: /api/v2/auth/access_token/get (METHOD: POST)
+# Common query params: partner_id, timestamp, sign (+ optionally shop_id or merchant_id in query if required by docs)
+# BODY: { "refresh_token": "...", "shop_id": <int> }  (or merchant_id for merchant flow)
+# Signature base string for this endpoint: partner_id + path + timestamp + shop_id|merchant_id
+# Note that 404 error_not_found usually means wrong path or missing/incorrect shop_id/merchant_id in request.
+# ================================================
+
+from typing import List, Dict, Any, Union, Optional
+import time
+import json
+import hmac
+import hashlib
+import secrets
+import urllib.parse
+
+# import frappe  # Moved inside functions to avoid import errors in tests
+from shopee_bridge import auth
 
 
 PROD_BASE_URL = "https://partner.shopeemobile.com"
@@ -125,6 +137,21 @@ def _validate_state(state: str):
     # One‑time use: remove
     import frappe
     frappe.cache().delete_value(STATE_CACHE_PREFIX + state)
+
+
+# ---------------------------------------------------------------------------
+# New helpers for refresh implementation
+# ---------------------------------------------------------------------------
+def now_epoch() -> int:
+    """Return current epoch timestamp (seconds since 1970-01-01 UTC)."""
+    return int(time.time())
+
+
+def _frappe():
+    """Lazy import frappe to avoid top-level imports."""
+    import frappe
+    return frappe
+
 
 def get_shop_info() -> Dict[str, Any]:
     """Get shop info from Shopee API.
@@ -653,118 +680,101 @@ def refresh_access_token() -> Dict[str, Any]:
         frappe.log_error(f"Token refresh failed: {str(e)}", "Shopee Token Refresh")
         return {"success": False, "error": str(e)}
 
-def get_token_status() -> Dict[str, Any]:
-    """Get current token status information for debugging.
+def refresh_access_token_if_needed(buffer_seconds: int = 600) -> bool:
+    """Refresh access token if expired or expiring soon.
+    
+    Official Shopee v2 OAuth docs: https://open.shopee.com/documents?module=2&type=1&id=53
+    - Access tokens expire in 4 hours (14400 seconds)
+    - Refresh tokens are valid for 30 days
+    - Always refresh proactively before expiry to avoid 401 errors
+    - Buffer prevents race conditions and network delays
+    
+    Args:
+        buffer_seconds: Refresh if token expires within this many seconds (default 10min)
+        
+    Returns:
+        True if refresh was performed, False if not needed
+        
+    Raises:
+        AuthRequired: If no refresh token available
+        Exception: If refresh fails
+    """
+    settings = _settings()
+    
+    if not settings.refresh_token:
+        raise AuthRequired("No refresh token available")
+        
+    if not settings.token_expires_at:
+        # No expiry info, assume expired and refresh
+        return _perform_refresh()
+        
+    # Calculate if refresh needed
+    expiry_epoch = _parse_expiry_to_epoch(settings.token_expires_at)
+    now_epoch = now_epoch()
+    
+    if expiry_epoch - now_epoch <= buffer_seconds:
+        return _perform_refresh()
+        
+    return False
+
+
+def get_valid_access_token() -> str:
+    """Get a valid access token, refreshing if necessary.
+    
+    Official Shopee v2 OAuth docs: https://open.shopee.com/documents?module=2&type=1&id=53
+    - Always check token validity before API calls
+    - Auto-refresh prevents 401 errors in production
+    - Thread-safe with database locking
     
     Returns:
-        Dict with token expiry details and time remaining.
+        Valid access token string
+        
+    Raises:
+        AuthRequired: If no tokens available or refresh fails
     """
-    from datetime import datetime, timezone
-    import pytz
-    
     settings = _settings()
-    access_token = getattr(settings, "access_token", None)
-    refresh_token = getattr(settings, "refresh_token", None)
-    raw_expires_at = getattr(settings, "token_expires_at", None)
     
-    result = {
-        "has_access_token": bool(access_token),
-        "has_refresh_token": bool(refresh_token),
-        "raw_expires_at": str(raw_expires_at),
-        "raw_expires_at_type": str(type(raw_expires_at))
-    }
-    
-    # Calculate time remaining if possible
-    if raw_expires_at:
-        try:
-            if isinstance(raw_expires_at, str):
-                expiry_dt = frappe.utils.get_datetime(raw_expires_at)
-                result["parsed_from_string"] = True
-            elif isinstance(raw_expires_at, datetime):
-                expiry_dt = raw_expires_at
-                result["parsed_from_string"] = False
-            else:
-                result["error"] = f"Unexpected token_expires_at type: {type(raw_expires_at)}"
-                return result
-                
-            # Timezone information
-            result["has_timezone"] = expiry_dt.tzinfo is not None
-            result["original_timezone"] = str(expiry_dt.tzinfo)
-            
-            # If naive, assume UTC and make it aware
-            if expiry_dt.tzinfo is None:
-                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-                result["assumed_utc_added_tzinfo"] = True
-            
-            # Format in multiple timezones for verification
-            utc_time = expiry_dt.astimezone(timezone.utc)
-            try:
-                jakarta_tz = pytz.timezone("Asia/Jakarta")
-                jakarta_time = expiry_dt.astimezone(jakarta_tz)
-                result["jakarta_format"] = jakarta_time.strftime("%d-%m-%Y %H:%M:%S")
-                result["jakarta_format_with_tz"] = jakarta_time.strftime("%d-%m-%Y %H:%M:%S %Z%z")
-            except Exception as tz_error:
-                result["jakarta_tz_error"] = str(tz_error)
-                
-            # Get expiry timestamp and current time
-            expiry_timestamp = int(expiry_dt.timestamp())
-            now_timestamp = int(time.time())
-            # Ensure time_remaining is always an integer
-            time_remaining = int(expiry_timestamp - now_timestamp)
-            
-            result.update({
-                "normalized_expires_at": str(expiry_dt),
-                "utc_format": utc_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                "iso_format": expiry_dt.isoformat(),
-                "expiry_timestamp": expiry_timestamp,
-                "current_timestamp": now_timestamp,
-                "seconds_remaining": time_remaining,
-                "minutes_remaining": round(time_remaining / 60, 1),
-                "hours_remaining": round(time_remaining / 3600, 2),
-                "is_expired": time_remaining <= 0,
-                "needs_refresh": time_remaining < 600
-            })
-            
-        except Exception as e:
-            result["error"] = f"Failed to calculate expiry: {str(e)}"
-    
-    return result
+    if not settings.access_token:
+        raise AuthRequired("No access token available")
+        
+    # Check if refresh needed
+    if refresh_access_token_if_needed():
+        # Token was refreshed, reload settings
+        _frappe().cache().delete_value("Shopee Settings")
+        settings.reload()
+        
+    if not settings.access_token:
+        raise AuthRequired("Failed to obtain valid access token")
+        
+    return settings.access_token
 
 
-def cron_refresh_job():  # pragma: no cover - scheduled job wrapper
-    """Background job wrapper invoked by the scheduler (no arguments)."""
+def _perform_refresh() -> bool:
+    """Internal function to perform token refresh with locking."""
+    # Use Frappe's locking to prevent concurrent refreshes
+    lock_key = "shopee_token_refresh"
+    
     try:
-        if refresh_if_needed():
+        # Acquire lock (non-blocking)
+        if not _frappe().cache().get(lock_key):
+            _frappe().cache().set(lock_key, True, expires_in_sec=30)
+            
             result = refresh_access_token()
-            if result.get("success"):
-                frappe.logger().info("[Shopee] Token refresh successful via cron")
+            success = result.get("success", False)
+            
+            if success:
+                _frappe().logger().info("[Shopee] Proactive token refresh successful")
             else:
-                frappe.logger().warning(f"[Shopee] Token refresh failed: {result.get('error')}")
-    except Exception as exc:  # swallow to avoid job crash
-        frappe.logger().warning(f"[Shopee] cron refresh error: {exc}")
-
-
-def schedule_token_renewal_cron() -> Dict[str, Any]:
-    """Create or ensure a Scheduled Job Type for proactive token renewal.
-
-    Strategy: Hourly job invokes `cron_refresh_job` which itself decides whether refresh is needed.
-    Returns a dict describing the upsert action.
-    """
-    job_method = "shopee_bridge.auth.cron_refresh_job"
-    existing = frappe.db.exists("Scheduled Job Type", {"method": job_method})
-    if existing:
-        return {"status": "exists", "name": existing}
-    try:
-        doc = frappe.get_doc({
-            "doctype": "Scheduled Job Type",
-            "method": job_method,
-            "frequency": "Hourly",
-            "stopped": 0,
-        }).insert(ignore_permissions=True)
-        return {"status": "created", "name": doc.name}
-    except Exception as exc:  # pragma: no cover
-        frappe.log_error(message=str(exc), title="Shopee schedule_token_renewal_cron failure")
-        return {"status": "error", "error": str(exc)}
+                _frappe().logger().warning(f"[Shopee] Proactive token refresh failed: {result.get('error')}")
+                
+            return success
+        else:
+            # Another process is refreshing, wait briefly and check
+            time.sleep(2)
+            return False
+            
+    finally:
+        _frappe().cache().delete_value(lock_key)
 
 def hmac_sha256(data: Union[str, bytes], key: str, raw: bool = False) -> str:
     """Return hex digest HMAC-SHA256.
@@ -787,6 +797,27 @@ def constant_time_compare(val1: str, val2: str) -> bool:
         result |= ord(a) ^ ord(b)
     return result == 0
 
+def _parse_expiry_to_epoch(expires_at) -> int:
+    """Parse token expiry to epoch timestamp.
+    
+    Args:
+        expires_at: Expiry datetime (string, datetime, or epoch)
+        
+    Returns:
+        Epoch timestamp as int
+    """
+    if isinstance(expires_at, str):
+        try:
+            dt = _frappe().utils.get_datetime(expires_at)
+            return int(dt.timestamp())
+        except:
+            # Fallback to direct parsing
+            return int(expires_at)
+    elif isinstance(expires_at, datetime):
+        return int(expires_at.timestamp())
+    else:
+        return int(expires_at)
+
 
 # Exported names (explicit for linting / clarity)
 __all__ = [
@@ -797,6 +828,8 @@ __all__ = [
     "refresh_if_needed",
     "refresh_token_via_api",
     "refresh_access_token",
+    "refresh_access_token_if_needed",
+    "get_valid_access_token",
     "sign_request",
     "verify_webhook_signature",
     "schedule_token_renewal_cron",
