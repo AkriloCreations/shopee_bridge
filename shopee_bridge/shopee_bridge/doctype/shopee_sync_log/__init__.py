@@ -1,8 +1,3 @@
-from frappe.model.document import Document
+from .shopee_sync_log import ShopeeSyncLog
 
-class ShopeeSyncLog(Document):
-    """
-    Controller for Shopee Sync Log doctype.
-    Provides helpers for logging sync operations.
-    """
-    pass
+__all__ = ["ShopeeSyncLog"]

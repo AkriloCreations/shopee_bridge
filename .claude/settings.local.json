@@ -7,7 +7,10 @@
       "Bash(docker-compose:*)",
       "Bash(docker exec:*)",
       "Bash(bench list-apps:*)",
-      "Bash(bench --site all migrate)"
+      "Bash(bench --site all migrate)",
+      "Bash(cat:*)",
+      "Bash(python:*)",
+      "Bash(ruff check:*)"
     ],
     "deny": [],
     "ask": []

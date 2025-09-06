@@ -1,1 +1,3 @@
-__version__ = "0.0.1"
+from .shopee_settings import ShopeeSettings
+
+__all__ = ["ShopeeSettings"]

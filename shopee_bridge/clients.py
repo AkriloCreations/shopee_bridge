@@ -394,10 +394,31 @@ def request_json(*, method: str, host: str, path: str, query: dict|None=None, bo
     hdrs = {"Content-Type": "application/json"}
 
     def _do():
+        # Build full URL with host prefix if provided
+        full_url = url
+        if host and not url.startswith("http"):
+            full_url = f"{host.rstrip('/')}{url}"
+            
         if method.upper() == "GET":
-            return _do_request("GET", host, url, None, hdrs, timeout or DEFAULT_TIMEOUT)
+            status, text, headers = _do_request("GET", full_url, hdrs, None, None, None)
         else:
-            return _do_request("POST", host, url, json.dumps(b).encode("utf-8"), hdrs, timeout or DEFAULT_TIMEOUT)
+            status, text, headers = _do_request("POST", full_url, hdrs, None, b, None)
+            
+        # Parse response and handle errors
+        if status >= 400:
+            error_msg = f"HTTP {status}: {text}"
+            if status in (401, 403):
+                raise ShopeeAuthError(error_msg, status, {"response": text})
+            elif status == 429:
+                raise ShopeeRateLimitError(error_msg, status, {"response": text})
+            else:
+                raise ShopeeAPIError(error_msg, status, {"response": text})
+                
+        try:
+            data = _json.loads(text) if text else {}
+            return data
+        except _json.JSONDecodeError:
+            return {"response": text, "_status": status}
 
     # first attempt
     try:

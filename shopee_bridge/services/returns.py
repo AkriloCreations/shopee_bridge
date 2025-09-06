@@ -178,25 +178,34 @@ def upsert_customer_issue_from_return(payload: Dict[str, Any]) -> str:
     if return_sn == "UNKNOWN":
         raise ValueError("Missing return_sn in payload")
     try:
-        issue = frappe.get_doc({
-            "doctype": "Customer Issue",
-            "return_sn": return_sn
-        })
-        # If exists, update payload JSON and timestamp if newer
-        issue.shopee_payload_json = frappe.as_json(payload)
-        issue.save(ignore_permissions=True)
-        _log("customer_issue_updated", {"return_sn": return_sn, "issue": issue.name})
-        return issue.name
-    except frappe.DoesNotExistError:
-        # Create new
-        issue = frappe.get_doc({
+        # Try to find existing by return_sn custom field
+        existing_name = frappe.db.get_value("Customer Issue", {"return_sn": return_sn}, "name")
+        if existing_name:
+            issue = frappe.get_doc("Customer Issue", existing_name)
+            # Update payload JSON and timestamp if newer
+            issue.shopee_payload_json = frappe.as_json(payload)
+            issue.save(ignore_permissions=True)
+            _log("customer_issue_updated", {"return_sn": return_sn, "issue": issue.name})
+            return issue.name
+        
+        # Create new with required standard fields
+        issue_data = {
             "doctype": "Customer Issue",
             "return_sn": return_sn,
-            "shopee_payload_json": frappe.as_json(payload)
-        })
+            "shopee_payload_json": frappe.as_json(payload),
+            "subject": f"Shopee Return {return_sn}",
+            "description": f"Shopee return request for order {return_sn}"
+        }
+        
+        # Add customer if available in payload
+        if payload.get("customer"):
+            issue_data["customer"] = payload["customer"]
+        
+        issue = frappe.get_doc(issue_data)
         issue.insert(ignore_permissions=True)
         _log("customer_issue_created", {"return_sn": return_sn, "issue": issue.name})
         return issue.name
+        
     except Exception as e:
         frappe.log_error(str(e), "Shopee Customer Issue Upsert Error")
         raise

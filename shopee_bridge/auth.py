@@ -699,7 +699,8 @@ def refresh_access_token_if_needed(force: bool = False) -> dict:
         if getattr(ss, "expires_at_epoch", 0) and ss.expires_at_epoch - now > overlap:
             return {"skipped": True, "expires_at_epoch": int(ss.expires_at_epoch)}
 
-    host = ss.host
+    # Use the same base URL logic as other auth functions
+    base_url = _base_url(ss.environment)
     path = "/api/v2/auth/access_token/get"
     shop_id = int(ss.shop_id) if getattr(ss, "shop_id", None) else None
     merchant_id = int(ss.merchant_id) if getattr(ss, "merchant_id", None) else None
@@ -709,7 +710,7 @@ def refresh_access_token_if_needed(force: bool = False) -> dict:
     # SIGN dan request via clients.request_json (jaga agar access_token tidak dipakai di base string refresh)
     resp = clients.request_json(
         method="POST",
-        host=host,
+        host=base_url,
         path=path,
         query={},                 # signer akan inject partner_id/timestamp/sign
         body={"refresh_token": ss.refresh_token, **({"shop_id": shop_id} if shop_id else {}), **({"merchant_id": merchant_id} if merchant_id else {})},
