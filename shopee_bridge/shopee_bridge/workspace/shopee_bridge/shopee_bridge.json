@@ -1,0 +1,21 @@
+{
+  "doctype": "Workspace",
+  "name": "Shopee Bridge",
+  "label": "Shopee Bridge",
+  "title": "Shopee Bridge",
+  "module": "Shopee Bridge",
+  "public": 1,
+  "is_hidden": 0,
+  "icon": "octicon octicon-globe",
+  "content": [
+    {"type":"header","data":{"text":"<span class=\"h4\"><b>Shopee Bridge</b></span>","col":12}},
+    {"type":"shortcut","data":{"label":"Shopee Settings","link_to":"Shopee Settings","type":"DocType","doc_view":"","col":4}},
+    {"type":"shortcut","data":{"label":"Shopee Webhook Inbox","link_to":"Shopee Webhook Inbox","type":"DocType","doc_view":"List","col":4}},
+    {"type":"shortcut","data":{"label":"Shopee Sync Log","link_to":"Shopee Sync Log","type":"DocType","doc_view":"List","col":4}}
+  ],
+  "shortcuts": [
+    {"label":"Shopee Settings","type":"DocType","link_to":"Shopee Settings","doc_view":"List"},
+    {"label":"Shopee Webhook Inbox","type":"DocType","link_to":"Shopee Webhook Inbox","doc_view":"List"},
+    {"label":"Shopee Sync Log","type":"DocType","link_to":"Shopee Sync Log","doc_view":"List"}
+  ]
+}

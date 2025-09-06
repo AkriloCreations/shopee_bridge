@@ -1,0 +1,34 @@
+[
+  {
+    "doctype": "Number Card",
+    "name": "Shopee Sync Errors",
+    "module": "Shopee Bridge",
+    "label": "Shopee Sync Errors",
+    "type": "Document Type",
+    "document_type": "Shopee Sync Log",
+    "function": "Count",
+    "aggregate_function_based_on": "Count",
+    "is_standard": 1,
+    "is_public": 1,
+    "color": "#ff5858",
+    "stats_time_interval": "Daily",
+    "show_percentage_stats": 1,
+    "filters_json": "[[\"Shopee Sync Log\",\"status\",\"=\",\"ERROR\"]]"
+  },
+  {
+    "doctype": "Number Card",
+    "name": "Shopee Webhooks Pending",
+    "module": "Shopee Bridge",
+    "label": "Shopee Webhooks Pending",
+    "type": "Document Type",
+    "document_type": "Shopee Webhook Inbox",
+    "function": "Count",
+    "aggregate_function_based_on": "Count",
+    "is_standard": 1,
+    "is_public": 1,
+    "color": "#ffa00a",
+    "stats_time_interval": "Daily",
+    "show_percentage_stats": 0,
+    "filters_json": "[[\"Shopee Webhook Inbox\",\"status\",\"=\",\"NEW\"]]"
+  }
+]
