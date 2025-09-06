@@ -90,6 +90,38 @@ def test_smoke_imports():
 	except ImportError as e:
 		pytest.fail(f"Import failed: {e}")
 
+@patch('shopee_bridge.clients.request_json')
+def test_get_order_list(mock_request_json):
+	"""Test get_order_list uses GET and adds required time params."""
+	from shopee_bridge.services.orders import get_order_list
+	
+	# Mock response with no more pages
+	mock_request_json.return_value = {
+		"response": {
+			"order_list": [{"order_sn": "ORDER001"}],
+			"more": False
+		}
+	}
+	
+	result = get_order_list(1640995200, 1641081600, status="paid", page_size=50)
+	
+	# Assert request_json was called with GET
+	mock_request_json.assert_called_with(
+		method="GET",
+		host="",
+		path="/api/v2/order/get_order_list",
+		query={
+			"time_range_field": "create_time",
+			"time_from": 1640995200,
+			"time_to": 1641081600,
+			"page_size": 50,
+			"order_status": "paid"
+		},
+		body=None
+	)
+	
+	assert result == ["ORDER001"]
+
 if __name__ == "__main__":
 	# Run basic smoke tests
 	print("Running smoke tests...")

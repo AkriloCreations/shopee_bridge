@@ -19,3 +19,20 @@ class TestFinance(unittest.TestCase):
 		)
 		self.assertIsInstance(result, dict)
 		self.assertEqual(result["order_sn"], "123")
+
+	def test_no_direct_http_calls_in_services(self):
+		"""Ensure no direct http_get, http_post, or requests calls in services/ (exclude tests)."""
+		import os
+		import re
+		services_dir = "/home/frappe/frappe-bench/apps/shopee_bridge/shopee_bridge/services"
+		violations = []
+		for root, dirs, files in os.walk(services_dir):
+			for file in files:
+				if file.endswith('.py'):
+					filepath = os.path.join(root, file)
+					with open(filepath, 'r') as f:
+						content = f.read()
+					# Check for direct calls
+					if re.search(r'\bhttp_(get|post)\s*\(', content) or re.search(r'\brequests\s*\.', content):
+						violations.append(filepath)
+		self.assertEqual(violations, [], f"Direct HTTP calls found in: {violations}")

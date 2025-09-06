@@ -40,6 +40,7 @@ from typing import Any, Dict, List
 import time
 
 from shopee_bridge import clients
+from shopee_bridge import helpers
 
 ESCROW_DETAIL_PATH = "/api/v2/payment/get_escrow_detail"
 
@@ -52,10 +53,9 @@ def _log(event: str, data: Dict[str, Any]):  # light logging
 		pass
 
 
-# Shopee endpoint: /api/v2/payment/get_escrow_detail
-# Method: GET
-# Query params: order_sn, shop_id (+ partner_id, timestamp, sign, access_token)
-# Body params: none
+# Path=/api/v2/payment/get_escrow_detail, Method=GET,
+# Query: order_sn, shop_id (+ partner_id, timestamp, sign, access_token auto by client),
+# Body: none.
 def get_escrow_detail(host: str, access_token: str, shop_id: int, order_sn: str) -> dict:
 	"""Fetch escrow detail for a single order."""
 	return clients.request_json(
@@ -238,7 +238,8 @@ def log_escrow(site: str, order_sn: str, payload: dict) -> str:
 		"doctype": "shopee_sync_log",
 		"category": "escrow",
 		"ref": order_sn,
-		"payload": frappe.as_json(payload)
+		"payload_json": frappe.as_json(payload),
+		"created_epoch": helpers.now_epoch()
 	})
 	doc.insert(ignore_permissions=True)
 	return doc.name

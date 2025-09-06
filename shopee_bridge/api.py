@@ -506,21 +506,31 @@ def debug_webhook_payload(inbox_name: str) -> Dict[str, Any]:
 
 
 @frappe.whitelist()
-def sync_recent_orders(minutes: int = 30) -> Dict[str, Any]:
-	"""Quick sync for recent orders.
-	
-	Args:
-		minutes: Minutes to look back
-		
-	Returns:
-		Sync results
-	"""
-	try:
-		from .services import orders
-		result = orders.sync_incremental_orders(updated_since_minutes=minutes)
-		return _result({"sync": result})
-	except Exception as e:
-		return _error(e)
+def sync_recent_orders(hours: int = 24, days: int | None = None) -> dict:
+	"""Sync recent orders."""
+	from shopee_bridge import helpers
+	from shopee_bridge.services import orders
+	if days is not None:
+		hours = days * 24
+	since_epoch = helpers.now_epoch() - hours * 3600
+	settings = _get_settings()
+	host = ""  # not used
+	access_token = getattr(settings, "access_token", "")
+	shop_id = getattr(settings, "shop_id", 0)
+	order_sns = orders.get_order_list(since_epoch, helpers.now_epoch())
+	orders_total = len(order_sns)
+	escrow_logged = 0
+	for sn in order_sns:
+		try:
+			# Fetch detail
+			detail = orders.get_order_details(sn)
+			# Fetch and log escrow
+			escrow = orders.fetch_and_log_escrow("", host, access_token, shop_id, sn)
+			if not escrow.get("error"):
+				escrow_logged += 1
+		except Exception:
+			pass  # ignore errors for count
+	return {"orders_total": orders_total, "escrow_logged": escrow_logged}
 
 
 @frappe.whitelist()
@@ -604,28 +614,6 @@ def audit_shopee_orders_for_month(year: int, month: int) -> dict:
 	min_created = min(created_times) if created_times else None
 	max_created = max(created_times) if created_times else None
 	return {"count": len(order_sns), "first_order_sn": first_order_sn, "last_order_sn": last_order_sn, "min_created": min_created, "max_created": max_created}
-
-
-@frappe.whitelist()
-def sync_recent_orders(hours: int = 24) -> dict:
-	"""Sync recent orders."""
-	from shopee_bridge import helpers
-	from shopee_bridge.services import orders
-	since_epoch = helpers.now_epoch() - hours * 3600
-	order_sns = orders.get_order_list(since_epoch, helpers.now_epoch())
-	orders_total = len(order_sns)
-	escrow_logged = 0
-	for sn in order_sns:
-		try:
-			# Fetch detail
-			detail = orders.get_order_details(sn)
-			# Fetch and log escrow
-			escrow = orders.fetch_and_log_escrow("", "", "", 0, sn)  # dummy params
-			if not escrow.get("error"):
-				escrow_logged += 1
-		except Exception:
-			pass  # ignore errors for count
-	return {"orders_total": orders_total, "escrow_logged": escrow_logged}
 
 
 __all__ = [

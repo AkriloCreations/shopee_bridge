@@ -147,7 +147,13 @@ def get_shop_info() -> Dict[str, Any]:
         from shopee_bridge import clients
         
         # Use the shop/get_shop_info endpoint
-        result = clients.http_get("/api/v2/shop/get_shop_info", {})
+        result = clients.request_json(
+            method="GET",
+            host="",
+            path="/api/v2/shop/get_shop_info",
+            query={},
+            body=None
+        )
         
         if result.get("error"):
             # API error, return basic info with error

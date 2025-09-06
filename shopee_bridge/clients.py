@@ -354,7 +354,7 @@ def log_request(path: str, params: Dict[str, Any], response: Dict[str, Any], dur
 
 
 def request_json(method: str, host: str, path: str, query: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, access_token: str | None = None, shop_id: int | None = None) -> Dict[str, Any]:
-	"""Generic request method for Shopee API."""
+	"""Generic request method for Shopee API with proper signing."""
 	if method.upper() == "GET":
 		return http_get(path, query or {})
 	elif method.upper() == "POST":

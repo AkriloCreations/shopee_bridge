@@ -54,7 +54,7 @@ def _get_last_pushed_update_time(doctype: str, name: str) -> int:
 		return 0
 
 
-def get_order_list(time_from: int, time_to: int, status: str | None = None, page_size: int = 100) -> List[str]:
+def get_order_list(time_from: int, time_to: int, status: str | None = None, page_size: int = 50) -> List[str]:
 	"""Fetch list of order_sn within time window.
 
 	Args:
@@ -79,7 +79,7 @@ def get_order_list(time_from: int, time_to: int, status: str | None = None, page
 		return []
 	
 	params: Dict[str, Any] = {
-		"time_range_field": "update_time",
+		"time_range_field": "create_time",
 		"time_from": int(time_from),
 		"time_to": int(time_to),
 		"page_size": min(max(int(page_size), 1), 100),
@@ -89,19 +89,45 @@ def get_order_list(time_from: int, time_to: int, status: str | None = None, page
 		params["order_status"] = status
 	
 	order_sns: List[str] = []
+	cursor = None
 	
-	try:
-		for item in clients.paginate_get(ORDER_LIST_PATH, params, page_size=page_size):
-			if sn := item.get("order_sn"):
-				order_sns.append(sn)
-	except clients.ShopeeAPIError as e:
-		_log_sync("order_list_api_error", {"error": str(e), "status": e.status_code})
-		frappe.log_error(f"Order list fetch failed: {e}", "Shopee Order Sync")
-		return []
-	except Exception as e:
-		_log_sync("order_list_error", {"error": str(e)})
-		frappe.log_error(f"Order list fetch failed: {e}", "Shopee Order Sync")
-		return []
+	while True:
+		query = params.copy()
+		if cursor:
+			query["cursor"] = cursor
+		
+		try:
+			resp = clients.request_json(
+				method="GET",
+				host="",
+				path=ORDER_LIST_PATH,
+				query=query,
+				body=None
+			)
+			data = resp.get("response") or resp
+			
+			# Extract items
+			items = data.get("order_list") or []
+			
+			for item in items:
+				if sn := item.get("order_sn"):
+					order_sns.append(sn)
+			
+			# Check for more pages
+			more = data.get("more", False)
+			cursor = data.get("next_cursor") or data.get("cursor")
+			
+			if not more or not cursor:
+				break
+				
+		except clients.ShopeeAPIError as e:
+			_log_sync("order_list_api_error", {"error": str(e), "status": e.status_code})
+			frappe.log_error(f"Order list fetch failed: {e}", "Shopee Order Sync")
+			break
+		except Exception as e:
+			_log_sync("order_list_error", {"error": str(e)})
+			frappe.log_error(f"Order list fetch failed: {e}", "Shopee Order Sync")
+			break
 	
 	return order_sns
 
@@ -116,8 +142,19 @@ def get_order_detail(order_sn_list: List[str]) -> List[Dict[str, Any]]:
 		return results
 	
 	try:
-		for result in clients.batch_request(ORDER_DETAIL_PATH, order_sn_list, batch_size=50):
-			results.append(result)
+		for i in range(0, len(order_sn_list), 50):
+			batch = order_sn_list[i:i+50]
+			order_sn_list_str = ",".join(batch)
+			resp = clients.request_json(
+				method="GET",
+				host="",
+				path=ORDER_DETAIL_PATH,
+				query={"order_sn_list": order_sn_list_str},
+				body=None
+			)
+			data = resp.get("response") or resp
+			order_list = data.get("order_list") or []
+			results.extend(order_list)
 	except Exception as e:
 		_log_sync("order_detail_error", {"error": str(e)})
 		frappe.log_error(f"Order detail fetch failed: {e}", "Shopee Order Sync")

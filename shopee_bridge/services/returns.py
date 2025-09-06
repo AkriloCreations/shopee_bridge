@@ -51,7 +51,13 @@ def get_return_list(time_from: int, time_to: int, status: str | None) -> List[st
 	while more:
 		if cursor:
 			params["cursor"] = cursor
-		resp = clients.http_get(RETURN_LIST_PATH, params)
+		resp = clients.request_json(
+			method="GET",
+			host="",
+			path=RETURN_LIST_PATH,
+			query=params,
+			body=None
+		)
 		data = resp.get("response") or resp
 		for row in (data.get("returns") or data.get("return_list") or []):
 			sn = row.get("return_sn") or row.get("returnsn")
@@ -66,13 +72,25 @@ def get_return_list(time_from: int, time_to: int, status: str | None) -> List[st
 
 def get_return_detail(return_sn: str) -> Dict[str, Any]:
 	"""Fetch detailed return object."""
-	resp = clients.http_get(RETURN_DETAIL_PATH, {"return_sn": return_sn})
+	resp = clients.request_json(
+		method="GET",
+		host="",
+		path=RETURN_DETAIL_PATH,
+		query={"return_sn": return_sn},
+		body=None
+	)
 	return resp.get("response") or resp
 
 
 def get_available_solution(return_sn: str) -> List[Dict[str, Any]]:
 	"""Fetch available resolution options."""
-	resp = clients.http_get(AVAILABLE_SOLUTION_PATH, {"return_sn": return_sn})
+	resp = clients.request_json(
+		method="GET",
+		host="",
+		path=AVAILABLE_SOLUTION_PATH,
+		query={"return_sn": return_sn},
+		body=None
+	)
 	data = resp.get("response") or resp
 	return data.get("solutions") or data.get("available_solutions") or []
 
@@ -80,19 +98,37 @@ def get_available_solution(return_sn: str) -> List[Dict[str, Any]]:
 def offer_solution(return_sn: str, solution: Dict[str, Any]) -> Dict[str, Any]:
 	"""Offer a solution to buyer (stub)."""
 	payload = {"return_sn": return_sn, **(solution or {})}
-	resp = clients.http_post(OFFER_SOLUTION_PATH, json=payload)
+	resp = clients.request_json(
+		method="POST",
+		host="",
+		path=OFFER_SOLUTION_PATH,
+		query=None,
+		body=payload
+	)
 	return resp.get("response") or resp
 
 
 def accept_offer(return_sn: str) -> Dict[str, Any]:
 	"""Accept buyer's / platform's offer (stub)."""
-	resp = clients.http_post(ACCEPT_OFFER_PATH, json={"return_sn": return_sn})
+	resp = clients.request_json(
+		method="POST",
+		host="",
+		path=ACCEPT_OFFER_PATH,
+		query=None,
+		body={"return_sn": return_sn}
+	)
 	return resp.get("response") or resp
 
 
 def raise_dispute(return_sn: str, reason: str) -> Dict[str, Any]:
 	"""Raise dispute (stub)."""
-	resp = clients.http_post(DISPUTE_PATH, json={"return_sn": return_sn, "reason": reason})
+	resp = clients.request_json(
+		method="POST",
+		host="",
+		path=DISPUTE_PATH,
+		query=None,
+		body={"return_sn": return_sn, "reason": reason}
+	)
 	return resp.get("response") or resp
 
 
@@ -103,13 +139,25 @@ def upload_proof(return_sn: str, files: List[bytes]) -> Dict[str, Any]:
 	"""
 	# TODO: implement multipart when needed. For now treat file lengths as metadata.
 	meta = [{"size": len(b)} for b in (files or [])]
-	resp = clients.http_post(UPLOAD_PROOF_PATH, json={"return_sn": return_sn, "files_meta": meta})
+	resp = clients.request_json(
+		method="POST",
+		host="",
+		path=UPLOAD_PROOF_PATH,
+		query=None,
+		body={"return_sn": return_sn, "files_meta": meta}
+	)
 	return resp.get("response") or resp
 
 
 def confirm_return(return_sn: str) -> Dict[str, Any]:
 	"""Confirm successful return (stub)."""
-	resp = clients.http_post(CONFIRM_RETURN_PATH, json={"return_sn": return_sn})
+	resp = clients.request_json(
+		method="POST",
+		host="",
+		path=CONFIRM_RETURN_PATH,
+		query=None,
+		body={"return_sn": return_sn}
+	)
 	return resp.get("response") or resp
 
 

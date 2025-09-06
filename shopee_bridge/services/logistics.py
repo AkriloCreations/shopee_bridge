@@ -41,7 +41,13 @@ def get_shipping_parameter(order_sn: str) -> Dict[str, Any]:
 	Wraps Shopee endpoint `/get_shipping_parameter`.
 	"""
 	try:
-		resp = clients.http_get(SHIPPING_PARAMETER_PATH, {"order_sn": order_sn})
+		resp = clients.request_json(
+			method="GET",
+			host="",
+			path=SHIPPING_PARAMETER_PATH,
+			query={"order_sn": order_sn},
+			body=None
+		)
 		return resp.get("response") or resp
 	except Exception as e:
 		_log("get_shipping_parameter_error", {"order_sn": order_sn, "error": str(e)})
@@ -64,7 +70,13 @@ def ship_order(order_sn: str, method: str, params: Dict[str, Any]) -> Dict[str, 
 		**(params or {}),
 	}
 	try:
-		resp = clients.http_post(SHIP_ORDER_PATH, json=payload)
+		resp = clients.request_json(
+			method="POST",
+			host="",
+			path=SHIP_ORDER_PATH,
+			query=None,
+			body=payload
+		)
 		return resp.get("response") or resp
 	except Exception as e:
 		_log("ship_order_error", {"order_sn": order_sn, "error": str(e)})
@@ -74,7 +86,13 @@ def ship_order(order_sn: str, method: str, params: Dict[str, Any]) -> Dict[str, 
 def get_tracking_number(order_sn: str) -> str:
 	"""Fetch tracking number (if allocated)."""
 	try:
-		resp = clients.http_get(TRACKING_NUMBER_PATH, {"order_sn": order_sn})
+		resp = clients.request_json(
+			method="GET",
+			host="",
+			path=TRACKING_NUMBER_PATH,
+			query={"order_sn": order_sn},
+			body=None
+		)
 		data = resp.get("response") or resp
 		return data.get("tracking_number") or data.get("tracking_no") or ""
 	except Exception as e:
@@ -85,7 +103,13 @@ def get_tracking_number(order_sn: str) -> str:
 def get_shipping_document_parameter(order_sn: str) -> Dict[str, Any]:
 	"""Fetch document parameter specification prior to requesting document."""
 	try:
-		resp = clients.http_get(SHIPPING_DOCUMENT_PARAMETER_PATH, {"order_sn": order_sn})
+		resp = clients.request_json(
+			method="GET",
+			host="",
+			path=SHIPPING_DOCUMENT_PARAMETER_PATH,
+			query={"order_sn": order_sn},
+			body=None
+		)
 		return resp.get("response") or resp
 	except Exception as e:
 		_log("get_shipping_document_parameter_error", {"order_sn": order_sn, "error": str(e)})
@@ -98,7 +122,13 @@ def get_shipping_document(order_sn: str) -> Dict[str, Any]:
 	Shopee responses often provide a result list; we normalize a plausible shape.
 	"""
 	try:
-		resp = clients.http_post(GET_SHIPPING_DOCUMENT_PATH, json={"order_sn_list": [order_sn]})
+		resp = clients.request_json(
+			method="POST",
+			host="",
+			path=GET_SHIPPING_DOCUMENT_PATH,
+			query=None,
+			body={"order_sn_list": [order_sn]}
+		)
 		data = resp.get("response") or resp
 		# Normalize: prefer first document info
 		docs = data.get("result_list") or data.get("documents") or []
@@ -117,7 +147,13 @@ def download_shipping_document(doc_id: str) -> bytes:
 	"""
 	try:
 		# Placeholder: some APIs might require POST with document_id
-		resp = clients.http_get(DOWNLOAD_SHIPPING_DOCUMENT_PATH, {"document_id": doc_id})
+		resp = clients.request_json(
+			method="GET",
+			host="",
+			path=DOWNLOAD_SHIPPING_DOCUMENT_PATH,
+			query={"document_id": doc_id},
+			body=None
+		)
 		data = resp.get("response") or resp
 		if isinstance(data, dict) and data.get("pdf_content_base64"):
 			import base64
