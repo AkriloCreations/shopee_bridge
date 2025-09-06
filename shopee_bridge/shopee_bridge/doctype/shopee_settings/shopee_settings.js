@@ -122,16 +122,23 @@ frappe.ui.form.on("Shopee Settings", {
             frm.add_custom_button(__("Refresh Token"), async () => {
                 frappe.show_alert(__("Checking token status and refreshing if needed..."), 3);
                 try {
-                    // Use new centralized refresh function
-                    const r = await frappe.call({ method: "shopee_bridge.auth.refresh_access_token_if_needed" });
-                    if (r.message) {
+                    // Use API facade for refresh
+                    const r = await frappe.call({ method: "shopee_bridge.api.refresh_token" });
+                    if (r.message?.refreshed) {
                         frappe.show_alert(__("Token was refreshed successfully!"), 5);
                         frm.reload_doc();
-                    } else {
+                    } else if (r.message?.skipped) {
                         frappe.show_alert(__("Token is still valid, no refresh needed."), 3);
+                    } else {
+                        frappe.show_alert(__("Token refresh completed."), 3);
+                        frm.reload_doc();
                     }
                 } catch (e) {
-                    frappe.msgprint(__("Token refresh error: {0}", [String(e)]));
+                    // Handle error properly to avoid [object Object]
+                    const msg = (e && e._server_messages) ? JSON.parse(e._server_messages)[0] : 
+                               (e && e.message ? e.message : 
+                               (typeof e === 'string' ? e : "Token refresh failed"));
+                    frappe.msgprint(__('Token refresh failed: {0}', [msg]));
                 }
             }, __("Connection"));
         } else {

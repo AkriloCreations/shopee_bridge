@@ -55,6 +55,7 @@ import urllib.parse
 
 # import frappe  # Moved inside functions to avoid import errors in tests
 from shopee_bridge import auth
+from shopee_bridge import helpers, clients
 
 
 PROD_BASE_URL = "https://partner.shopeemobile.com"
@@ -680,74 +681,77 @@ def refresh_access_token() -> Dict[str, Any]:
         frappe.log_error(f"Token refresh failed: {str(e)}", "Shopee Token Refresh")
         return {"success": False, "error": str(e)}
 
-def refresh_access_token_if_needed(buffer_seconds: int = 600) -> bool:
-    """Refresh access token if expired or expiring soon.
-    
-    Official Shopee v2 OAuth docs: https://open.shopee.com/documents?module=2&type=1&id=53
-    - Access tokens expire in 4 hours (14400 seconds)
-    - Refresh tokens are valid for 30 days
-    - Always refresh proactively before expiry to avoid 401 errors
-    - Buffer prevents race conditions and network delays
-    
-    Args:
-        buffer_seconds: Refresh if token expires within this many seconds (default 10min)
-        
-    Returns:
-        True if refresh was performed, False if not needed
-        
-    Raises:
-        AuthRequired: If no refresh token available
-        Exception: If refresh fails
+def refresh_access_token_if_needed(force: bool = False) -> dict:
     """
-    settings = _settings()
-    
-    if not settings.refresh_token:
-        raise AuthRequired("No refresh token available")
-        
-    if not settings.token_expires_at:
-        # No expiry info, assume expired and refresh
-        return _perform_refresh()
-        
-    # Calculate if refresh needed
-    expiry_epoch = _parse_expiry_to_epoch(settings.token_expires_at)
-    now_epoch = now_epoch()
-    
-    if expiry_epoch - now_epoch <= buffer_seconds:
-        return _perform_refresh()
-        
-    return False
-
-
-def get_valid_access_token() -> str:
-    """Get a valid access token, refreshing if necessary.
-    
-    Official Shopee v2 OAuth docs: https://open.shopee.com/documents?module=2&type=1&id=53
-    - Always check token validity before API calls
-    - Auto-refresh prevents 401 errors in production
-    - Thread-safe with database locking
-    
-    Returns:
-        Valid access token string
-        
-    Raises:
-        AuthRequired: If no tokens available or refresh fails
+    Refresh access_token via Shopee v2 AUTH.
+    Doc-guard:
+    - PATH: /api/v2/auth/access_token/get  (POST)
+    - Common query: partner_id, timestamp, sign (+ shop_id/merchant_id if required)
+    - BODY: {"refresh_token": "...", "shop_id": <int>}  # merchant flow: merchant_id
+    - Base string untuk SIGN: partner_id + path + timestamp + shop_id|merchant_id (TANPA access_token)
+    - 404 error_not_found umumnya karena path/param shop_id/merchant_id tidak disertakan benar.
     """
-    settings = _settings()
-    
-    if not settings.access_token:
-        raise AuthRequired("No access token available")
-        
-    # Check if refresh needed
-    if refresh_access_token_if_needed():
-        # Token was refreshed, reload settings
-        _frappe().cache().delete_value("Shopee Settings")
-        settings.reload()
-        
-    if not settings.access_token:
-        raise AuthRequired("Failed to obtain valid access token")
-        
-    return settings.access_token
+    import frappe, time
+    ss = _settings()
+    now = helpers.now_epoch()
+    overlap = 600
+    if not force:
+        if getattr(ss, "expires_at_epoch", 0) and ss.expires_at_epoch - now > overlap:
+            return {"skipped": True, "expires_at_epoch": int(ss.expires_at_epoch)}
 
+    host = ss.host
+    path = "/api/v2/auth/access_token/get"
+    shop_id = int(ss.shop_id) if getattr(ss, "shop_id", None) else None
+    merchant_id = int(ss.merchant_id) if getattr(ss, "merchant_id", None) else None
+    if not ss.refresh_token:
+        frappe.throw("Missing refresh_token in Shopee Settings")
+
+    # SIGN dan request via clients.request_json (jaga agar access_token tidak dipakai di base string refresh)
+    resp = clients.request_json(
+        method="POST",
+        host=host,
+        path=path,
+        query={},                 # signer akan inject partner_id/timestamp/sign
+        body={"refresh_token": ss.refresh_token, **({"shop_id": shop_id} if shop_id else {}), **({"merchant_id": merchant_id} if merchant_id else {})},
+        access_token=None,
+        shop_id=shop_id,
+        merchant_id=merchant_id,
+    )
+
+    # Normalisasi respons sesuai payload Shopee
+    # Harapkan keys: access_token, refresh_token (opsional rotate), expire_in (detik)
+    data = resp.get("response") or resp
+    new_token = data.get("access_token")
+    if not new_token:
+        frappe.throw(f"Refresh failed: {helpers.safe(data)}")
+
+    # Persist atomically
+    ss.access_token = new_token
+    if data.get("refresh_token"):
+        ss.refresh_token = data["refresh_token"]
+    expire_in = int(data.get("expire_in") or data.get("expires_in") or 4*3600)
+    ss.expires_at_epoch = now + expire_in
+    ss.last_refresh_epoch = now
+    ss.save(ignore_permissions=True)
+
+    return {"refreshed": True, "expires_at_epoch": int(ss.expires_at_epoch)}
+
+def get_valid_access_token(force_refresh: bool = False) -> tuple[str, int]:
+    """
+    Balikkan (access_token, expires_at_epoch). Auto refresh jika < 600s.
+    """
+    import frappe
+    ss = _settings()
+    if force_refresh:
+        refresh_access_token_if_needed(force=True)
+        ss = _settings()
+        return ss.access_token, int(ss.expires_at_epoch or 0)
+
+    now = helpers.now_epoch()
+    if (ss.expires_at_epoch or 0) - now <= 600:
+        refresh_access_token_if_needed(force=True)
+        ss = _settings()
+    return ss.access_token, int(ss.expires_at_epoch or 0)
 
 def _perform_refresh() -> bool:
     """Internal function to perform token refresh with locking."""
