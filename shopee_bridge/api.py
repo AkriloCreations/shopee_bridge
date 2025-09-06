@@ -616,6 +616,12 @@ def audit_shopee_orders_for_month(year: int, month: int) -> dict:
 	return {"count": len(order_sns), "first_order_sn": first_order_sn, "last_order_sn": last_order_sn, "min_created": min_created, "max_created": max_created}
 
 
+@frappe.whitelist()
+def log_message(category: str, ref: str, payload: dict | None = None):
+	from shopee_bridge.services.finance import log_generic
+	return {"ok": True, "name": log_generic(category, ref, payload or {})}
+
+
 __all__ = [
 	# Auth & Connection
 	"connect_to_shopee",
@@ -660,5 +666,6 @@ __all__ = [
 	"get_sync_logs",
 	"debug_sign",
 	"audit_shopee_orders_for_month",
+	"log_message",
 ]
 

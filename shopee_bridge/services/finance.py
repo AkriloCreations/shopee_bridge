@@ -253,6 +253,21 @@ def log_escrow(site: str, order_sn: str, payload: dict) -> str:
 	return doc.name
 
 
+def log_generic(category: str, ref: str, payload: dict) -> str:
+	import frappe
+	from shopee_bridge import helpers
+	doc = frappe.get_doc({
+		"doctype": "Shopee Sync Log",
+		"category": category,
+		"ref": ref,
+		"payload_json": frappe.as_json(payload),
+		"status": "OK",
+		"created_epoch": helpers.now_epoch(),
+	})
+	doc.insert(ignore_permissions=True)
+	return doc.name
+
+
 __all__ = [
 	"get_escrow_detail",
 	"patch_invoice_with_fees",
@@ -261,5 +276,6 @@ __all__ = [
 	"sync_escrow_for_completed_orders",
 	"reconcile_bank_strict",
 	"finance_backfill_range",
+	"log_generic",
 ]
 
