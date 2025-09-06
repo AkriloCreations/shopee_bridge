@@ -58,15 +58,11 @@ def _log(event: str, data: Dict[str, Any]):  # light logging
 # Body: none.
 def get_escrow_detail(host: str, access_token: str, shop_id: int, order_sn: str) -> dict:
 	"""Fetch escrow detail for a single order."""
-	return clients.request_json(
-		method="GET",
-		host=host,
-		path="/api/v2/payment/get_escrow_detail",
-		query={"order_sn": order_sn, "shop_id": shop_id},
-		body=None,
-		access_token=access_token,
-		shop_id=shop_id,
-	)
+	from shopee_bridge import clients, auth
+	token = auth.get_valid_access_token()
+	return clients.request_json(method="GET", host=host, path="/api/v2/payment/get_escrow_detail",
+								query={"order_sn": order_sn, "shop_id": shop_id},
+								body=None, access_token=token, shop_id=shop_id)
 
 
 def patch_invoice_with_fees(escrow: Dict[str, Any]) -> str:
@@ -235,16 +231,11 @@ def finance_backfill_range(start: str, end: str) -> Dict[str, Any]:
 def log_escrow(site: str, order_sn: str, payload: dict) -> str:
 	import frappe
 	from shopee_bridge import helpers
-	# idempotent upsert on (category, ref)
-	existing = frappe.get_all(
-		"Shopee Sync Log",
-		filters={"category": "escrow", "ref": order_sn},
-		pluck="name",
-		limit=1,
-	)
+	existing = frappe.get_all("Shopee Sync Log",
+							  filters={"category": "escrow", "ref": order_sn},
+							  pluck="name", limit=1)
 	if existing:
-		name = existing[0]
-		doc = frappe.get_doc("Shopee Sync Log", name)
+		doc = frappe.get_doc("Shopee Sync Log", existing[0])
 		doc.payload_json = frappe.as_json(payload)
 		doc.status = "DONE"
 		doc.created_epoch = helpers.now_epoch()

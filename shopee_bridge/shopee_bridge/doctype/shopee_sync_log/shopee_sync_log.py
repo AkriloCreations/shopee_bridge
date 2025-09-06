@@ -1,5 +1,6 @@
 import frappe
 from frappe.model.document import Document
+import time
 
 class ShopeeSyncLog(Document):
     """
@@ -19,10 +20,11 @@ class ShopeeSyncLog(Document):
         :param meta: Optional metadata dictionary.
         """
         log = frappe.new_doc("Shopee Sync Log")
-        log.sync_type = sync_type
-        log.status = status
+        log.category = sync_type
+        log.ref = reference
+        log.status = status.upper() if status in ["new", "done", "error"] else "ERROR"
         log.error_message = message
-        log.details = frappe.as_json(meta) if meta else None
-        log.timestamp = frappe.utils.now()
+        log.payload_json = frappe.as_json(meta) if meta else None
+        log.created_epoch = int(time.time())
         log.insert(ignore_permissions=True)
         frappe.db.commit()

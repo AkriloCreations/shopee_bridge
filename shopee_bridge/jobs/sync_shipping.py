@@ -28,10 +28,11 @@ def run(minutes: int = 30) -> Dict[str, Any]:
         # Write summary log
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "sync_shipping",
-            "status": status,
-            "details": frappe.as_json(summary),
-            "timestamp": frappe.utils.now()
+            "category": "sync_shipping",
+            "ref": f"batch_{from_ts}_{now_ts}",
+            "status": "DONE" if status == "ok" else "ERROR",
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": now_ts
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
@@ -41,10 +42,12 @@ def run(minutes: int = 30) -> Dict[str, Any]:
         # Write error log
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "sync_shipping",
-            "status": "fail",
+            "category": "sync_shipping",
+            "ref": f"error_{from_ts}_{now_ts}",
+            "status": "ERROR",
             "error_message": msg,
-            "timestamp": frappe.utils.now()
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": now_ts
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()

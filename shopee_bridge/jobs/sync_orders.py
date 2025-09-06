@@ -52,10 +52,12 @@ def run(minutes: int = 10) -> Dict[str, Any]:
                 # Write per-order error log
                 log_doc = frappe.get_doc({
                     "doctype": "Shopee Sync Log",
-                    "sync_type": "sync_orders",
-                    "status": "fail",
+                    "category": "sync_orders",
+                    "ref": order_sn,
+                    "status": "ERROR",
                     "error_message": msg,
-                    "timestamp": frappe.utils.now()
+                    "payload_json": frappe.as_json(od),
+                    "created_epoch": now_ts
                 })
                 log_doc.insert(ignore_permissions=True)
                 frappe.db.commit()
@@ -63,10 +65,11 @@ def run(minutes: int = 10) -> Dict[str, Any]:
         # Write summary log
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "sync_orders",
-            "status": status,
-            "details": frappe.as_json(summary),
-            "timestamp": frappe.utils.now()
+            "category": "sync_orders",
+            "ref": f"batch_{window_from}_{now_ts}",
+            "status": "DONE" if status == "ok" else "ERROR",
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": now_ts
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
@@ -75,10 +78,12 @@ def run(minutes: int = 10) -> Dict[str, Any]:
         # Write fatal error log
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "sync_orders",
-            "status": "fail",
+            "category": "sync_orders",
+            "ref": f"fatal_{window_from}_{now_ts}",
+            "status": "ERROR",
             "error_message": str(exc),
-            "timestamp": frappe.utils.now()
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": now_ts
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()

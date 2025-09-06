@@ -2,6 +2,7 @@
 
 from typing import Dict, Any
 import frappe
+import time
 
 
 def run(days_back: int = 2) -> Dict[str, Any]:
@@ -14,10 +15,11 @@ def run(days_back: int = 2) -> Dict[str, Any]:
         # Write summary log
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "reconcile_bank",
-            "status": status,
-            "details": frappe.as_json(summary),
-            "timestamp": frappe.utils.now()
+            "category": "reconcile_bank",
+            "ref": f"batch_{days_back}d",
+            "status": "DONE",
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": int(time.time())
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
@@ -26,10 +28,12 @@ def run(days_back: int = 2) -> Dict[str, Any]:
         # Write error log
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "reconcile_bank",
-            "status": "fail",
+            "category": "reconcile_bank",
+            "ref": f"error_{days_back}d",
+            "status": "ERROR",
             "error_message": str(exc),
-            "timestamp": frappe.utils.now()
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": int(time.time())
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()

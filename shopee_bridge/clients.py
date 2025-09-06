@@ -359,14 +359,66 @@ def log_request(path: str, params: Dict[str, Any], response: Dict[str, Any], dur
 		frappe.logger().warning(f"Failed to log API request: {e}")
 
 
-def request_json(method: str, host: str, path: str, query: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, access_token: str | None = None, shop_id: int | None = None) -> Dict[str, Any]:
-	"""Generic request method for Shopee API with proper signing."""
-	if method.upper() == "GET":
-		return http_get(path, query or {})
-	elif method.upper() == "POST":
-		return http_post(path, json=body)
-	else:
-		raise ValueError(f"Unsupported method: {method}")
+# Shopee OpenAPI v2 request wrapper
+# - Signs every request using auth.sign_request()
+# - Common params: partner_id, timestamp, sign (+ access_token, shop_id/merchant_id if required)
+# - GET: query only; POST: query + JSON body
+# - Auto-refresh access_token if <=600s to expire or on 401/403 once
+
+def request_json(*, method: str, host: str, path: str, query: dict|None=None, body: dict|None=None,
+                 access_token: str|None=None, shop_id: int|None=None, merchant_id: int|None=None,
+                 timeout: int|None=None) -> dict:
+    from shopee_bridge import auth, helpers
+    import json, time
+
+    # shallow copies
+    q = dict(query or {})
+    b = dict(body or {})
+
+    # preflight: refresh if expiring soon
+    try:
+        auth.refresh_access_token_if_needed(force=False)
+        # if access_token not given, try to fetch valid one
+        if access_token is None:
+            access_token, _exp = auth.get_valid_access_token(False)
+    except Exception:
+        pass  # non-fatal
+
+    # build signed url (no access_token in base string for public/refresh)
+    signed = auth.sign_request(path, q, {
+        "access_token": access_token,
+        "shop_id": shop_id,
+        "merchant_id": merchant_id,
+    })
+    url = signed["url"]          # already includes partner_id,timestamp,sign,& possibly access_token,shop_id
+    hdrs = {"Content-Type": "application/json"}
+
+    def _do():
+        if method.upper() == "GET":
+            return _do_request("GET", host, url, None, hdrs, timeout or DEFAULT_TIMEOUT)
+        else:
+            return _do_request("POST", host, url, json.dumps(b).encode("utf-8"), hdrs, timeout or DEFAULT_TIMEOUT)
+
+    # first attempt
+    try:
+        return _do()
+    except ShopeeAPIError as e:
+        if e.status_code in (401, 403):
+            # one forced refresh + retry once
+            try:
+                auth.refresh_access_token_if_needed(force=True)
+                if access_token is None:
+                    access_token, _exp = auth.get_valid_access_token(True)
+                signed = auth.sign_request(path, q, {
+                    "access_token": access_token,
+                    "shop_id": shop_id,
+                    "merchant_id": merchant_id,
+                })
+                url = signed["url"]
+                return _do()
+            except Exception:
+                raise
+        raise
 
 
 __all__ = ["http_get", "http_post", "request_json", "rotate_on_401", "paginate_get", "batch_request", "log_request", 

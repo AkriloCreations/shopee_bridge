@@ -2,6 +2,7 @@
 
 from typing import Dict, Any
 import frappe
+import time
 
 
 def run(hours: int = 1) -> Dict[str, Any]:
@@ -17,11 +18,11 @@ def run(hours: int = 1) -> Dict[str, Any]:
         # Write log entry using frappe.get_doc instead of DocType import
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "sync_finance",
-            "status": status,
-            "error_message": None,
-            "details": frappe.as_json(summary),
-            "timestamp": frappe.utils.now()
+            "category": "sync_finance",
+            "ref": f"batch_{hours}h",
+            "status": "DONE" if status == "ok" else "ERROR",
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": int(time.time())
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
@@ -30,11 +31,12 @@ def run(hours: int = 1) -> Dict[str, Any]:
         # Write error log entry
         log_doc = frappe.get_doc({
             "doctype": "Shopee Sync Log",
-            "sync_type": "sync_finance",
-            "status": "fail",
+            "category": "sync_finance",
+            "ref": f"error_{hours}h",
+            "status": "ERROR",
             "error_message": str(exc),
-            "details": frappe.as_json(summary),
-            "timestamp": frappe.utils.now()
+            "payload_json": frappe.as_json(summary),
+            "created_epoch": int(time.time())
         })
         log_doc.insert(ignore_permissions=True)
         frappe.db.commit()
